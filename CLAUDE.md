@@ -87,7 +87,7 @@ machine.
 - Don't use `sed`/`awk` to edit files — use direct file writes/edits.
   `tee` is fine for one-off terminal inspection, but Claude Code sessions
   should edit files directly rather than shelling through it.
-- Repo lives at `/home/alex/Projects/KernelPop` (GitHub repo: `labj1987/kernel-pop`), owned by user `alex` — if
+- Repo lives at `/home/alex/Projects/kernel-pop` (GitHub repo: `labj1987/kernel-pop`), owned by user `alex` — if
   operating as root, run git commands as `alex`
   (`su -s /bin/bash alex -c '...'`) to keep authorship and file
   ownership correct.
