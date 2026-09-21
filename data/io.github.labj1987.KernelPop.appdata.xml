@@ -18,7 +18,7 @@
   <launchable type="desktop-id">kernelpop.desktop</launchable>
   <url type="homepage">https://github.com/labj1987/KernelPop</url>
   <developer id="io.github.labj1987">
-    <name>Alex Brown</name>
+    <name>Linnard Alex Brown Jr.</name>
   </developer>
   <provides>
     <binary>kernelpop</binary>
