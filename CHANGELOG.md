@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.3.3 — 2026-09-21
+
+- **Security:** the removal path now rejects any kernel version string that
+  isn't a plain token (`*` or `../..` could previously purge every
+  `linux-*` package or walk `rm -rf` outside `/lib/modules`) and requires
+  the kernel to actually be installed. The install path only accepts
+  `linux-image`/`linux-modules`/`linux-headers` packages and refuses
+  world-writable staging directories. The polkit policy no longer caches
+  authorization (`auth_admin` instead of `auth_admin_keep`), and the
+  AppImage's first-run helper install is hash-verified on the root side.
+- Fixes a crash (RefCell double borrow) when typing in the search box or
+  flipping the release-candidate switch with a kernel selected.
+- Pop!_OS: kernelstub is detected and verified via the ESP kernel image
+  instead of a per-version entry; boot-menu health no longer flags every
+  kernel on Pop!_OS. GRUB boot-entry health now actually checks `grub.cfg`.
+- Installer script runs under `set -euo pipefail`, checks that
+  `/boot/vmlinuz-<version>` exists before reporting success, and refuses
+  to purge a kernel if that would also remove the `linux-generic`
+  metapackages.
+- Downloads that end short of the advertised length are retried/failed.
+- Build: `apt-get update` before installing zsync, appimagetool cache kept.
+- CI: build/test/clippy/shellcheck on push and PR; releases verify the tag
+  matches `Cargo.toml` and run the tests first. Added unit tests.
+- The display name is now "Kernel Pop"; credits use the full author name.
+
 ## 1.3.2 — 2026-09-17
 
 - Fixes the install script updating GRUB but not the actual boot default
