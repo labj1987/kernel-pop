@@ -368,10 +368,6 @@ pub fn build_ui(app: &Application) {
         }
     };
 
-    // Populate the installed-kernels list; remove_cb is invoked with the
-    // version string when a row's Remove button is clicked.
-    let populate_kernels: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
-
     // load_sysinfo — declared as Rc so remove/install callbacks can re-run it
     let load_sysinfo: Rc<dyn Fn()> = {
         let running_row = running_row.clone();
@@ -385,7 +381,6 @@ pub fn build_ui(app: &Application) {
         let log_fn = log_fn.clone();
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
-        let populate_kernels = populate_kernels.clone();
 
         // Forward declaration hack: the remove action needs load_sysinfo,
         // which is what we're building. A Rc<RefCell<Option<…>>> slot breaks
@@ -409,7 +404,6 @@ pub fn build_ui(app: &Application) {
             let window = window.clone();
             let toast_overlay = toast_overlay.clone();
             let self_slot = self_slot.clone();
-            let _populate_kernels = populate_kernels.clone();
 
             spawn_async(
                 async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() },

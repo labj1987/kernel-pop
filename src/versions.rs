@@ -48,7 +48,29 @@ pub async fn fetch_versions() -> Result<Vec<KernelVersion>> {
         .text()
         .await?;
 
-    let document = Html::parse_document(&html);
+    let versions = parse_versions(&html);
+    if versions.is_empty() {
+        bail!("No kernel versions found in the mainline index");
+    }
+    Ok(versions)
+}
+
+/// Leading dotted-numeric part of a version, as sortable components. An
+/// RC's "-rcN" suffix isn't parseable as a version component and would
+/// otherwise sort that entry as if every part after the first dot were 0.
+fn version_sort_key(version: &str) -> Vec<u32> {
+    version
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>()
+        .split('.')
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+/// Parse the mainline index page into versions, newest first, de-duplicated.
+fn parse_versions(html: &str) -> Vec<KernelVersion> {
+    let document = Html::parse_document(html);
     let selector = Selector::parse("a[href]").unwrap();
     // Stable directories look like "v7.1.3/"; daily builds etc. are skipped
     // by not matching either pattern below.
@@ -74,25 +96,9 @@ pub async fn fetch_versions() -> Result<Vec<KernelVersion>> {
         })
         .collect();
 
-    // Sort on the leading dotted-numeric part only — an RC's "-rcN" suffix
-    // isn't parseable as a version component, and would otherwise sort that
-    // entry as if every part after the first dot were 0.
-    let sort_key = |v: &KernelVersion| -> Vec<u32> {
-        v.version
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect::<String>()
-            .split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
-    versions.sort_by(|a, b| sort_key(b).cmp(&sort_key(a)));
+    versions.sort_by(|a, b| version_sort_key(&b.version).cmp(&version_sort_key(&a.version)));
     versions.dedup_by(|a, b| a.version == b.version);
-
-    if versions.is_empty() {
-        bail!("No kernel versions found in the mainline index");
-    }
-    Ok(versions)
+    versions
 }
 
 /// Collect .deb links from one index page. Hrefs may be plain filenames or
@@ -211,6 +217,88 @@ pub async fn fetch_deb_list(ver: &KernelVersion) -> Result<Vec<KernelDeb>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INDEX_HTML: &str = r#"<html><body>
+<a href="?C=N;O=D">Name</a>
+<a href="/">Parent</a>
+<a href="v5.4.9/">v5.4.9/</a>
+<a href="v6.10/">v6.10/</a>
+<a href="v6.9.12/">v6.9.12/</a>
+<a href="v6.11-rc2/">v6.11-rc2/</a>
+<a href="v6.10/">v6.10/</a>
+<a href="daily/">daily/</a>
+<a href="v6.9.12/amd64/">not a version dir</a>
+</body></html>"#;
+
+    #[test]
+    fn parse_versions_sorts_numerically_dedups_and_tags_rc() {
+        let v = parse_versions(INDEX_HTML);
+        let names: Vec<_> = v.iter().map(|k| k.version.as_str()).collect();
+        assert_eq!(names, ["6.11-rc2", "6.10", "6.9.12", "5.4.9"]);
+        assert!(v[0].is_rc);
+        assert!(v[1..].iter().all(|k| !k.is_rc));
+        assert_eq!(v[1].url, "https://kernel.ubuntu.com/mainline/v6.10/");
+    }
+
+    #[test]
+    fn parse_versions_empty_page() {
+        assert!(parse_versions("<html></html>").is_empty());
+    }
+
+    #[test]
+    fn sort_key_ignores_rc_suffix() {
+        assert_eq!(version_sort_key("6.11-rc2"), vec![6, 11]);
+        assert_eq!(version_sort_key("6.9.12"), vec![6, 9, 12]);
+        assert!(version_sort_key("6.10") > version_sort_key("6.9.12"));
+    }
+
+    #[test]
+    fn checksums_keep_only_sha256_keyed_by_basename() {
+        let sha256 = "A".repeat(64);
+        let sha1 = "b".repeat(40);
+        let text = format!(
+            "{sha1}  linux-a.deb\n{sha256}  amd64/linux-image-unsigned-6.9.12-060912-generic_6.9.12-060912.202407_amd64.deb\n{sha256} *linux-b.deb\nnot a line\n\n"
+        );
+        let m = parse_checksums(&text);
+        assert_eq!(m.len(), 2);
+        assert!(!m.contains_key("linux-a.deb"));
+        assert_eq!(
+            m["linux-image-unsigned-6.9.12-060912-generic_6.9.12-060912.202407_amd64.deb"],
+            "a".repeat(64)
+        );
+        assert!(m.contains_key("linux-b.deb"));
+    }
+
+    #[test]
+    fn wanted_deb_selects_generic_amd64_set() {
+        assert!(wanted_deb("linux-image-unsigned-6.9.12-060912-generic_6.9.12-060912.202407_amd64.deb"));
+        assert!(wanted_deb("linux-modules-6.9.12-060912-generic_6.9.12-060912.202407_amd64.deb"));
+        assert!(wanted_deb("linux-headers-6.9.12-060912-generic_6.9.12-060912.202407_amd64.deb"));
+        assert!(wanted_deb("linux-headers-6.9.12-060912_6.9.12-060912.202407_all.deb"));
+        assert!(!wanted_deb("linux-image-unsigned-6.9.12-060912-lowlatency_6.9.12-060912.202407_amd64.deb"));
+        assert!(!wanted_deb("linux-modules-6.9.12-060912-generic_6.9.12-060912.202407_arm64.deb"));
+        assert!(!wanted_deb("linux-buildinfo-6.9.12-060912-generic_6.9.12-060912.202407_amd64.deb"));
+        assert!(!wanted_deb("CHECKSUMS"));
+    }
+
+    #[test]
+    fn debs_from_page_resolves_urls_and_skips_parent_links() {
+        let html = r#"<a href="../">up</a>
+<a href="linux-modules-1-generic_1_amd64.deb">a</a>
+<a href="./linux-headers-1_1_all.deb">b</a>
+<a href="amd64/linux-image-1-generic_1_amd64.deb">c</a>
+<a href="../linux-evil.deb">d</a>
+<a href="README">e</a>"#;
+        let out = debs_from_page("https://example.test/v1/", html);
+        assert_eq!(
+            out,
+            vec![
+                ("linux-modules-1-generic_1_amd64.deb".into(), "https://example.test/v1/linux-modules-1-generic_1_amd64.deb".into()),
+                ("linux-headers-1_1_all.deb".into(), "https://example.test/v1/linux-headers-1_1_all.deb".into()),
+                ("linux-image-1-generic_1_amd64.deb".into(), "https://example.test/v1/amd64/linux-image-1-generic_1_amd64.deb".into()),
+            ]
+        );
+    }
 
     #[tokio::test]
     #[ignore]

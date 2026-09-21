@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install GTK4 / libadwaita headers
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config libssl-dev
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Syntax check
+        run: |
+          bash -n scripts/privileged-install.sh
+          bash -n build-appimage.sh
+      - name: ShellCheck
+        run: |
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning scripts/privileged-install.sh scripts/tests/test-privileged.sh build-appimage.sh
+      - name: Privileged-script helper tests
+        run: bash scripts/tests/test-privileged.sh

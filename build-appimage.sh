@@ -50,6 +50,16 @@ cp data/$APP-256.png                                "$APPDIR/usr/share/icons/hic
 cp data/io.github.labj1987.KernelPop.policy         "$APPDIR/usr/share/polkit-1/actions/"
 cp data/io.github.labj1987.KernelPop.appdata.xml    "$APPDIR/usr/share/metainfo/"
 
+# Guarantee the shipped appdata lists this build's version (taken from
+# Cargo.toml) even if the source file wasn't updated, so it can't drift.
+METAINFO="$APPDIR/usr/share/metainfo/io.github.labj1987.KernelPop.appdata.xml"
+if ! grep -q "<release version=\"$VERSION\"" "$METAINFO"; then
+    echo "==> appdata.xml lacks a release entry for $VERSION — adding it to the packaged copy"
+    ENTRY="    <release version=\"$VERSION\" date=\"$(date +%F)\"/>"
+    CONTENT="$(cat "$METAINFO")"
+    printf '%s\n' "${CONTENT/<releases>/<releases>$'\n'$ENTRY}" > "$METAINFO"
+fi
+
 # Top-level AppImage requirements
 cp data/$APP.desktop "$APPDIR/"
 cp data/$APP-256.png "$APPDIR/$APP.png"

@@ -56,13 +56,19 @@ machine.
 
 ## Release process
 
-1. Bump `version` in `Cargo.toml`.
+1. Bump `version` in `Cargo.toml` (and let `Cargo.lock` follow).
 2. Add a `CHANGELOG.md` entry.
-3. Commit, push to `main`.
-4. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-5. The tag push triggers `.github/workflows/release.yml` ("Build and
-   Release"), which runs `build-appimage.sh` and uploads the AppImage
-   (+ `.zsync`) to a GitHub Release via `softprops/action-gh-release`.
+3. Add a `<release version="X.Y.Z" date="..."/>` entry to
+   `data/io.github.labj1987.KernelPop.appdata.xml`. The release workflow
+   fails if it is missing, and `build-appimage.sh` injects one into the
+   packaged copy as a safety net, but the source file should be right.
+4. Commit, push to `main` (`.github/workflows/ci.yml` builds, tests and
+   shellchecks on push/PR).
+5. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+6. The tag push triggers `.github/workflows/release.yml` ("Build and
+   Release"), which checks the tag matches `Cargo.toml`, runs the tests,
+   runs `build-appimage.sh` and uploads the AppImage (+ `.zsync`) to a
+   GitHub Release via `softprops/action-gh-release`.
 
 ## Conventions
 

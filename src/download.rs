@@ -200,3 +200,19 @@ pub async fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn verify_sha256_accepts_match_and_rejects_mismatch() {
+        let path = std::env::temp_dir().join(format!("kernelpop-test-{}.bin", std::process::id()));
+        tokio::fs::write(&path, b"hello").await.unwrap();
+        // sha256("hello")
+        let good = "2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824";
+        assert!(verify_sha256(&path, good).await.is_ok());
+        assert!(verify_sha256(&path, &"0".repeat(64)).await.is_err());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}

@@ -288,7 +288,7 @@ do_remove() {
         meta="$(printf '%s\n' "$sim" | grep '^Remv ' | cut -d' ' -f2 \
             | grep -E '^linux-(image-|headers-)?(generic|lowlatency|virtual|oem|kvm)(-[a-z0-9.-]+)?$' || true)"
         if [[ -n "$meta" ]]; then
-            die "Removing $kver would also remove kernel metapackage(s): $(echo $meta) — that would stop future kernel updates from installing. Install a newer stock kernel first, or remove manually with 'apt-mark hold' on them."
+            die "Removing $kver would also remove kernel metapackage(s): ${meta//$'\n'/ } — that would stop future kernel updates from installing. Install a newer stock kernel first, or remove manually with 'apt-mark hold' on them."
         fi
 
         log "Purging packages:"
@@ -340,10 +340,13 @@ do_remove() {
     log "==== Done. Kernel $kver removed. ===="
 }
 
-case "$MODE" in
-    --install) do_install "$ARG" ;;
-    --remove)  do_remove  "$ARG" ;;
-    *) die "Usage: $0 --install <dir-of-debs> | --remove <kernel-version>" ;;
-esac
-
-exit 0
+# Run only when executed, not when sourced (scripts/tests/ sources this file
+# to unit-test the helper functions).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        --install) do_install "$ARG" ;;
+        --remove)  do_remove  "$ARG" ;;
+        *) die "Usage: $0 --install <dir-of-debs> | --remove <kernel-version>" ;;
+    esac
+    exit 0
+fi

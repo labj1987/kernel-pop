@@ -245,3 +245,36 @@ pub fn compare_to_running(running: &str, candidate: &str) -> VersionRelation {
         std::cmp::Ordering::Less    => VersionRelation::Older,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_newer_same_older() {
+        assert!(compare_to_running("6.8.0-45-generic", "6.10.1") == VersionRelation::Newer);
+        assert!(compare_to_running("6.8.0-45-generic", "6.8") == VersionRelation::Same);
+        assert!(compare_to_running("7.1.3-070103-generic", "7.1.2") == VersionRelation::Older);
+    }
+
+    #[test]
+    fn compare_handles_rc_and_garbage() {
+        assert!(compare_to_running("6.8.0-45-generic", "6.9-rc1") == VersionRelation::Newer);
+        assert!(compare_to_running("unknown", "6.9") == VersionRelation::Unknown);
+        assert!(compare_to_running("6.8.0", "") == VersionRelation::Unknown);
+    }
+
+    #[test]
+    fn healthy_requires_all_three() {
+        let mut k = InstalledKernel {
+            version: "6.8.0-45-generic".into(),
+            has_initrd: true,
+            has_modules: true,
+            has_boot_entry: true,
+            running: false,
+        };
+        assert!(k.healthy());
+        k.has_initrd = false;
+        assert!(!k.healthy());
+    }
+}
