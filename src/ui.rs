@@ -729,8 +729,13 @@ pub fn build_ui(app: &Application) {
         let list_box = list_box.clone();
         let state = state.clone();
         search_entry.connect_search_changed(move |entry| {
-            let s = state.borrow();
-            populate_list(&list_box, &s.versions, &entry.text(), &s.sysinfo.running_kernel, s.show_rc);
+            // Clone out and drop the borrow first: populate_list can remove the
+            // selected row, firing row-selected which takes borrow_mut().
+            let (versions, running, show_rc) = {
+                let s = state.borrow();
+                (s.versions.clone(), s.sysinfo.running_kernel.clone(), s.show_rc)
+            };
+            populate_list(&list_box, &versions, &entry.text(), &running, show_rc);
         });
     }
 
@@ -740,8 +745,11 @@ pub fn build_ui(app: &Application) {
         let search_entry = search_entry.clone();
         rc_toggle.connect_state_set(move |_, active| {
             state.borrow_mut().show_rc = active;
-            let s = state.borrow();
-            populate_list(&list_box, &s.versions, &search_entry.text(), &s.sysinfo.running_kernel, active);
+            let (versions, running) = {
+                let s = state.borrow();
+                (s.versions.clone(), s.sysinfo.running_kernel.clone())
+            };
+            populate_list(&list_box, &versions, &search_entry.text(), &running, active);
             glib::Propagation::Proceed
         });
     }

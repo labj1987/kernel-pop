@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-LOGFILE="/var/log/kernelpop.log"
+LOGFILE="${KERNELPOP_LOG:-/var/log/kernelpop.log}"
 log() {
     local msg="[kernelpop] $*"
     echo "$msg"
@@ -92,12 +92,41 @@ kver_from_debs() {
     return 1
 }
 
+# A kernel version string is spliced into globs and rm -rf paths, so it must
+# be a plain token: no '*', '/', '..' or whitespace. Returns 0 if safe.
+valid_kver() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] && [[ "$1" != *..* ]]
+}
+
+# Only kernel packages may be installed as root through this helper.
+deb_allowed() {
+    local pkg
+    pkg="$(dpkg-deb -f "$1" Package 2>/dev/null)" || return 1
+    case "$pkg" in
+        linux-image*|linux-modules*|linux-headers*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 do_install() {
     local dir="$1"
     [[ -d "$dir" ]] || die "Not a directory: $dir"
 
-    local debs=("$dir"/*.deb)
-    [[ -f "${debs[0]}" ]] || die "No .deb files found in $dir"
+    # Reject staging directories other users could modify while we run as root
+    local mode owner
+    mode="$(stat -c '%a' "$dir")"
+    owner="$(stat -c '%u' "$dir")"
+    if (( (8#$mode & 8#002) != 0 )); then
+        die "Refusing world-writable package directory: $dir"
+    fi
+    log "Package directory owner uid=$owner mode=$mode"
+
+    local all_debs=("$dir"/*.deb) debs=() d
+    [[ -f "${all_debs[0]}" ]] || die "No .deb files found in $dir"
+    for d in "${all_debs[@]}"; do
+        deb_allowed "$d" || die "Refusing to install $d: Package field is not linux-image/linux-modules/linux-headers"
+        debs+=("$d")
+    done
 
     log "==== Kernel install started ===="
     log "Package directory: $dir"
@@ -201,6 +230,9 @@ do_install() {
 do_remove() {
     local kver="$1"
     [[ -n "$kver" ]] || die "No kernel version specified"
+    valid_kver "$kver" || die "Invalid kernel version string: '$kver'"
+    [[ -e "/boot/vmlinuz-$kver" || -d "/lib/modules/$kver" ]] \
+        || die "Kernel $kver is not installed (no /boot/vmlinuz-$kver or /lib/modules/$kver)"
 
     local running
     running="$(uname -r)"
