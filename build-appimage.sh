@@ -13,18 +13,17 @@ APPDIR="$BUILD_DIR/AppDir"
 echo "==> Building $APP $VERSION AppImage"
 
 # ── Build dependencies ────────────────────────────────────────────────
-# zsync is installed unconditionally: the guard below evaluates false in CI
-# (a prior workflow step already installs cargo), so the guarded block —
-# and zsync along with it — was being silently skipped.
+# The package index is refreshed and zsync installed unconditionally: the
+# guard below evaluates false in CI (a prior workflow step already installs
+# cargo), so anything inside it — zsync included — would be silently skipped.
+# Update first so the install can't 404 on a stale index. Tolerate an
+# unrelated third-party repo (e.g. the runner image's preinstalled Google
+# Chrome source) failing to refresh; only failing to install zsync is fatal.
+apt-get update -qq || true
 apt-get install -y -qq zsync
 
 if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null; then
     echo "==> Installing build dependencies"
-    # Tolerate an unrelated third-party repo (e.g. the runner image's preinstalled
-    # Google Chrome source) failing to refresh -- apt falls back to its cached index
-    # for that repo and still refreshes everything else; only `apt-get install`
-    # failing on a package we actually need should be fatal.
-    apt-get update -qq || true
     apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
         pkg-config libssl-dev wget file desktop-file-utils zsync
 fi
@@ -34,7 +33,8 @@ echo "==> cargo build --release"
 cargo build --release
 
 # ── AppDir layout ─────────────────────────────────────────────────────
-rm -rf "$BUILD_DIR"
+# Only the AppDir is wiped: $BUILD_DIR also holds the cached appimagetool.
+rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/lib/$APP" \
          "$APPDIR/usr/share/applications" \
@@ -77,10 +77,27 @@ if [[ ! -f "$DST_POLICY" ]] || ! cmp -s "$SRC_POLICY" "$DST_POLICY"; then
 fi
 
 if [[ $needs_install -eq 1 ]]; then
+    # The AppImage's FUSE mount is normally not readable by root, so the
+    # files are staged in a private user dir. To close the stage-then-install
+    # TOCTOU window, hashes are taken from the read-only mounted originals and
+    # the root side copies the staged files into a root-owned dir and refuses
+    # to install anything that doesn't match those hashes.
     STAGE="$(mktemp -d)"
     cp "$SRC_SCRIPT" "$STAGE/privileged-install.sh"
     cp "$SRC_POLICY" "$STAGE/policy"
-    pkexec bash -c "install -D -m 755 '$STAGE/privileged-install.sh' '$DST_SCRIPT' && install -D -m 644 '$STAGE/policy' '$DST_POLICY'"
+    H_SCRIPT="$(sha256sum "$SRC_SCRIPT" | cut -d' ' -f1)"
+    H_POLICY="$(sha256sum "$SRC_POLICY" | cut -d' ' -f1)"
+    pkexec bash -c '
+        set -euo pipefail
+        stage="$1"; hs="$2"; hp="$3"; dst_s="$4"; dst_p="$5"
+        safe="$(mktemp -d)"; trap "rm -rf \"$safe\"" EXIT
+        cp "$stage/privileged-install.sh" "$safe/s"
+        cp "$stage/policy" "$safe/p"
+        [[ "$(sha256sum "$safe/s" | cut -d" " -f1)" == "$hs" ]] || { echo "script hash mismatch" >&2; exit 1; }
+        [[ "$(sha256sum "$safe/p" | cut -d" " -f1)" == "$hp" ]] || { echo "policy hash mismatch" >&2; exit 1; }
+        install -D -m 755 "$safe/s" "$dst_s"
+        install -D -m 644 "$safe/p" "$dst_p"
+    ' _ "$STAGE" "$H_SCRIPT" "$H_POLICY" "$DST_SCRIPT" "$DST_POLICY"
     rm -rf "$STAGE"
 fi
 

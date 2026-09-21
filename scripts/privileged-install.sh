@@ -19,13 +19,13 @@
 #   privileged-install.sh --install <dir-of-debs>
 #   privileged-install.sh --remove  <kernel-version-string>
 
-set -uo pipefail
+set -euo pipefail
 
 LOGFILE="${KERNELPOP_LOG:-/var/log/kernelpop.log}"
 log() {
     local msg="[kernelpop] $*"
     echo "$msg"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE" 2>/dev/null || true
+    { echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE"; } 2>/dev/null || true
 }
 die() { log "ERROR: $*"; exit 1; }
 
@@ -77,12 +77,12 @@ grub_entry_path_for_kver() {
     [[ -f "$cfg" ]] || return 1
 
     local submenu_id entry_id
-    submenu_id="$(grep -oP "submenu '[^']*' \\\$menuentry_id_option '\\K[^']+" "$cfg" | head -1)"
+    submenu_id="$(grep -oP "submenu '[^']*' \\\$menuentry_id_option '\\K[^']+" "$cfg" | head -1)" || true
     # Excludes recovery-mode entries, which also contain $kver in their
     # title — the default must never land on one of those.
     entry_id="$(grep "menuentry '[^']*${kver}[^']*'" "$cfg" 2>/dev/null \
         | grep -v 'recovery mode' \
-        | grep -oP "\\\$menuentry_id_option '\\K[^']+" | head -1)"
+        | grep -oP "\\\$menuentry_id_option '\\K[^']+" | head -1)" || true
     [[ -n "$submenu_id" && -n "$entry_id" ]] || return 1
     echo "${submenu_id}>${entry_id}"
 }
@@ -173,6 +173,11 @@ do_install() {
         fi
     fi
 
+    # dpkg can fail while apt-get -f finds nothing to fix and still exit 0;
+    # never declare success unless the kernel image itself is on disk.
+    [[ -f "/boot/vmlinuz-$kver" ]] || die "/boot/vmlinuz-$kver did NOT appear after install — the kernel package did not install correctly"
+    log "Verified: /boot/vmlinuz-$kver exists"
+
     # ── Initramfs: generate AND verify ─────────────────────────────────
     log "Generating initramfs for $kver…"
     if [[ -f "/boot/initrd.img-$kver" ]]; then
@@ -205,7 +210,7 @@ do_install() {
             # same philosophy as the initramfs check above.
             log "systemd-boot detected (ESP: $esp) — verifying boot menu entry…"
             local entry
-            entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)"
+            entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)" || true
             [[ -n "$entry" ]] || die "No systemd-boot entry appeared for $kver in $esp/loader/entries — DO NOT reboot expecting it in the menu"
             log "Verified: boot menu entry $entry exists"
             ;;
@@ -224,11 +229,11 @@ do_install() {
             if grep -qE '^GRUB_DEFAULT=saved' /etc/default/grub 2>/dev/null; then
                 log "GRUB_DEFAULT=saved detected — pointing the saved default at $kver…"
                 local entry_path
-                entry_path="$(grub_entry_path_for_kver "$kver")"
+                entry_path="$(grub_entry_path_for_kver "$kver")" || entry_path=""
                 if [[ -n "$entry_path" ]]; then
                     if grub-set-default "$entry_path" >>"$LOGFILE" 2>&1; then
                         local saved
-                        saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')"
+                        saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || saved=""
                         if [[ "$saved" == "$entry_path" ]]; then
                             log "Verified: saved_entry now points to $kver"
                         else
@@ -273,6 +278,19 @@ do_remove() {
     pkgs="$(printf '%s\n%s\n' "$pkgs" "$base_pkgs" | sort -u | sed '/^$/d')"
 
     if [[ -n "$pkgs" ]]; then
+        # Purging a stock kernel can drag out the linux-generic /
+        # linux-image-generic metapackages (they depend on that exact
+        # version), after which no future kernel update would ever install.
+        # Simulate first and refuse rather than silently break updates.
+        local sim meta
+        # shellcheck disable=SC2086
+        sim="$(apt-get -s purge $pkgs 2>/dev/null || true)"
+        meta="$(printf '%s\n' "$sim" | grep '^Remv ' | cut -d' ' -f2 \
+            | grep -E '^linux-(image-|headers-)?(generic|lowlatency|virtual|oem|kvm)(-[a-z0-9.-]+)?$' || true)"
+        if [[ -n "$meta" ]]; then
+            die "Removing $kver would also remove kernel metapackage(s): $(echo $meta) — that would stop future kernel updates from installing. Install a newer stock kernel first, or remove manually with 'apt-mark hold' on them."
+        fi
+
         log "Purging packages:"
         log "$pkgs"
         # shellcheck disable=SC2086

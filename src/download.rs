@@ -92,6 +92,18 @@ where
         }
 
         if !failed {
+            // A stream that ends early is not a success just because no
+            // error surfaced: compare against the advertised length.
+            if let Some(expected) = total {
+                if downloaded != expected {
+                    last_err = anyhow::anyhow!(
+                        "Incomplete download: got {downloaded} of {expected} bytes"
+                    );
+                    failed = true;
+                }
+            }
+        }
+        if !failed {
             file.flush().await?;
             return Ok(());
         }
