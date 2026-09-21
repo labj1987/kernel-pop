@@ -42,5 +42,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          files: kernelpop-*-x86_64.AppImage*
+          files: |
+            kernel-pop-*-x86_64.AppImage*
+            kernelpop-*-x86_64.AppImage*
           generate_release_notes: true

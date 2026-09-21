@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.4 — 2026-09-21
+
+- Naming convention: display name "Kernel Pop"; crate, binary, repo
+  (`labj1987/kernel-pop`), AppImage, desktop/icon files, helper dir
+  (`/usr/lib/kernel-pop/`) and log (`/var/log/kernel-pop.log`) are now
+  hyphenated lowercase. App ID and polkit action ids are unchanged.
+- Releases keep publishing legacy `kernelpop-*` AppImage/.zsync copies so
+  older installs can still self-update. The log override env var is now
+  `KERNEL_POP_LOG` (`KERNELPOP_LOG` still honored).
+
 ## 1.3.3 — 2026-09-21
 
 - **Security:** the removal path now rejects any kernel version string that

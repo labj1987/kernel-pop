@@ -27,7 +27,7 @@ fn client() -> Result<reqwest::Client> {
     // a total timeout would kill a slow-but-healthy download; read_timeout
     // only fires when the stream actually stalls.
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("kernelpop/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("kernel-pop/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(60))
         .build()?)
@@ -207,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_sha256_accepts_match_and_rejects_mismatch() {
-        let path = std::env::temp_dir().join(format!("kernelpop-test-{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("kernel-pop-test-{}.bin", std::process::id()));
         tokio::fs::write(&path, b"hello").await.unwrap();
         // sha256("hello")
         let good = "2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824";

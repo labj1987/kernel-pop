@@ -31,7 +31,7 @@ pub struct KernelDeb {
 
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("kernelpop/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("kernel-pop/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(60))
         .build()?)

@@ -33,14 +33,14 @@ on boot. This app is built around not letting that happen:
 - Per-file download progress with retries and cancellation
 - Remove old kernels (running kernel is never removable)
 - Disk space checks for /boot and /
-- Install log in-app plus /var/log/kernelpop.log
+- Install log in-app plus /var/log/kernel-pop.log
 
 ## Install
 
 Download the AppImage from the Releases page:
 
-    chmod +x kernelpop-*-x86_64.AppImage
-    ./kernelpop-*-x86_64.AppImage
+    chmod +x kernel-pop-*-x86_64.AppImage
+    ./kernel-pop-*-x86_64.AppImage
 
 First launch asks for authentication once to install the privileged
 helper script and polkit policy to system paths.

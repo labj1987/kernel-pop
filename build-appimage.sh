@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# build-appimage.sh — build the KernelPop AppImage.
+# build-appimage.sh — build the Kernel Pop AppImage.
 # Run from the repo root on Ubuntu (CI uses ubuntu-latest). Run as root in CI.
 set -euo pipefail
 
-APP="kernelpop"
+APP="kernel-pop"
 # Single source of truth: the version in Cargo.toml
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
@@ -71,7 +71,7 @@ cp data/$APP-256.png "$APPDIR/$APP.png"
 cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
-APP="kernelpop"
+APP="kernel-pop"
 
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
 SRC_POLICY="$HERE/usr/share/polkit-1/actions/io.github.labj1987.KernelPop.policy"
@@ -128,7 +128,7 @@ fi
 echo "==> Packing AppImage"
 OUT="$APP-$VERSION-$ARCH.AppImage"
 
-UPDATE_INFORMATION="gh-releases-zsync|labj1987|KernelPop|latest|kernelpop-*-x86_64.AppImage.zsync"
+UPDATE_INFORMATION="gh-releases-zsync|labj1987|kernel-pop|latest|kernel-pop-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
     -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 
@@ -143,4 +143,18 @@ if zsyncmake "$OUT"; then
     echo "==> .zsync generated: $OUT.zsync"
 else
     echo "==> WARNING: zsyncmake failed — continuing without .zsync"
+fi
+
+# Back-compat: AppImages built before the kernel-pop rename look for
+# "kernelpop-*-x86_64.AppImage.zsync" in the latest release when
+# self-updating. Publish legacy-named copies too so they can still update
+# (the new build's embedded update info uses the kernel-pop-* pattern).
+# Non-fatal.
+LEGACY="kernelpop-$VERSION-$ARCH.AppImage"
+cp "$OUT" "$LEGACY"
+if zsyncmake "$LEGACY"; then
+    echo "==> legacy-named copy + .zsync generated: $LEGACY"
+else
+    echo "==> WARNING: legacy zsyncmake failed — continuing"
+    rm -f "$LEGACY"
 fi

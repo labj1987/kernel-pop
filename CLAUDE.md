@@ -1,10 +1,22 @@
-# KernelPop (formerly MKI / Mainline Kernel Installer)
+# Kernel Pop (formerly MKI / Mainline Kernel Installer)
 
 GTK4 + libadwaita GUI, written in Rust, for browsing and installing Ubuntu
 mainline kernels from kernel.ubuntu.com. Distributed as a single AppImage.
 The core safety feature: every kernel in `/boot` is checked for a matching
 `initrd.img` and `/lib/modules` directory, so a kernel that would fail to
 boot is flagged *before* the reboot, not after.
+
+## Naming convention
+
+- Display name: "Kernel Pop" (window title, About dialog, desktop Name).
+- Binary, crate, repo, AppImage filename, `.desktop` and icon filenames,
+  installed paths and log: hyphenated lowercase `kernel-pop`
+  (`kernel-pop-$VERSION-x86_64.AppImage`, `/usr/lib/kernel-pop/`,
+  `/var/log/kernel-pop.log`).
+- The app ID `io.github.labj1987.KernelPop` and the polkit action ids stay
+  PascalCase and UNCHANGED.
+- Back-compat: releases also carry legacy `kernelpop-*` AppImage/.zsync
+  copies so pre-rename installs can still self-update.
 
 ## Module layout (`src/`)
 
@@ -31,7 +43,7 @@ boot is flagged *before* the reboot, not after.
 3. Assembles the AppDir (binary, privileged script, polkit policy,
    desktop file, icon, appdata).
 4. Downloads `appimagetool` (continuous build) and packs the AppDir into
-   `kernelpop-$VERSION-x86_64.AppImage`, with
+   `kernel-pop-$VERSION-x86_64.AppImage`, with
    `UPDATE_INFORMATION` set for `gh-releases-zsync` delta updates.
 5. Runs `zsyncmake` directly on the built AppImage to produce the
    `.zsync` sidecar.
@@ -75,7 +87,7 @@ machine.
 - Don't use `sed`/`awk` to edit files — use direct file writes/edits.
   `tee` is fine for one-off terminal inspection, but Claude Code sessions
   should edit files directly rather than shelling through it.
-- Repo lives at `/home/alex/Projects/KernelPop`, owned by user `alex` — if
+- Repo lives at `/home/alex/Projects/KernelPop` (GitHub repo: `labj1987/kernel-pop`), owned by user `alex` — if
   operating as root, run git commands as `alex`
   (`su -s /bin/bash alex -c '...'`) to keep authorship and file
   ownership correct.

@@ -1,13 +1,13 @@
 [package]
-name = "kernelpop"
-version = "1.3.3"
+name = "kernel-pop"
+version = "1.3.4"
 edition = "2021"
 description = "Kernel Pop — GTK4 GUI for installing Ubuntu mainline kernels"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"
 
 [[bin]]
-name = "kernelpop"
+name = "kernel-pop"
 path = "src/main.rs"
 
 [dependencies]

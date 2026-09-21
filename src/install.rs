@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-const SCRIPT: &str = "/usr/lib/kernelpop/privileged-install.sh";
+const SCRIPT: &str = "/usr/lib/kernel-pop/privileged-install.sh";
 
 fn run_script(args: &[String]) -> Result<()> {
     if !Path::new(SCRIPT).exists() {
@@ -25,7 +25,7 @@ fn run_script(args: &[String]) -> Result<()> {
             bail!("Authentication was cancelled.");
         }
         bail!(
-            "Script exited with code {} (see /var/log/kernelpop.log)",
+            "Script exited with code {} (see /var/log/kernel-pop.log)",
             code
         );
     }

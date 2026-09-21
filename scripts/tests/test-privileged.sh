@@ -3,7 +3,7 @@
 # Sources the script (its main dispatch is guarded) and stubs dpkg-deb.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export KERNELPOP_LOG=/dev/null
+export KERNEL_POP_LOG=/dev/null
 # shellcheck source=../privileged-install.sh
 source "$HERE/../privileged-install.sh"
 set +e
