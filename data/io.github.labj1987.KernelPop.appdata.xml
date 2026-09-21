@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.labj1987.KernelPop</id>
-  <name>KernelPop</name>
+  <name>Kernel Pop</name>
   <summary>Install Ubuntu mainline kernels with a verified initramfs</summary>
   <metadata_license>MIT</metadata_license>
   <project_license>AGPL-3.0-or-later</project_license>

@@ -70,7 +70,7 @@ pub fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("KernelPop")
+        .title("Kernel Pop")
         .default_width(780)
         .default_height(660)
         .build();
@@ -983,7 +983,7 @@ pub fn build_ui(app: &Application) {
                 (s.sysinfo.running_kernel.clone(), s.sysinfo.kernels.len())
             };
             let dialog = AboutDialog::builder()
-                .application_name("KernelPop")
+                .application_name("Kernel Pop")
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments(format!(

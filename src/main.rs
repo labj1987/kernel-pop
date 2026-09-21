@@ -27,7 +27,7 @@ fn main() {
     // prgname and StartupWMClass (in the .desktop file) to the application
     // ID makes the running window match the desktop file on either backend.
     glib::set_prgname(Some("io.github.labj1987.KernelPop"));
-    glib::set_application_name("KernelPop");
+    glib::set_application_name("Kernel Pop");
 
     let app = libadwaita::Application::builder()
         .application_id("io.github.labj1987.KernelPop")

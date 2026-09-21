@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=KernelPop
+Name=Kernel Pop
 Comment=Install Ubuntu mainline kernels with a verified initramfs
 Exec=kernelpop
 Icon=kernelpop

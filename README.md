@@ -1,4 +1,4 @@
-# KernelPop
+# Kernel Pop
 
 GTK4 + libadwaita desktop app for installing Ubuntu mainline kernels from
 kernel.ubuntu.com, written in Rust. Distributed as an AppImage. (Formerly
