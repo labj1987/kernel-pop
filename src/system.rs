@@ -22,8 +22,7 @@ pub struct InstalledKernel {
     pub has_initrd: bool,
     pub has_modules: bool,
     /// Whether the active boot loader actually has a menu entry for this
-    /// kernel. Always true on GRUB (grub-mkconfig picks up anything with a
-    /// vmlinuz in /boot on its own); on systemd-boot this checks for a real
+    /// kernel. On GRUB this greps grub.cfg for the vmlinuz; on systemd-boot this checks for a real
     /// entry under the ESP, since nothing else guarantees one exists.
     pub has_boot_entry: bool,
     pub running: bool,
@@ -46,10 +45,16 @@ impl InstalledKernel {
 pub enum Bootloader {
     Grub,
     SystemdBoot { esp: String },
+    /// Pop!_OS: kernelstub manages systemd-boot with Pop_OS-current.conf
+    /// rather than one entry per kernel version.
+    Kernelstub,
     Unknown,
 }
 
 pub fn detect_bootloader() -> Bootloader {
+    if Path::new("/etc/kernelstub/configuration").exists() || command_exists("kernelstub") {
+        return Bootloader::Kernelstub;
+    }
     if Path::new("/sys/firmware/efi").exists() {
         if let Ok(out) = Command::new("bootctl").arg("--print-esp-path").output() {
             if out.status.success() {
@@ -60,15 +65,43 @@ pub fn detect_bootloader() -> Bootloader {
             }
         }
     }
-    let has_update_grub = Command::new("sh")
-        .args(["-c", "command -v update-grub"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if has_update_grub {
+    if command_exists("update-grub") {
         return Bootloader::Grub;
     }
     Bootloader::Unknown
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("command -v {name}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// kernelstub keeps only Pop_OS-current / Pop_OS-oldkern rather than a
+/// per-version entry, so the best available check is that its kernel image
+/// exists on the ESP (EFI/Pop_OS-*/vmlinuz.efi).
+fn kernelstub_has_image() -> bool {
+    ["/boot/efi/EFI", "/boot/EFI"].iter().any(|dir| {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name().to_str().is_some_and(|n| n.starts_with("Pop_OS-"))
+                        && e.path().join("vmlinuz.efi").exists()
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Whether grub.cfg has an entry for vmlinuz-<version>. An unreadable
+/// grub.cfg gets the benefit of the doubt rather than flagging everything.
+fn grub_cfg_mentions(version: &str) -> bool {
+    match std::fs::read_to_string("/boot/grub/grub.cfg") {
+        Ok(cfg) => cfg.contains(&format!("vmlinuz-{version}")),
+        Err(_) => true,
+    }
 }
 
 /// Whether the boot loader has a menu entry for this exact kernel version.
@@ -76,7 +109,9 @@ pub fn detect_bootloader() -> Bootloader {
 /// than marking every kernel unhealthy for a check we can't perform.
 fn has_boot_entry(version: &str, bootloader: &Bootloader) -> bool {
     match bootloader {
-        Bootloader::Grub | Bootloader::Unknown => true,
+        Bootloader::Unknown => true,
+        Bootloader::Kernelstub => kernelstub_has_image(),
+        Bootloader::Grub => grub_cfg_mentions(version),
         Bootloader::SystemdBoot { esp } => {
             let entries_dir = format!("{esp}/loader/entries");
             std::fs::read_dir(&entries_dir)
@@ -180,7 +215,7 @@ pub fn format_bytes(b: u64) -> String {
 
 /// Compare the running kernel's numeric part against a mainline version
 /// string like "7.1.3". Returns Newer/Same/Older from the candidate's
-/// point of view, mirroring GreenLight's badge logic.
+/// point of view, for the version badge.
 #[derive(PartialEq)]
 pub enum VersionRelation { Newer, Same, Older, Unknown }
 

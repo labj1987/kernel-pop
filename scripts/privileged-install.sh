@@ -36,8 +36,21 @@ ARG="${2:-}"
 # GRUB and systemd-boot binaries/config can both be present on a machine
 # (leftover packages, distro upgrades) — the signal that matters is which
 # one an ESP loader.conf says is actually active, not merely which
-# binaries exist. Prints one of: "systemd-boot <esp-path>" | "grub" | "unknown"
+# binaries exist. Prints one of: "kernelstub <esp-path>" | "systemd-boot
+# <esp-path>" | "grub" | "unknown".
+# Pop!_OS uses kernelstub on top of systemd-boot: it writes a single
+# Pop_OS-current.conf entry (not per-kernel-version) and copies the kernel
+# to EFI/Pop_OS-*/vmlinuz.efi, so it is checked for before systemd-boot.
 detect_bootloader() {
+    if command -v kernelstub >/dev/null 2>&1 || [[ -f /etc/kernelstub/configuration ]]; then
+        local kesp=""
+        if command -v bootctl >/dev/null 2>&1; then
+            kesp="$(bootctl --print-esp-path 2>/dev/null)" || kesp=""
+        fi
+        [[ -n "$kesp" ]] || kesp="/boot/efi"
+        echo "kernelstub $kesp"
+        return
+    fi
     if [[ -d /sys/firmware/efi ]] && command -v bootctl >/dev/null 2>&1; then
         local esp
         esp="$(bootctl --print-esp-path 2>/dev/null)" || esp=""
@@ -175,6 +188,16 @@ do_install() {
     local bl esp
     read -r bl esp <<< "$(detect_bootloader)"
     case "$bl" in
+        kernelstub)
+            # kernelstub's postinst hook (/etc/kernel/postinst.d/zz-kernelstub)
+            # ran during dpkg. Entries are Pop_OS-current/oldkern, not
+            # per-version, so verify the kernel image it copies to the ESP.
+            log "kernelstub (Pop!_OS) detected (ESP: $esp) — verifying ESP kernel image…"
+            local efi_img
+            efi_img="$(compgen -G "$esp/EFI/Pop_OS-*/vmlinuz.efi" | head -1 || true)"
+            [[ -n "$efi_img" ]] || die "No EFI/Pop_OS-*/vmlinuz.efi under $esp after install — kernelstub did not sync. Try 'kernelstub -p' — DO NOT reboot expecting the new kernel"
+            log "Verified: kernelstub image $efi_img exists"
+            ;;
         systemd-boot)
             # kernel-install already ran automatically via the dpkg postinst
             # hook (/usr/lib/kernel/install.d/90-loaderentry.install) — verify
@@ -269,6 +292,12 @@ do_remove() {
     local bl esp
     read -r bl esp <<< "$(detect_bootloader)"
     case "$bl" in
+        kernelstub)
+            # The kernelstub postrm hook (/etc/kernel/postrm.d/zz-kernelstub)
+            # resyncs the ESP when the packages are purged; kernel-install
+            # remove does nothing useful here.
+            log "kernelstub (Pop!_OS) detected — ESP entries are resynced by its postrm hook, not per-version"
+            ;;
         systemd-boot)
             log "systemd-boot detected (ESP: $esp) — removing boot menu entry for $kver…"
             if command -v kernel-install >/dev/null 2>&1; then
