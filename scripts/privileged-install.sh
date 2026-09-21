@@ -324,7 +324,7 @@ do_remove() {
             else
                 rm -f "$esp/loader/entries/"*"-${kver}.conf"
                 if [[ -r /etc/machine-id ]]; then
-                    rm -rf "$esp/$(cat /etc/machine-id)/$kver"
+                    rm -rf "${esp:?}/$(cat /etc/machine-id)/${kver:?}"
                 fi
             fi
             ;;
