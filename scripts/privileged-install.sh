@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-LOGFILE="${KERNEL_POP_LOG:-${KERNELPOP_LOG:-/var/log/kernel-pop.log}}"
+LOGFILE="${KERNEL_POP_LOG:-/var/log/kernel-pop.log}"
 log() {
     local msg="[kernel-pop] $*"
     echo "$msg"

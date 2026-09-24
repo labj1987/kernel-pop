@@ -144,17 +144,3 @@ if zsyncmake "$OUT"; then
 else
     echo "==> WARNING: zsyncmake failed — continuing without .zsync"
 fi
-
-# Back-compat: AppImages built before the kernel-pop rename look for
-# "kernelpop-*-x86_64.AppImage.zsync" in the latest release when
-# self-updating. Publish legacy-named copies too so they can still update
-# (the new build's embedded update info uses the kernel-pop-* pattern).
-# Non-fatal.
-LEGACY="kernelpop-$VERSION-$ARCH.AppImage"
-cp "$OUT" "$LEGACY"
-if zsyncmake "$LEGACY"; then
-    echo "==> legacy-named copy + .zsync generated: $LEGACY"
-else
-    echo "==> WARNING: legacy zsyncmake failed — continuing"
-    rm -f "$LEGACY"
-fi

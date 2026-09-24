@@ -44,5 +44,4 @@ jobs:
         with:
           files: |
             kernel-pop-*-x86_64.AppImage*
-            kernelpop-*-x86_64.AppImage*
           generate_release_notes: true

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.5 — 2026-09-24
+
+- Releases no longer publish legacy `kernelpop-*` AppImage/.zsync copies, and
+  the old `KERNELPOP_LOG` log override is gone; use `KERNEL_POP_LOG`.
+
 ## 1.3.4 — 2026-09-21
 
 - Naming convention: display name "Kernel Pop"; crate, binary, repo

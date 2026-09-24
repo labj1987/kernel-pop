@@ -15,8 +15,6 @@ boot is flagged *before* the reboot, not after.
   `/var/log/kernel-pop.log`).
 - The app ID `io.github.labj1987.KernelPop` and the polkit action ids stay
   PascalCase and UNCHANGED.
-- Back-compat: releases also carry legacy `kernelpop-*` AppImage/.zsync
-  copies so pre-rename installs can still self-update.
 
 ## Module layout (`src/`)
 
