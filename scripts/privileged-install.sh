@@ -18,6 +18,8 @@
 # Usage:
 #   privileged-install.sh --install <dir-of-debs>
 #   privileged-install.sh --remove  <kernel-version-string>
+#   privileged-install.sh --remove-many <kernel-version-string>...
+#   privileged-install.sh --boot-once <kernel-version-string>
 
 set -euo pipefail
 
@@ -73,7 +75,7 @@ detect_bootloader() {
 # "<submenu-id>><entry-id>" for use with grub-set-default, or nothing if no
 # match was found.
 grub_entry_path_for_kver() {
-    local kver="$1" cfg="/boot/grub/grub.cfg"
+    local kver="$1" cfg="${KERNEL_POP_GRUB_CFG:-/boot/grub/grub.cfg}"
     [[ -f "$cfg" ]] || return 1
 
     local submenu_id entry_id
@@ -85,6 +87,25 @@ grub_entry_path_for_kver() {
         | grep -oP "\\\$menuentry_id_option '\\K[^']+" | head -1)" || true
     [[ -n "$submenu_id" && -n "$entry_id" ]] || return 1
     echo "${submenu_id}>${entry_id}"
+}
+
+# Put the previously saved GRUB default back after a default change that
+# did not verify. Best effort and conservative: does nothing when there was
+# no previous default, and never fails the install.
+restore_grub_default() {
+    local prev="$1" now
+    [[ -n "$prev" ]] || return 0
+    if grub-set-default "$prev" >>"$LOGFILE" 2>&1; then
+        now="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || now=""
+        if [[ "$now" == "$prev" ]]; then
+            log "Restored previous GRUB default: $prev"
+        else
+            log "WARNING: tried to restore the previous GRUB default '$prev' but saved_entry is '$now' — check it before rebooting"
+        fi
+    else
+        log "WARNING: could not restore the previous GRUB default '$prev' — check it before rebooting"
+    fi
+    return 0
 }
 
 # ── Derive kernel version strings from .deb metadata ──────────────────
@@ -109,6 +130,138 @@ kver_from_debs() {
 # be a plain token: no '*', '/', '..' or whitespace. Returns 0 if safe.
 valid_kver() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] && [[ "$1" != *..* ]]
+}
+
+# ── Initramfs tool detection ────────────────────────────────────────────
+# Prints "update-initramfs" | "dracut" | "none". Ubuntu ships
+# initramfs-tools; dracut is only used when initramfs-tools is absent.
+initramfs_tool() {
+    if command -v update-initramfs >/dev/null 2>&1; then
+        echo "update-initramfs"
+    elif command -v dracut >/dev/null 2>&1; then
+        echo "dracut"
+    else
+        echo "none"
+    fi
+}
+
+# Generate /boot/initrd.img-<kver> with whichever tool is installed. The
+# caller verifies the file exists afterwards, whatever the tool was.
+generate_initramfs() {
+    local kver="$1" tool
+    tool="$(initramfs_tool)"
+    case "$tool" in
+        update-initramfs)
+            if [[ -f "/boot/initrd.img-$kver" ]]; then
+                update-initramfs -u -k "$kver" >>"$LOGFILE" 2>&1
+            else
+                update-initramfs -c -k "$kver" >>"$LOGFILE" 2>&1
+            fi
+            ;;
+        dracut)
+            # Write to the same initrd.img-<kver> name the rest of this
+            # script and the app's health check look for.
+            dracut --force "/boot/initrd.img-$kver" "$kver" >>"$LOGFILE" 2>&1
+            ;;
+        *)
+            log "No initramfs tool found (update-initramfs or dracut)"
+            return 1
+            ;;
+    esac
+}
+
+# ── DKMS ────────────────────────────────────────────────────────────────
+# Out-of-tree modules (nvidia above all) are built per kernel. A failed
+# build does not stop the kernel from booting, but the machine may come up
+# without its GPU driver, so failures are reported loudly as warnings and
+# never turn a successful kernel install into a failed one.
+DKMS_FAILED=0
+
+# "nvidia/550.54, 6.8.0-45-generic, x86_64: installed" (dkms 3) or
+# "nvidia, 550.54, 6.8.0-45-generic, x86_64: installed" (dkms 2) -> the
+# state word ("installed", "built", "added", ...).
+dkms_line_state() {
+    local rest="${1#*: }"
+    echo "${rest%% *}"
+}
+
+# Same lines -> "nvidia/550.54" (module/version).
+dkms_line_module() {
+    local head="${1%%:*}" f
+    IFS=', ' read -ra f <<< "$head"
+    if [[ "${f[0]}" == */* ]]; then
+        echo "${f[0]}"
+    else
+        echo "${f[0]}/${f[1]:-?}"
+    fi
+}
+
+# Path of the make.log for a "module/version" and kernel, or nothing.
+dkms_make_log() {
+    compgen -G "${KERNEL_POP_DKMS_TREE:-/var/lib/dkms}/$1/$2/*/log/make.log" | head -1 || true
+}
+
+dkms_postcheck() {
+    local kver="$1"
+    if ! command -v dkms >/dev/null 2>&1; then
+        log "DKMS not installed — no out-of-tree modules to build"
+        return 0
+    fi
+    local registered
+    registered="$(dkms status 2>/dev/null || true)"
+    if [[ -z "$registered" ]]; then
+        log "No DKMS modules registered — nothing to build for $kver"
+        return 0
+    fi
+    if [[ ! -e "${KERNEL_POP_MODULES:-/lib/modules}/$kver/build" ]]; then
+        DKMS_FAILED=$((DKMS_FAILED + 1))
+        log "DKMS WARNING: DKMS modules are registered but /lib/modules/$kver/build is missing (headers not installed?) — they cannot be built for $kver"
+        return 0
+    fi
+
+    log "DKMS modules registered — building for $kver (this can take a few minutes)…"
+    dkms autoinstall -k "$kver" >>"$LOGFILE" 2>&1 \
+        || log "DKMS WARNING: dkms autoinstall reported errors for $kver"
+
+    local line tl state mod total=0 logf
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        total=$((total + 1))
+        state="$(dkms_line_state "$line")"
+        mod="$(dkms_line_module "$line")"
+        if [[ "$state" == "installed" ]]; then
+            log "DKMS OK: $mod installed for $kver"
+        else
+            DKMS_FAILED=$((DKMS_FAILED + 1))
+            log "DKMS WARNING: $mod is '$state' for $kver, not installed — the module will be missing after reboot"
+            logf="$(dkms_make_log "$mod" "$kver")"
+            if [[ -n "$logf" && -r "$logf" ]]; then
+                log "DKMS make.log tail ($logf):"
+                while IFS= read -r tl; do log "  | $tl"; done < <(tail -n 20 "$logf")
+            fi
+        fi
+    done < <(dkms status -k "$kver" 2>/dev/null || true)
+
+    if (( total == 0 )); then
+        DKMS_FAILED=$((DKMS_FAILED + 1))
+        log "DKMS WARNING: DKMS modules are registered but none is installed for $kver"
+    fi
+    return 0
+}
+
+# ── Installed kernels ───────────────────────────────────────────────────
+# One kernel version per line, from the vmlinuz-* files in /boot.
+installed_kvers() {
+    local boot="${KERNEL_POP_BOOT:-/boot}" f
+    for f in "$boot"/vmlinuz-*; do
+        [[ -e "$f" ]] || continue
+        echo "${f#"$boot"/vmlinuz-}"
+    done
+}
+
+# Newest version in a newline-separated list on stdin (version sort).
+newest_kver_in_list() {
+    sort -V | tail -n 1
 }
 
 # Only kernel packages may be installed as root through this helper.
@@ -178,13 +331,17 @@ do_install() {
     [[ -f "/boot/vmlinuz-$kver" ]] || die "/boot/vmlinuz-$kver did NOT appear after install — the kernel package did not install correctly"
     log "Verified: /boot/vmlinuz-$kver exists"
 
+    # ── DKMS: build out-of-tree modules before the initramfs ───────────
+    # The headers are installed by now. Running this before the initramfs
+    # step means modules that belong in the initramfs are included. A failure
+    # here is a warning, never an install error.
+    dkms_postcheck "$kver" || log "DKMS WARNING: the DKMS check itself failed"
+
     # ── Initramfs: generate AND verify ─────────────────────────────────
-    log "Generating initramfs for $kver…"
-    if [[ -f "/boot/initrd.img-$kver" ]]; then
-        update-initramfs -u -k "$kver" >>"$LOGFILE" 2>&1 || die "update-initramfs -u failed for $kver"
-    else
-        update-initramfs -c -k "$kver" >>"$LOGFILE" 2>&1 || die "update-initramfs -c failed for $kver"
-    fi
+    local irtool
+    irtool="$(initramfs_tool)"
+    log "Generating initramfs for $kver with $irtool…"
+    generate_initramfs "$kver" || die "initramfs generation ($irtool) failed for $kver"
 
     [[ -f "/boot/initrd.img-$kver" ]] || die "initrd.img-$kver did NOT appear in /boot — DO NOT reboot into this kernel"
     log "Verified: /boot/initrd.img-$kver exists"
@@ -227,6 +384,11 @@ do_install() {
             # silently — doubly so with GRUB_TIMEOUT_STYLE=hidden, where
             # there's no visible menu to notice the stale selection from.
             if grep -qE '^GRUB_DEFAULT=saved' /etc/default/grub 2>/dev/null; then
+                # Remember the previous default so it can be put back if the
+                # new one does not verify.
+                local prev_saved
+                prev_saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || prev_saved=""
+                log "Previous GRUB default: ${prev_saved:-<none>}"
                 log "GRUB_DEFAULT=saved detected — pointing the saved default at $kver…"
                 local entry_path
                 entry_path="$(grub_entry_path_for_kver "$kver")" || entry_path=""
@@ -238,9 +400,11 @@ do_install() {
                             log "Verified: saved_entry now points to $kver"
                         else
                             log "WARNING: saved_entry is '$saved' after grub-set-default, expected '$entry_path' — verify manually before rebooting"
+                            restore_grub_default "$prev_saved"
                         fi
                     else
                         log "WARNING: grub-set-default failed for $entry_path — $kver is installed but may not be the default boot entry"
+                        restore_grub_default "$prev_saved"
                     fi
                 else
                     log "WARNING: could not find a GRUB menu entry for $kver in grub.cfg — saved default left unchanged, verify manually before rebooting"
@@ -252,7 +416,45 @@ do_install() {
             ;;
     esac
 
+    if (( DKMS_FAILED > 0 )); then
+        log "DKMS WARNING: $DKMS_FAILED DKMS problem(s) for $kver — the kernel is installed, but out-of-tree modules (such as the NVIDIA driver) may be missing after reboot. See the DKMS lines above."
+    fi
     log "==== Done. Kernel $kver installed with initramfs verified. Reboot when ready. ===="
+}
+
+# Boot a different installed kernel on the NEXT boot only; the saved default
+# is left alone. Does not reboot.
+do_boot_once() {
+    local kver="$1"
+    [[ -n "$kver" ]] || die "No kernel version specified"
+    valid_kver "$kver" || die "Invalid kernel version string: '$kver'"
+    [[ -e "/boot/vmlinuz-$kver" ]] || die "Kernel $kver is not installed (no /boot/vmlinuz-$kver)"
+
+    local bl esp
+    read -r bl esp <<< "$(detect_bootloader)"
+    case "$bl" in
+        grub)
+            local entry_path
+            entry_path="$(grub_entry_path_for_kver "$kver")" \
+                || die "Could not find a GRUB menu entry for $kver in grub.cfg"
+            grub-reboot "$entry_path" >>"$LOGFILE" 2>&1 || die "grub-reboot failed for $entry_path"
+            log "GRUB will boot $kver on the next boot only ($entry_path)"
+            ;;
+        systemd-boot)
+            local entry id
+            entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)" || true
+            [[ -n "$entry" ]] || die "No systemd-boot entry found for $kver in $esp/loader/entries"
+            id="$(basename "$entry")"
+            bootctl set-oneshot "$id" >>"$LOGFILE" 2>&1 || die "bootctl set-oneshot failed for $id"
+            log "systemd-boot will boot $kver on the next boot only ($id)"
+            ;;
+        kernelstub)
+            die "One-time boot selection is not supported with kernelstub (Pop!_OS); use the boot menu"
+            ;;
+        *)
+            die "Could not detect a supported boot loader — use your boot menu to pick $kver"
+            ;;
+    esac
 }
 
 do_remove() {
@@ -340,13 +542,46 @@ do_remove() {
     log "==== Done. Kernel $kver removed. ===="
 }
 
+# Remove several kernels under ONE authentication. Each removal runs as its
+# own child process of this script, so a refusal (e.g. it would drag out the
+# kernel metapackages) only skips that kernel. The running kernel and the
+# newest installed kernel are never removed here, whatever was asked for.
+do_remove_many() {
+    (( $# > 0 )) || die "No kernel versions specified"
+    local running newest v removed=0 skipped=0 failed=0
+    running="$(uname -r)"
+    newest="$(installed_kvers | newest_kver_in_list)"
+    log "==== Bulk kernel removal started: $* ===="
+    for v in "$@"; do
+        if ! valid_kver "$v"; then
+            log "Skipping invalid kernel version string: '$v'"
+            failed=$((failed + 1))
+        elif [[ "$v" == "$running" ]]; then
+            log "Skipping $v: it is the running kernel"
+            skipped=$((skipped + 1))
+        elif [[ "$v" == "$newest" ]]; then
+            log "Skipping $v: it is the newest installed kernel"
+            skipped=$((skipped + 1))
+        elif bash "${BASH_SOURCE[0]}" --remove "$v"; then
+            removed=$((removed + 1))
+        else
+            log "Removal of $v failed — continuing with the rest"
+            failed=$((failed + 1))
+        fi
+    done
+    log "==== Bulk removal done: $removed removed, $skipped skipped, $failed failed ===="
+    (( failed == 0 )) || exit 1
+}
+
 # Run only when executed, not when sourced (scripts/tests/ sources this file
 # to unit-test the helper functions).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "$MODE" in
-        --install) do_install "$ARG" ;;
-        --remove)  do_remove  "$ARG" ;;
-        *) die "Usage: $0 --install <dir-of-debs> | --remove <kernel-version>" ;;
+        --install)     do_install "$ARG" ;;
+        --remove)      do_remove  "$ARG" ;;
+        --remove-many) shift; do_remove_many "$@" ;;
+        --boot-once)   do_boot_once "$ARG" ;;
+        *) die "Usage: $0 --install <dir-of-debs> | --remove <kernel-version> | --remove-many <kernel-version>... | --boot-once <kernel-version>" ;;
     esac
     exit 0
 fi

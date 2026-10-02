@@ -13,6 +13,27 @@ pub struct SystemInfo {
     pub kernels: Vec<InstalledKernel>,
     pub free_boot_bytes: Option<u64>,
     pub free_root_bytes: Option<u64>,
+    pub secure_boot: SecureBoot,
+    /// Roughly what one more kernel needs in /boot: the largest existing
+    /// kernel image plus the largest existing initramfs.
+    pub boot_needed_bytes: u64,
+}
+
+impl SystemInfo {
+    /// True when /boot has less free space than one more kernel needs.
+    pub fn boot_low(&self) -> bool {
+        self.free_boot_bytes.is_some_and(|f| f < self.boot_needed_bytes)
+    }
+}
+
+/// Secure Boot state. Mainline kernels are unsigned, so `Enabled` means a
+/// freshly installed one will be refused by shim at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SecureBoot {
+    Enabled,
+    Disabled,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +157,142 @@ pub fn query_system() -> SystemInfo {
         running_kernel,
         free_boot_bytes: get_free_disk("/boot"),
         free_root_bytes: get_free_disk("/"),
+        secure_boot: detect_secure_boot(),
+        boot_needed_bytes: boot_needed_bytes(),
     }
+}
+
+// ── Secure Boot ──────────────────────────────────────────────────────────
+
+/// Parse the raw SecureBoot EFI variable: 4 attribute bytes, then one data
+/// byte that is 1 when Secure Boot is on.
+pub fn parse_secureboot_efivar(raw: &[u8]) -> SecureBoot {
+    match raw.get(4) {
+        Some(1) => SecureBoot::Enabled,
+        Some(0) => SecureBoot::Disabled,
+        _ => SecureBoot::Unknown,
+    }
+}
+
+/// Parse `mokutil --sb-state` output. "SecureBoot validation is disabled in
+/// shim" means shim does not enforce signatures even though the firmware
+/// has Secure Boot on, so unsigned kernels do boot.
+pub fn parse_mokutil_sb_state(text: &str) -> SecureBoot {
+    if text.contains("validation is disabled") || text.contains("SecureBoot disabled") {
+        SecureBoot::Disabled
+    } else if text.contains("SecureBoot enabled") {
+        SecureBoot::Enabled
+    } else {
+        SecureBoot::Unknown
+    }
+}
+
+/// Merge the EFI variable reading with mokutil's (when installed). mokutil
+/// wins when it says disabled (it also sees shim's validation switch); the
+/// variable wins otherwise, with mokutil filling in when it is unreadable.
+pub fn combine_secure_boot(efi: SecureBoot, mokutil: Option<SecureBoot>) -> SecureBoot {
+    match (efi, mokutil) {
+        (_, Some(SecureBoot::Disabled)) => SecureBoot::Disabled,
+        (SecureBoot::Unknown, Some(m)) => m,
+        (e, _) => e,
+    }
+}
+
+fn detect_secure_boot() -> SecureBoot {
+    // Legacy BIOS boot: Secure Boot does not exist.
+    if !Path::new("/sys/firmware/efi").exists() {
+        return SecureBoot::Disabled;
+    }
+    let efi = std::fs::read_dir("/sys/firmware/efi/efivars")
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().find(|e| {
+                e.file_name().to_str().is_some_and(|n| n.starts_with("SecureBoot-"))
+            })
+        })
+        .and_then(|e| std::fs::read(e.path()).ok())
+        .map(|raw| parse_secureboot_efivar(&raw))
+        .unwrap_or(SecureBoot::Unknown);
+    // mokutil may be missing; that is fine.
+    let mokutil = Command::new("mokutil")
+        .arg("--sb-state")
+        .output()
+        .ok()
+        .map(|o| parse_mokutil_sb_state(&String::from_utf8_lossy(&o.stdout)));
+    combine_secure_boot(efi, mokutil)
+}
+
+// ── /boot space ──────────────────────────────────────────────────────────
+
+/// One more kernel needs about the largest existing kernel image plus the
+/// largest existing initramfs. None when either kind is absent.
+pub fn estimate_boot_needed(vmlinuz_sizes: &[u64], initrd_sizes: &[u64]) -> Option<u64> {
+    Some(*vmlinuz_sizes.iter().max()? + *initrd_sizes.iter().max()?)
+}
+
+fn boot_needed_bytes() -> u64 {
+    let (mut kernels, mut initrds) = (vec![], vec![]);
+    if let Ok(entries) = std::fs::read_dir("/boot") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(meta) = e.metadata() else { continue };
+            if name.starts_with("vmlinuz-") {
+                kernels.push(meta.len());
+            } else if name.starts_with("initrd.img-") {
+                initrds.push(meta.len());
+            }
+        }
+    }
+    estimate_boot_needed(&kernels, &initrds).unwrap_or(MIN_BOOT_BYTES)
+}
+
+/// Everything worth a confirmation before an install starts. Empty means
+/// nothing to warn about.
+pub fn install_warnings(info: &SystemInfo) -> Vec<String> {
+    let mut out = vec![];
+    if info.secure_boot == SecureBoot::Enabled {
+        out.push(
+            "Secure Boot is enabled. Mainline kernels are unsigned, so this machine will \
+             refuse to boot the new kernel unless Secure Boot is turned off or you sign \
+             the kernel yourself. The kernel you are running now will keep working."
+                .to_string(),
+        );
+    }
+    if let Some(f) = info.free_boot_bytes {
+        if info.boot_low() {
+            out.push(format!(
+                "/boot has {} free but a new kernel needs about {}. The install may fail \
+                 part way; remove old kernels first.",
+                format_bytes(f),
+                format_bytes(info.boot_needed_bytes)
+            ));
+        }
+    }
+    out
+}
+
+// ── Pruning old kernels ──────────────────────────────────────────────────
+
+/// Leading numeric components of a version string, for newest-first sorting.
+fn version_key(version: &str) -> Vec<u32> {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+/// Kernels that can be removed to keep only the newest `keep` (at least 1).
+/// The running kernel and the newest installed kernel are never returned.
+pub fn prune_candidates(kernels: &[InstalledKernel], keep: usize) -> Vec<String> {
+    let mut sorted: Vec<&InstalledKernel> = kernels.iter().collect();
+    sorted.sort_by_key(|k| std::cmp::Reverse(version_key(&k.version)));
+    sorted
+        .iter()
+        .skip(keep.max(1))
+        .filter(|k| !k.running)
+        .map(|k| k.version.clone())
+        .collect()
 }
 
 /// uname -r
@@ -172,15 +328,9 @@ fn get_installed_kernels(running: &str, bootloader: &Bootloader) -> Vec<Installe
     }
 
     kernels.sort_by(|a, b| {
-        let key = |k: &InstalledKernel| -> Vec<u32> {
-            k.version
-                .split(|c: char| !c.is_ascii_digit())
-                .filter_map(|s| s.parse().ok())
-                .collect()
-        };
         b.running
             .cmp(&a.running)
-            .then_with(|| key(b).cmp(&key(a)))
+            .then_with(|| version_key(&b.version).cmp(&version_key(&a.version)))
     });
     kernels
 }
@@ -262,6 +412,94 @@ mod tests {
         assert!(compare_to_running("6.8.0-45-generic", "6.9-rc1") == VersionRelation::Newer);
         assert!(compare_to_running("unknown", "6.9") == VersionRelation::Unknown);
         assert!(compare_to_running("6.8.0", "") == VersionRelation::Unknown);
+    }
+
+    fn kernel(version: &str, running: bool) -> InstalledKernel {
+        InstalledKernel {
+            version: version.into(),
+            has_initrd: true,
+            has_modules: true,
+            has_boot_entry: true,
+            running,
+        }
+    }
+
+    #[test]
+    fn secureboot_efivar_parsing() {
+        assert_eq!(parse_secureboot_efivar(&[6, 0, 0, 0, 1]), SecureBoot::Enabled);
+        assert_eq!(parse_secureboot_efivar(&[6, 0, 0, 0, 0]), SecureBoot::Disabled);
+        assert_eq!(parse_secureboot_efivar(&[6, 0, 0, 0]), SecureBoot::Unknown);
+        assert_eq!(parse_secureboot_efivar(&[]), SecureBoot::Unknown);
+        assert_eq!(parse_secureboot_efivar(&[6, 0, 0, 0, 7]), SecureBoot::Unknown);
+    }
+
+    #[test]
+    fn mokutil_parsing() {
+        assert_eq!(parse_mokutil_sb_state("SecureBoot enabled\n"), SecureBoot::Enabled);
+        assert_eq!(parse_mokutil_sb_state("SecureBoot disabled\n"), SecureBoot::Disabled);
+        assert_eq!(
+            parse_mokutil_sb_state("SecureBoot enabled\nSecureBoot validation is disabled in shim\n"),
+            SecureBoot::Disabled
+        );
+        assert_eq!(
+            parse_mokutil_sb_state("This system doesn't support Secure Boot\n"),
+            SecureBoot::Unknown
+        );
+        assert_eq!(parse_mokutil_sb_state(""), SecureBoot::Unknown);
+    }
+
+    #[test]
+    fn secure_boot_combination() {
+        use SecureBoot::*;
+        assert_eq!(combine_secure_boot(Enabled, None), Enabled);
+        assert_eq!(combine_secure_boot(Unknown, None), Unknown);
+        assert_eq!(combine_secure_boot(Unknown, Some(Enabled)), Enabled);
+        assert_eq!(combine_secure_boot(Enabled, Some(Disabled)), Disabled);
+        assert_eq!(combine_secure_boot(Enabled, Some(Unknown)), Enabled);
+        assert_eq!(combine_secure_boot(Disabled, Some(Enabled)), Disabled);
+    }
+
+    #[test]
+    fn boot_estimate_uses_largest_of_each() {
+        assert_eq!(estimate_boot_needed(&[10, 30, 20], &[100, 50]), Some(130));
+        assert_eq!(estimate_boot_needed(&[], &[100]), None);
+        assert_eq!(estimate_boot_needed(&[10], &[]), None);
+    }
+
+    #[test]
+    fn install_warnings_cover_secure_boot_and_space() {
+        let mut info = SystemInfo::default();
+        assert!(install_warnings(&info).is_empty());
+        info.secure_boot = SecureBoot::Enabled;
+        assert_eq!(install_warnings(&info).len(), 1);
+        info.free_boot_bytes = Some(50);
+        info.boot_needed_bytes = 100;
+        assert!(info.boot_low());
+        assert_eq!(install_warnings(&info).len(), 2);
+        info.free_boot_bytes = Some(100);
+        assert!(!info.boot_low());
+        info.secure_boot = SecureBoot::Unknown;
+        assert!(install_warnings(&info).is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_newest_and_running() {
+        let ks = vec![
+            kernel("6.8.0-45-generic", true),
+            kernel("7.1.3-070103-generic", false),
+            kernel("6.10.0-9-generic", false),
+            kernel("6.5.0-1-generic", false),
+        ];
+        // keep 2: newest two are 7.1.3 and 6.10.0; running 6.8.0 is spared
+        assert_eq!(prune_candidates(&ks, 2), vec!["6.5.0-1-generic".to_string()]);
+        // keep 1: only the newest is kept besides the running kernel
+        let got = prune_candidates(&ks, 1);
+        assert_eq!(got, vec!["6.10.0-9-generic".to_string(), "6.5.0-1-generic".to_string()]);
+        // keep 0 behaves like keep 1: the newest is never removed
+        assert_eq!(prune_candidates(&ks, 0), got);
+        assert!(!prune_candidates(&ks, 0).contains(&"7.1.3-070103-generic".to_string()));
+        // keep more than exist: nothing to remove
+        assert!(prune_candidates(&ks, 10).is_empty());
     }
 
     #[test]

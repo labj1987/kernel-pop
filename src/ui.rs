@@ -1,15 +1,18 @@
 use crate::download::{download_deb_set, Progress};
-use crate::install::{run_privileged_install, run_privileged_remove};
+use crate::install::{
+    dkms_warnings, run_privileged_boot_once, run_privileged_install, run_privileged_remove,
+    run_privileged_remove_many,
+};
 use crate::system::{
-    compare_to_running, format_bytes, query_system, SystemInfo, VersionRelation,
-    MIN_BOOT_BYTES, MIN_ROOT_BYTES,
+    compare_to_running, format_bytes, install_warnings, prune_candidates, query_system,
+    SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
 use crate::versions::{fetch_deb_list, fetch_versions, KernelVersion};
 
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, Label, ListBox, Orientation, ProgressBar,
-    ScrolledWindow, SelectionMode, Spinner, Stack, Switch, TextView, WrapMode,
+    ScrolledWindow, SelectionMode, SpinButton, Spinner, Stack, Switch, TextView, WrapMode,
 };
 use libadwaita::prelude::*;
 use libadwaita::{
@@ -59,6 +62,13 @@ where
             callback(val);
         }
     });
+}
+
+/// Show what the privileged script printed, line by line, in the Log tab.
+fn log_output(log_fn: &impl Fn(String), output: &str) {
+    for line in output.lines().filter(|l| !l.trim().is_empty()) {
+        log_fn(line.to_string());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,6 +138,11 @@ pub fn build_ui(app: &Application) {
     kernels_group.add(&kernels_list);
     sysinfo_page.append(&kernels_group);
 
+    let safety_group = PreferencesGroup::builder().title("Boot Safety").build();
+    let secure_boot_row = ActionRow::builder().title("Secure Boot").subtitle("Checking…").build();
+    safety_group.add(&secure_boot_row);
+    sysinfo_page.append(&safety_group);
+
     let disk_group = PreferencesGroup::builder().title("Disk").build();
     let boot_row = ActionRow::builder().title("/boot Free Space").subtitle("Checking…").build();
     let root_row = ActionRow::builder().title("/ Free Space").subtitle("Checking…").build();
@@ -135,13 +150,16 @@ pub fn build_ui(app: &Application) {
     disk_group.add(&root_row);
     sysinfo_page.append(&disk_group);
 
-    let refresh_sysinfo_btn = Button::builder()
-        .label("Refresh System Info")
-        .halign(Align::Center)
-        .margin_top(8)
-        .build();
+    let sys_btn_box = GtkBox::new(Orientation::Horizontal, 8);
+    sys_btn_box.set_halign(Align::Center);
+    sys_btn_box.set_margin_top(8);
+    let refresh_sysinfo_btn = Button::builder().label("Refresh System Info").build();
     refresh_sysinfo_btn.add_css_class("flat");
-    sysinfo_page.append(&refresh_sysinfo_btn);
+    let prune_btn = Button::builder().label("Remove Old Kernels…").build();
+    prune_btn.add_css_class("flat");
+    sys_btn_box.append(&refresh_sysinfo_btn);
+    sys_btn_box.append(&prune_btn);
+    sysinfo_page.append(&sys_btn_box);
 
     let sys_scroll = ScrolledWindow::builder().vexpand(true).child(&sysinfo_page).build();
     stack.add_titled(&sys_scroll, Some("system"), "System");
@@ -374,6 +392,7 @@ pub fn build_ui(app: &Application) {
         let kernels_list = kernels_list.clone();
         let boot_row = boot_row.clone();
         let root_row = root_row.clone();
+        let secure_boot_row = secure_boot_row.clone();
         let health_banner = health_banner.clone();
         let update_banner = update_banner.clone();
         let state = state.clone();
@@ -396,6 +415,7 @@ pub fn build_ui(app: &Application) {
             let kernels_list = kernels_list.clone();
             let boot_row = boot_row.clone();
             let root_row = root_row.clone();
+            let secure_boot_row = secure_boot_row.clone();
             let health_banner = health_banner.clone();
             let update_banner = update_banner.clone();
             let state = state.clone();
@@ -412,9 +432,19 @@ pub fn build_ui(app: &Application) {
                     running_row.set_subtitle("uname -r");
 
                     // Disk rows
+                    match info.secure_boot {
+                        SecureBoot::Enabled => secure_boot_row.set_subtitle(
+                            "Enabled — unsigned mainline kernels will not boot while it is on"),
+                        SecureBoot::Disabled => secure_boot_row.set_subtitle(
+                            "Off — unsigned mainline kernels can boot"),
+                        SecureBoot::Unknown => secure_boot_row.set_subtitle(
+                            "Could not determine (mokutil missing or EFI variables unreadable)"),
+                    }
                     match info.free_boot_bytes {
-                        Some(f) if f < MIN_BOOT_BYTES => {
-                            boot_row.set_subtitle(&format!("Low: {} free", format_bytes(f)));
+                        Some(f) if info.boot_low() => {
+                            boot_row.set_subtitle(&format!(
+                                "Low: {} free, a new kernel needs about {}",
+                                format_bytes(f), format_bytes(info.boot_needed_bytes)));
                         }
                         Some(f) => boot_row.set_subtitle(&format!("{} free", format_bytes(f))),
                         None => boot_row.set_subtitle("Could not determine"),
@@ -457,6 +487,42 @@ pub fn build_ui(app: &Application) {
                             remove_btn.add_css_class("destructive-action");
                             remove_btn.add_css_class("flat");
 
+                            // One-time boot of this kernel; the saved default stays put.
+                            let boot_btn = Button::builder()
+                                .label("Boot Next Time")
+                                .tooltip_text("Boot this kernel on the next restart only; the default is unchanged")
+                                .valign(Align::Center)
+                                .build();
+                            boot_btn.add_css_class("flat");
+                            {
+                                let ver = k.version.clone();
+                                let toast_overlay = toast_overlay.clone();
+                                let log_fn = log_fn.clone();
+                                boot_btn.connect_clicked(move |_| {
+                                    log_fn(format!("Selecting {} for the next boot only…", ver));
+                                    let ver2 = ver.clone();
+                                    let toast_overlay = toast_overlay.clone();
+                                    let log_fn = log_fn.clone();
+                                    spawn_async(
+                                        async move {
+                                            tokio::task::spawn_blocking(move || run_privileged_boot_once(&ver2)).await
+                                        },
+                                        move |result| match result {
+                                            Ok(Ok(out)) => {
+                                                log_output(&log_fn, &out);
+                                                toast_overlay.add_toast(Toast::new(
+                                                    "The next restart will boot that kernel once"));
+                                            }
+                                            Ok(Err(e)) => {
+                                                log_fn(format!("Boot-once failed: {}", e));
+                                                toast_overlay.add_toast(Toast::new("Could not set next boot — see Log tab"));
+                                            }
+                                            Err(e) => log_fn(format!("Task error: {}", e)),
+                                        },
+                                    );
+                                });
+                            }
+
                             let ver = k.version.clone();
                             let window = window.clone();
                             let toast_overlay = toast_overlay.clone();
@@ -489,7 +555,8 @@ pub fn build_ui(app: &Application) {
                                         },
                                         move |result| {
                                             match result {
-                                                Ok(Ok(())) => {
+                                                Ok(Ok(out)) => {
+                                                    log_output(&log_fn, &out);
                                                     log_fn("Kernel removed.".to_string());
                                                     toast_overlay.add_toast(Toast::new("Kernel removed"));
                                                 }
@@ -508,6 +575,7 @@ pub fn build_ui(app: &Application) {
                                 dialog.present(Some(&window));
                             });
 
+                            row.add_suffix(&boot_btn);
                             row.add_suffix(&remove_btn);
                         }
 
@@ -574,6 +642,92 @@ pub fn build_ui(app: &Application) {
     {
         let ls = load_sysinfo.clone();
         refresh_sysinfo_btn.connect_clicked(move |_| ls());
+    }
+
+    // Remove old kernels: ask how many to keep, show exactly what would go,
+    // then remove them all under one authentication. The running kernel and
+    // the newest installed kernel are never candidates (and the script
+    // enforces the same rule on its side).
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let log_fn = log_fn.clone();
+        let toast_overlay = toast_overlay.clone();
+        let load_sysinfo = load_sysinfo.clone();
+        prune_btn.connect_clicked(move |_| {
+            let keep_spin = SpinButton::with_range(1.0, 10.0, 1.0);
+            keep_spin.set_value(2.0);
+            keep_spin.set_halign(Align::Center);
+
+            let ask = AlertDialog::builder()
+                .heading("Remove old kernels")
+                .body("How many of the newest installed kernels should be kept? The running kernel is always kept as well.")
+                .build();
+            ask.set_extra_child(Some(&keep_spin));
+            ask.add_responses(&[("cancel", "Cancel"), ("review", "Review")]);
+            ask.set_default_response(Some("review"));
+            ask.set_close_response("cancel");
+
+            let window2 = window.clone();
+            let state = state.clone();
+            let log_fn = log_fn.clone();
+            let toast_overlay = toast_overlay.clone();
+            let load_sysinfo = load_sysinfo.clone();
+            ask.connect_response(None, move |_, resp| {
+                if resp != "review" { return; }
+                let keep = keep_spin.value() as usize;
+                let candidates = prune_candidates(&state.borrow().sysinfo.kernels, keep);
+                if candidates.is_empty() {
+                    toast_overlay.add_toast(Toast::new("Nothing to remove"));
+                    return;
+                }
+
+                let confirm = AlertDialog::builder()
+                    .heading(format!("Remove {} kernel(s)?", candidates.len()))
+                    .body(format!(
+                        "These will be purged and the boot loader updated:\n\n{}\n\nKernels whose removal would also remove the kernel metapackages are skipped and reported in the Log.",
+                        candidates.join("\n")
+                    ))
+                    .build();
+                confirm.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
+                confirm.set_response_appearance("remove", libadwaita::ResponseAppearance::Destructive);
+                confirm.set_default_response(Some("cancel"));
+                confirm.set_close_response("cancel");
+
+                let log_fn = log_fn.clone();
+                let toast_overlay = toast_overlay.clone();
+                let load_sysinfo = load_sysinfo.clone();
+                confirm.connect_response(None, move |_, resp| {
+                    if resp != "remove" { return; }
+                    log_fn(format!("Removing old kernels: {}", candidates.join(", ")));
+                    let list = candidates.clone();
+                    let log_fn = log_fn.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    let load_sysinfo = load_sysinfo.clone();
+                    spawn_async(
+                        async move {
+                            tokio::task::spawn_blocking(move || run_privileged_remove_many(&list)).await
+                        },
+                        move |result| {
+                            match result {
+                                Ok(Ok(out)) => {
+                                    log_output(&log_fn, &out);
+                                    toast_overlay.add_toast(Toast::new("Old kernels removed"));
+                                }
+                                Ok(Err(e)) => {
+                                    log_fn(format!("Removal finished with problems: {}", e));
+                                    toast_overlay.add_toast(Toast::new("Some kernels were not removed — see Log tab"));
+                                }
+                                Err(e) => log_fn(format!("Task error: {}", e)),
+                            }
+                            load_sysinfo();
+                        },
+                    );
+                });
+                confirm.present(Some(&window2));
+            });
+            ask.present(Some(&window));
+        });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -915,8 +1069,10 @@ pub fn build_ui(app: &Application) {
         let toast_overlay = toast_overlay.clone();
         let progress = progress.clone();
         let load_sysinfo = load_sysinfo.clone();
+        let window = window.clone();
+        let preflight_state = state.clone();
 
-        install_btn.connect_clicked(move |btn| {
+        let start_install: Rc<dyn Fn(&Button)> = Rc::new(move |btn: &Button| {
             let dir = { state.borrow().staged_dir.clone() };
             let Some(dir) = dir else { return };
             let dir_str = dir.display().to_string();
@@ -954,10 +1110,23 @@ pub fn build_ui(app: &Application) {
                     btn.set_sensitive(true);
                     progress.set_visible(false);
                     match result {
-                        Ok(Ok(())) => {
+                        Ok(Ok(out)) => {
+                            log_output(&log_fn, &out);
                             log_fn("Install completed — initramfs verified in /boot.".to_string());
-                            log_fn("Reboot to switch to the new kernel.".to_string());
-                            toast_overlay.add_toast(Toast::new("Kernel installed — reboot to activate"));
+                            // A DKMS failure never fails the install, but it
+                            // must not go unnoticed before a reboot.
+                            let dkms = dkms_warnings(&out);
+                            if dkms.is_empty() {
+                                log_fn("Reboot to switch to the new kernel.".to_string());
+                                toast_overlay.add_toast(Toast::new("Kernel installed — reboot to activate"));
+                            } else {
+                                log_fn(format!(
+                                    "WARNING: {} DKMS problem(s) — out-of-tree modules such as the NVIDIA driver may be missing after reboot. See the DKMS lines above.",
+                                    dkms.len()
+                                ));
+                                toast_overlay.add_toast(Toast::new(
+                                    "Kernel installed, but DKMS modules failed — see Log tab before rebooting"));
+                            }
                             load_sysinfo();
                         }
                         Ok(Err(e)) => {
@@ -968,6 +1137,32 @@ pub fn build_ui(app: &Application) {
                     }
                 },
             );
+        });
+
+        // Preflight: Secure Boot and /boot space need an explicit "install
+        // anyway" before the install starts.
+        install_btn.connect_clicked(move |btn| {
+            let warnings = install_warnings(&preflight_state.borrow().sysinfo);
+            if warnings.is_empty() {
+                start_install(btn);
+                return;
+            }
+            let dialog = AlertDialog::builder()
+                .heading("Before you install")
+                .body(warnings.join("\n\n"))
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("install", "Install Anyway")]);
+            dialog.set_response_appearance("install", libadwaita::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let start_install = start_install.clone();
+            let btn = btn.clone();
+            dialog.connect_response(None, move |_, resp| {
+                if resp == "install" {
+                    start_install(&btn);
+                }
+            });
+            dialog.present(Some(&window));
         });
     }
 

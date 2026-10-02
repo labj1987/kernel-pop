@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.4.0 — 2026-10-02
+
+- Secure Boot preflight: the System tab shows the Secure Boot state (EFI
+  variable, cross-checked with `mokutil --sb-state` when installed), and
+  installing while it is on asks for explicit confirmation, since unsigned
+  mainline kernels are refused at boot.
+- DKMS: the install builds registered DKMS modules (NVIDIA and others) for
+  the new kernel before generating the initramfs and reports installed or
+  failed per module in the Log tab, with the tail of `make.log` on failure.
+  A DKMS failure is a loud warning, never an install error.
+- `/boot` space check: the System tab and the install confirmation compare
+  free space with the largest kernel image plus the largest initramfs
+  already in `/boot`, instead of a fixed number.
+- Remove Old Kernels: keep the newest N kernels and remove the rest under a
+  single authentication. The running kernel and the newest installed kernel
+  are never removed, and kernels whose removal would drag out the kernel
+  metapackages are skipped.
+- Boot Next Time: boot a chosen installed kernel on the next restart only
+  (`grub-reboot` or `bootctl set-oneshot`), leaving the default untouched.
+- On `GRUB_DEFAULT=saved` systems the previous default is recorded and put
+  back if the new default does not verify.
+- Initramfs generation works with `update-initramfs` or `dracut`, whichever
+  is installed; the image is verified on disk either way.
+- The privileged script's output now appears in the app's Log tab.
+
 ## 1.3.5 — 2026-09-24
 
 - Releases no longer publish legacy `kernelpop-*` AppImage/.zsync copies, and

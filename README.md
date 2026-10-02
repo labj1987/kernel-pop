@@ -31,8 +31,13 @@ on boot. This app is built around not letting that happen:
 - Optional release-candidate visibility on the Browse tab (off by default)
 - SHA256 verification against the published CHECKSUMS file
 - Per-file download progress with retries and cancellation
-- Remove old kernels (running kernel is never removable)
-- Disk space checks for /boot and /
+- Remove old kernels (running kernel is never removable), singly or
+  "keep the newest N" in one step
+- Boot a chosen installed kernel on the next restart only
+- Secure Boot warning before installing an unsigned mainline kernel
+- DKMS modules (such as NVIDIA) are built for the new kernel and reported
+  per module; a failure is a warning, not an install error
+- Disk space checks for / and for /boot (sized from the kernels already there)
 - Install log in-app plus /var/log/kernel-pop.log
 
 ## Install
