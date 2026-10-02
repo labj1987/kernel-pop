@@ -15,7 +15,8 @@ pub struct SystemInfo {
     pub free_root_bytes: Option<u64>,
     pub secure_boot: SecureBoot,
     /// Roughly what one more kernel needs in /boot: the largest existing
-    /// kernel image plus the largest existing initramfs.
+    /// kernel image plus twice the largest existing initramfs (the margin
+    /// covers update-initramfs briefly needing more than the final size).
     pub boot_needed_bytes: u64,
 }
 
@@ -224,10 +225,12 @@ fn detect_secure_boot() -> SecureBoot {
 
 // ── /boot space ──────────────────────────────────────────────────────────
 
-/// One more kernel needs about the largest existing kernel image plus the
-/// largest existing initramfs. None when either kind is absent.
+/// One more kernel needs about the largest existing kernel image plus twice
+/// the largest existing initramfs: update-initramfs can briefly need more
+/// than the final initramfs size, so the second copy is a safety margin.
+/// None when either kind is absent.
 pub fn estimate_boot_needed(vmlinuz_sizes: &[u64], initrd_sizes: &[u64]) -> Option<u64> {
-    Some(*vmlinuz_sizes.iter().max()? + *initrd_sizes.iter().max()?)
+    Some(*vmlinuz_sizes.iter().max()? + 2 * *initrd_sizes.iter().max()?)
 }
 
 fn boot_needed_bytes() -> u64 {
@@ -460,8 +463,8 @@ mod tests {
     }
 
     #[test]
-    fn boot_estimate_uses_largest_of_each() {
-        assert_eq!(estimate_boot_needed(&[10, 30, 20], &[100, 50]), Some(130));
+    fn boot_estimate_is_largest_kernel_plus_twice_largest_initrd() {
+        assert_eq!(estimate_boot_needed(&[10, 30, 20], &[100, 50]), Some(230));
         assert_eq!(estimate_boot_needed(&[], &[100]), None);
         assert_eq!(estimate_boot_needed(&[10], &[]), None);
     }

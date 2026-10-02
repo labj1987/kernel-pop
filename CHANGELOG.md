@@ -11,8 +11,9 @@
   failed per module in the Log tab, with the tail of `make.log` on failure.
   A DKMS failure is a loud warning, never an install error.
 - `/boot` space check: the System tab and the install confirmation compare
-  free space with the largest kernel image plus the largest initramfs
-  already in `/boot`, instead of a fixed number.
+  free space with the largest kernel image plus twice the largest initramfs
+  already in `/boot` (a margin, since update-initramfs can briefly need more
+  than the final size), instead of a fixed number.
 - Remove Old Kernels: keep the newest N kernels and remove the rest under a
   single authentication. The running kernel and the newest installed kernel
   are never removed, and kernels whose removal would drag out the kernel
