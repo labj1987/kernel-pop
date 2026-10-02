@@ -28,9 +28,11 @@ boot is flagged *before* the reboot, not after.
   and SHA256 verification against the published CHECKSUMS file.
 - `system.rs` — inventories installed kernels and their boot health (the
   initrd/modules safety check described above); disk space on `/boot` and
-  `/`.
+  `/`; Secure Boot detection; install preflight warnings; which old
+  kernels can be pruned.
 - `install.rs` — invokes `scripts/privileged-install.sh` via `pkexec`
-  (dpkg install, initramfs generation, GRUB update).
+  (dpkg install, DKMS build, initramfs generation, boot loader update,
+  bulk removal, one-time boot) and returns the script's output to the UI.
 
 ## Build process
 
