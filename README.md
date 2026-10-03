@@ -94,6 +94,10 @@ Or build the AppImage the same way CI does:
 
     bash build-appimage.sh
 
+## Acknowledgements
+
+Development assistance: Claude Code (Anthropic) and Codex (OpenAI).
+
 ## License
 
 AGPL-3.0-or-later — see [LICENSE](LICENSE).

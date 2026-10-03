@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.1 — 2026-10-02
+
+- The About dialog and README credit Codex (OpenAI) again, alongside Claude Code (Anthropic).
+
 ## 1.4.0 — 2026-10-02
 
 - Secure Boot preflight: the System tab shows the Secure Boot state (EFI

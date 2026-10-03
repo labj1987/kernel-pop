@@ -1186,7 +1186,7 @@ pub fn build_ui(app: &Application) {
                     running, count
                 ))
                 .build();
-            dialog.add_acknowledgement_section(Some("Built with"), &["Claude Code (Anthropic)"]);
+            dialog.add_acknowledgement_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
             dialog.present(Some(&window));
         });
     }
