@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.0 — 2026-10-08
+
+- Kernel signing for Secure Boot. A one-time **Set Up Signing** action on
+  the System tab installs `sbsigntool`/`openssl`/`mokutil` if missing,
+  creates Kernel Pop's own kernel-signing key in `/var/lib/kernel-pop/mok/`
+  (codeSigning EKU, never Ubuntu's module-only MOK), signs every installed
+  kernel and queues the key for MOK enrollment with a one-time password
+  that is passed on stdin, never on a command line.
+- Once a key exists, every kernel the install signs right after it lands in
+  `/boot`: `sbsign` to a temp file, `sbverify`, then replace. On
+  systemd-boot and kernelstub the ESP copy is refreshed and checked too.
+  A signing failure is a `SIGN WARNING`, never an install failure; if
+  Secure Boot is enforcing, the final line says the kernel will not boot
+  until it is signed. With no key, installs behave as before.
+- The System tab shows a Kernel signing row (not set up, enrollment
+  pending, enrolled), a Signed/Unsigned badge and a Sign action per kernel,
+  and the Secure Boot row and install warning take the signing state into
+  account.
+- New privileged script modes: `--setup-signing` and `--sign <version>`.
+
 ## 1.4.1 — 2026-10-02
 
 - The About dialog and README credit Codex (OpenAI) again, alongside Claude Code (Anthropic).

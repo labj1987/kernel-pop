@@ -28,11 +28,30 @@ boot is flagged *before* the reboot, not after.
   and SHA256 verification against the published CHECKSUMS file.
 - `system.rs` — inventories installed kernels and their boot health (the
   initrd/modules safety check described above); disk space on `/boot` and
-  `/`; Secure Boot detection; install preflight warnings; which old
-  kernels can be pruned.
+  `/`; Secure Boot detection; kernel-signing state (`KernelSigning`, from
+  the key files in `/var/lib/kernel-pop/mok/` plus `mokutil --test-key` and
+  `--list-new`) and per-kernel signed state (from the size/mtime markers in
+  `/var/lib/kernel-pop/signed/`, since `/boot/vmlinuz-*` is 0600); install
+  preflight warnings; which old kernels can be pruned.
 - `install.rs` — invokes `scripts/privileged-install.sh` via `pkexec`
-  (dpkg install, DKMS build, initramfs generation, boot loader update,
-  bulk removal, one-time boot) and returns the script's output to the UI.
+  (dpkg install, kernel signing, DKMS build, initramfs generation, boot
+  loader update, bulk removal, one-time boot, signing setup, signing one
+  kernel) and returns the script's output to the UI. The signing setup's
+  MOK password goes to the script on stdin, never in argv.
+
+## Kernel signing
+
+- Kernel Pop has its own kernel-signing key (`/var/lib/kernel-pop/mok/`,
+  `signing.key` 0600, `signing.pem`/`signing.der` 0644, dir 0755). Never
+  reuse `/var/lib/shim-signed/mok/MOK.priv`: its module-only EKU
+  (1.3.6.1.4.1.2312.16.1.2) makes shim reject kernels signed with it. Key
+  generation asserts that OID is absent.
+- `sbsign` takes the PEM cert, `mokutil` the DER. sbsign appends a
+  signature; an already-signed image keeps its existing ones.
+- With no key, `--install` only adds one "signing not set up" log line.
+- Test overrides: `KERNEL_POP_MOK_DIR`, `KERNEL_POP_SIGNED_DIR`,
+  `KERNEL_POP_BOOT`. The script tests sign a copied EFI binary with a
+  throwaway key and stub mokutil; never run the real modes on a dev machine.
 
 ## Build process
 

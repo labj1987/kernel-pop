@@ -34,7 +34,12 @@ on boot. This app is built around not letting that happen:
 - Remove old kernels (running kernel is never removable), singly or
   "keep the newest N" in one step
 - Boot a chosen installed kernel on the next restart only
-- Secure Boot warning before installing an unsigned mainline kernel
+- Secure Boot warning before installing a kernel that will not be signed
+  with an enrolled key
+- Optional kernel signing: a one-time Set Up Signing step creates Kernel
+  Pop's own signing key, signs the installed kernels and queues the key for
+  MOK enrollment; from then on every kernel it installs is signed
+  automatically, with a Signed/Unsigned badge per kernel
 - DKMS modules (such as NVIDIA) are built for the new kernel and reported
   per module; a failure is a warning, not an install error
 - Disk space checks for / and for /boot (sized from the kernels already there)
@@ -80,10 +85,29 @@ helper script and polkit policy to system paths.
 
 ## Notes
 
-Developed and tested on Ubuntu 26.04, GNOME on Wayland. Mainline kernels
-are unsigned: with Secure Boot enabled they will not boot without a
-signing setup. Release candidates and daily builds are intentionally not
-listed.
+Developed and tested on Ubuntu 26.04, GNOME on Wayland. Release
+candidates and daily builds are intentionally not listed.
+
+### Secure Boot and kernel signing
+
+Mainline kernels are unsigned: with Secure Boot enforcing, shim refuses to
+boot them. Kernel signing fixes that:
+
+1. On the System tab, Kernel signing → **Set Up Signing**. Choose a
+   one-time password (8-16 characters). Kernel Pop installs `sbsigntool`,
+   `openssl` and `mokutil` if they are missing, creates a key in
+   `/var/lib/kernel-pop/mok/`, signs every installed kernel and queues the
+   key for enrollment with `mokutil --import`.
+2. Reboot. A blue MOK Manager screen appears: choose Enroll MOK, Continue,
+   Yes, and type the password once.
+
+From then on every kernel Kernel Pop installs is signed (`sbsign`, then
+`sbverify` before the image in `/boot` is replaced), whether Secure Boot is
+on or off. A signing failure is a `SIGN WARNING` in the log, never an
+install failure. Signing adds a signature, so a kernel already signed by
+Ubuntu keeps its original one too. Kernel Pop uses its own key rather than
+Ubuntu's module-signing MOK, which shim does not accept for kernels. Without
+the setup, kernels are installed unsigned exactly as before.
 
 ## Building from source
 

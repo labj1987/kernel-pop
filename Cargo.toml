@@ -1,6 +1,6 @@
 [package]
 name = "kernel-pop"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "Kernel Pop — GTK4 GUI for installing Ubuntu mainline kernels"
 authors = ["Linnard Alex Brown Jr."]
