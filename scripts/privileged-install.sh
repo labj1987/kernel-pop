@@ -20,6 +20,8 @@
 #   privileged-install.sh --remove  <kernel-version-string>
 #   privileged-install.sh --remove-many <kernel-version-string>...
 #   privileged-install.sh --boot-once <kernel-version-string>
+#   privileged-install.sh --setup-signing        (enrollment password on stdin)
+#   privileged-install.sh --sign <kernel-version-string>
 
 set -euo pipefail
 
@@ -249,6 +251,219 @@ dkms_postcheck() {
     return 0
 }
 
+# ── Kernel signing (Secure Boot) ────────────────────────────────────────
+# Mainline kernels are unsigned. Once --setup-signing has created a key and
+# queued it for MOK enrollment, every kernel this script installs is signed
+# with it, whether or not Secure Boot is on right now. Kernel Pop has its own
+# kernel-signing key: Ubuntu's module-signing MOK (/var/lib/shim-signed/mok)
+# carries a module-only EKU that shim rejects for kernels. sbsign appends a
+# signature, so a kernel that is already signed (by Canonical, say) keeps its
+# original signature as well.
+# With no key, nothing here runs except one "not set up" log line per install.
+SIGN_FAILED=0
+SIGN_OID_MODULE_ONLY="1.3.6.1.4.1.2312.16.1.2"
+SIGN_KEY_CN="Kernel Pop kernel signing key"
+
+mok_dir()    { echo "${KERNEL_POP_MOK_DIR:-/var/lib/kernel-pop/mok}"; }
+signed_dir() { echo "${KERNEL_POP_SIGNED_DIR:-/var/lib/kernel-pop/signed}"; }
+
+# All three key files are present.
+signing_key_present() {
+    local d
+    d="$(mok_dir)"
+    [[ -f "$d/signing.key" && -f "$d/signing.pem" && -f "$d/signing.der" ]]
+}
+
+# Create the signing key and certificate. Idempotent: an existing key is
+# never overwritten. Fails (non-zero) without touching anything already there.
+generate_signing_key() {
+    local d tmpd
+    d="$(mok_dir)"
+    if signing_key_present; then
+        log "Signing key already exists in $d — keeping it"
+        return 0
+    fi
+    if [[ -e "$d/signing.key" || -e "$d/signing.pem" || -e "$d/signing.der" ]]; then
+        log "SIGN WARNING: $d holds an incomplete key set — refusing to overwrite it. Move it aside and run the setup again."
+        return 1
+    fi
+    mkdir -p "$d" || return 1
+    chmod 0755 "$d" "$(dirname "$d")" 2>/dev/null || true
+    tmpd="$(mktemp -d "$d/.new.XXXXXX")" || return 1
+    cat > "$tmpd/req.cnf" <<EOF
+[ req ]
+distinguished_name = dn
+prompt = no
+x509_extensions = v3
+[ dn ]
+CN = $SIGN_KEY_CN
+[ v3 ]
+basicConstraints = critical,CA:FALSE
+extendedKeyUsage = codeSigning
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+EOF
+    if ! (umask 077 && openssl req -new -x509 -newkey rsa:2048 -nodes -days 36500 \
+            -config "$tmpd/req.cnf" -keyout "$tmpd/signing.key" -out "$tmpd/signing.pem") \
+            >>"$LOGFILE" 2>&1; then
+        rm -rf "$tmpd"
+        log "SIGN WARNING: openssl could not generate the signing key"
+        return 1
+    fi
+    # A module-only EKU would make shim refuse every kernel signed with it.
+    if openssl x509 -in "$tmpd/signing.pem" -noout -text 2>/dev/null | grep -qF "$SIGN_OID_MODULE_ONLY"; then
+        rm -rf "$tmpd"
+        die "The generated certificate carries the module-only EKU $SIGN_OID_MODULE_ONLY — refusing to use it"
+    fi
+    if ! openssl x509 -in "$tmpd/signing.pem" -outform DER -out "$tmpd/signing.der" >>"$LOGFILE" 2>&1; then
+        rm -rf "$tmpd"
+        log "SIGN WARNING: openssl could not convert the certificate to DER"
+        return 1
+    fi
+    chmod 0600 "$tmpd/signing.key"
+    chmod 0644 "$tmpd/signing.pem" "$tmpd/signing.der"
+    # Key last, so signing_key_present is never true for a half-moved set.
+    mv "$tmpd/signing.der" "$d/signing.der" && mv "$tmpd/signing.pem" "$d/signing.pem" \
+        && mv "$tmpd/signing.key" "$d/signing.key" || { rm -rf "$tmpd"; return 1; }
+    rm -rf "$tmpd"
+    log "Created signing key in $d (CN=$SIGN_KEY_CN)"
+}
+
+# Whether /boot/vmlinuz-<kver> carries a signature from our key. Quiet.
+kernel_signed() {
+    local img="${KERNEL_POP_BOOT:-/boot}/vmlinuz-$1"
+    [[ -f "$img" ]] && sbverify --cert "$(mok_dir)/signing.pem" "$img" >/dev/null 2>&1
+}
+
+# Record that vmlinuz-<kver> is signed, as "<size> <mtime>": the unprivileged
+# app cannot read a 0600 kernel image, but it can stat it and compare.
+write_signed_marker() {
+    local kver="$1" img="${KERNEL_POP_BOOT:-/boot}/vmlinuz-$1" d
+    d="$(signed_dir)"
+    mkdir -p "$d" && chmod 0755 "$d" || return 1
+    stat -c '%s %Y' "$img" > "$d/$kver" && chmod 0644 "$d/$kver"
+}
+
+remove_signed_marker() {
+    rm -f "$(signed_dir)/$1"
+}
+
+# Sign /boot/vmlinuz-<kver> in place. The signed image is written to a temp
+# file in the same directory, verified, and only then moved over the
+# original (keeping its mode and owner). Any failure removes the temp file,
+# leaves the original untouched and returns non-zero. An image that already
+# verifies against our key is left alone (returns 0).
+sign_kernel() {
+    local kver="$1" d img tmp
+    d="$(mok_dir)"
+    img="${KERNEL_POP_BOOT:-/boot}/vmlinuz-$kver"
+    if [[ ! -f "$img" ]]; then
+        log "SIGN WARNING: $img not found — nothing to sign"
+        return 1
+    fi
+    if ! signing_key_present; then
+        log "SIGN WARNING: no signing key in $d — run the signing setup first"
+        return 1
+    fi
+    if kernel_signed "$kver"; then
+        log "Already signed with the Kernel Pop key: $img"
+        write_signed_marker "$kver" || log "SIGN WARNING: could not write the signed marker for $kver"
+        return 0
+    fi
+    tmp="$(mktemp "$(dirname "$img")/.vmlinuz-$kver.signing.XXXXXX")" || {
+        log "SIGN WARNING: could not create a temp file next to $img"
+        return 1
+    }
+    if ! sbsign --key "$d/signing.key" --cert "$d/signing.pem" --output "$tmp" "$img" >>"$LOGFILE" 2>&1; then
+        rm -f "$tmp"
+        log "SIGN WARNING: sbsign failed for $img — left unchanged"
+        return 1
+    fi
+    if ! sbverify --cert "$d/signing.pem" "$tmp" >>"$LOGFILE" 2>&1; then
+        rm -f "$tmp"
+        log "SIGN WARNING: the signed copy of $img did not verify — left unchanged"
+        return 1
+    fi
+    if ! { chmod --reference="$img" "$tmp" && chown --reference="$img" "$tmp" && mv -f "$tmp" "$img"; }; then
+        rm -f "$tmp"
+        log "SIGN WARNING: could not replace $img with the signed copy — left unchanged"
+        return 1
+    fi
+    write_signed_marker "$kver" || log "SIGN WARNING: could not write the signed marker for $kver"
+    log "Signed: $img"
+}
+
+# After a kernel in /boot was signed, refresh the copy the boot loader really
+# loads. GRUB reads /boot directly. systemd-boot and kernelstub got the
+# unsigned image copied to the ESP by the dpkg postinst hook, so re-run the
+# sync and check the ESP copy. Best effort: problems are SIGN WARNINGs only.
+sync_signed_to_esp() {
+    local kver="$1" bl esp img="" entry rel
+    read -r bl esp <<< "$(detect_bootloader)"
+    case "$bl" in
+        systemd-boot)
+            if ! command -v kernel-install >/dev/null 2>&1; then
+                log "SIGN WARNING: kernel-install not found — the ESP copy of $kver was not refreshed and is still unsigned"
+                return 0
+            fi
+            if ! kernel-install add "$kver" "/boot/vmlinuz-$kver" >>"$LOGFILE" 2>&1; then
+                log "SIGN WARNING: kernel-install add failed for $kver — the ESP copy may still be unsigned"
+                return 0
+            fi
+            entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)" || true
+            if [[ -n "$entry" ]]; then
+                rel="$(sed -n 's/^linux[[:space:]]\{1,\}//p' "$entry" | head -1)"
+                [[ -n "$rel" ]] && img="$esp/${rel#/}"
+            fi
+            ;;
+        kernelstub)
+            if ! kernelstub >>"$LOGFILE" 2>&1; then
+                log "SIGN WARNING: kernelstub failed — the ESP kernel image may still be unsigned"
+                return 0
+            fi
+            img="$(compgen -G "$esp/EFI/Pop_OS-*/vmlinuz.efi" | head -1 || true)"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+    if [[ -z "$img" || ! -f "$img" ]]; then
+        log "SIGN WARNING: could not find the ESP kernel image for $kver to check its signature"
+    elif sbverify --cert "$(mok_dir)/signing.pem" "$img" >/dev/null 2>&1; then
+        log "Verified: ESP copy $img is signed"
+    else
+        log "SIGN WARNING: the ESP copy $img does not carry the Kernel Pop signature"
+    fi
+    return 0
+}
+
+# Secure Boot is on and shim enforces it. mokutil sees shim's validation
+# switch; the raw EFI variable is the fallback.
+secure_boot_enforcing() {
+    local out v
+    if command -v mokutil >/dev/null 2>&1; then
+        out="$(mokutil --sb-state 2>/dev/null)" || out=""
+        [[ "$out" == *"validation is disabled"* ]] && return 1
+        [[ "$out" == *"SecureBoot enabled"* ]] && return 0
+        [[ "$out" == *"SecureBoot disabled"* ]] && return 1
+    fi
+    v="$(compgen -G '/sys/firmware/efi/efivars/SecureBoot-*' | head -1 || true)"
+    [[ -n "$v" ]] || return 1
+    [[ "$(od -An -t u1 -j4 -N1 "$v" 2>/dev/null | tr -d ' ')" == "1" ]]
+}
+
+# MOK Manager takes 8-16 characters, typed on a US keyboard layout at boot.
+valid_mok_password() {
+    local LC_ALL=C
+    [[ "$1" =~ ^[!-~]{8,16}$ ]]
+}
+
+# The crypt line from `mokutil --generate-hash` output (its prompts are
+# printed too).
+mok_hash_from_output() {
+    grep -m1 '^\$6\$' || true
+}
+
 # ── Installed kernels ───────────────────────────────────────────────────
 # One kernel version per line, from the vmlinuz-* files in /boot.
 installed_kvers() {
@@ -331,6 +546,20 @@ do_install() {
     [[ -f "/boot/vmlinuz-$kver" ]] || die "/boot/vmlinuz-$kver did NOT appear after install — the kernel package did not install correctly"
     log "Verified: /boot/vmlinuz-$kver exists"
 
+    # ── Signing: only when the signing setup has been done ─────────────
+    # A failure is a warning, never an install error (same as DKMS below).
+    local signed_now=0
+    if signing_key_present; then
+        if sign_kernel "$kver"; then
+            signed_now=1
+        else
+            SIGN_FAILED=$((SIGN_FAILED + 1))
+            log "SIGN WARNING: $kver was installed but could NOT be signed"
+        fi
+    else
+        log "Kernel signing not set up — $kver left unsigned"
+    fi
+
     # ── DKMS: build out-of-tree modules before the initramfs ───────────
     # The headers are installed by now. Running this before the initramfs
     # step means modules that belong in the initramfs are included. A failure
@@ -359,6 +588,7 @@ do_install() {
             efi_img="$(compgen -G "$esp/EFI/Pop_OS-*/vmlinuz.efi" | head -1 || true)"
             [[ -n "$efi_img" ]] || die "No EFI/Pop_OS-*/vmlinuz.efi under $esp after install — kernelstub did not sync. Try 'kernelstub -p' — DO NOT reboot expecting the new kernel"
             log "Verified: kernelstub image $efi_img exists"
+            if (( signed_now )); then sync_signed_to_esp "$kver"; fi
             ;;
         systemd-boot)
             # kernel-install already ran automatically via the dpkg postinst
@@ -370,6 +600,7 @@ do_install() {
             entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)" || true
             [[ -n "$entry" ]] || die "No systemd-boot entry appeared for $kver in $esp/loader/entries — DO NOT reboot expecting it in the menu"
             log "Verified: boot menu entry $entry exists"
+            if (( signed_now )); then sync_signed_to_esp "$kver"; fi
             ;;
         grub)
             log "Updating GRUB…"
@@ -418,6 +649,13 @@ do_install() {
 
     if (( DKMS_FAILED > 0 )); then
         log "DKMS WARNING: $DKMS_FAILED DKMS problem(s) for $kver — the kernel is installed, but out-of-tree modules (such as the NVIDIA driver) may be missing after reboot. See the DKMS lines above."
+    fi
+    if (( SIGN_FAILED > 0 )); then
+        if secure_boot_enforcing; then
+            log "==== Done. Kernel $kver installed with initramfs verified, but it is NOT signed and Secure Boot is enforcing: it will not boot until it is signed. ===="
+            return 0
+        fi
+        log "SIGN WARNING: $kver is installed but unsigned. Secure Boot is not enforcing now, so it boots; sign it before turning Secure Boot on."
     fi
     log "==== Done. Kernel $kver installed with initramfs verified. Reboot when ready. ===="
 }
@@ -539,7 +777,98 @@ do_remove() {
             ;;
     esac
 
+    remove_signed_marker "$kver"
     log "==== Done. Kernel $kver removed. ===="
+}
+
+# ── Signing setup and on-demand signing ─────────────────────────────────
+# Names of the apt packages that provide the signing tools not yet installed.
+missing_signing_packages() {
+    local pkgs=()
+    if ! command -v sbsign >/dev/null 2>&1 || ! command -v sbverify >/dev/null 2>&1; then
+        pkgs+=(sbsigntool)
+    fi
+    command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
+    command -v mokutil >/dev/null 2>&1 || pkgs+=(mokutil)
+    echo "${pkgs[*]}"
+}
+
+MOK_HASH_FILE=""
+
+# Queue signing.der for enrollment at the next boot. The password goes from
+# a variable through bash builtins into mokutil's stdin and the hash into a
+# root-only temp file; it never appears in argv or the log.
+queue_key_enrollment() {
+    local pw="$1" d test hash
+    d="$(mok_dir)"
+    test="$(mokutil --test-key "$d/signing.der" 2>/dev/null)" || true
+    if [[ "$test" == *"is already"* ]]; then
+        log "The signing key is already enrolled or waiting for enrollment — nothing to queue"
+        return 0
+    fi
+    hash="$(printf '%s\n%s\n' "$pw" "$pw" | mokutil --generate-hash 2>/dev/null | mok_hash_from_output)"
+    [[ -n "$hash" ]] || die "mokutil --generate-hash did not produce a password hash"
+    MOK_HASH_FILE="$(umask 077 && mktemp)" || die "Could not create a temp file for the password hash"
+    trap 'rm -f "$MOK_HASH_FILE"' EXIT
+    printf '%s\n' "$hash" > "$MOK_HASH_FILE"
+    if ! mokutil --import "$d/signing.der" --hash-file "$MOK_HASH_FILE" >>"$LOGFILE" 2>&1; then
+        rm -f "$MOK_HASH_FILE"
+        die "mokutil --import failed — the key was not queued for enrollment"
+    fi
+    rm -f "$MOK_HASH_FILE"
+    log "Enrollment queued. On the next reboot a blue MOK Manager screen appears: choose Enroll MOK, Continue, Yes, then type the password you chose."
+}
+
+# One-time setup: tools, key, sign every installed kernel, queue enrollment.
+# The enrollment password is the first line of stdin.
+do_setup_signing() {
+    local pw="" missing v signed=0 already=0 failed=0
+    IFS= read -r pw || true
+    valid_mok_password "$pw" || die "The enrollment password must be 8 to 16 printable ASCII characters without spaces"
+
+    log "==== Kernel signing setup started ===="
+    missing="$(missing_signing_packages)"
+    if [[ -n "$missing" ]]; then
+        log "Installing signing tools: $missing"
+        # shellcheck disable=SC2086
+        apt-get install -y $missing </dev/null >>"$LOGFILE" 2>&1 || die "apt-get could not install: $missing"
+    fi
+
+    generate_signing_key || die "Could not create the signing key"
+
+    while IFS= read -r v; do
+        [[ -n "$v" ]] || continue
+        if ! valid_kver "$v"; then
+            log "Skipping oddly named kernel image: vmlinuz-$v"
+            continue
+        fi
+        if kernel_signed "$v"; then
+            write_signed_marker "$v" || log "SIGN WARNING: could not write the signed marker for $v"
+            log "Already signed: $v"
+            already=$((already + 1))
+        elif sign_kernel "$v"; then
+            sync_signed_to_esp "$v"
+            signed=$((signed + 1))
+        else
+            log "SIGN WARNING: $v could not be signed — continuing with the rest"
+            failed=$((failed + 1))
+        fi
+    done < <(installed_kvers)
+    log "Kernels: $signed signed now, $already already signed, $failed failed"
+
+    queue_key_enrollment "$pw"
+    log "==== Kernel signing setup done ===="
+}
+
+do_sign() {
+    local kver="$1"
+    [[ -n "$kver" ]] || die "No kernel version specified"
+    valid_kver "$kver" || die "Invalid kernel version string: '$kver'"
+    [[ -f "/boot/vmlinuz-$kver" ]] || die "Kernel $kver is not installed (no /boot/vmlinuz-$kver)"
+    signing_key_present || die "Kernel signing is not set up — run the signing setup first"
+    sign_kernel "$kver" || die "Signing $kver failed — the kernel image was left unchanged"
+    sync_signed_to_esp "$kver"
+    log "==== Done. Kernel $kver is signed. ===="
 }
 
 # Remove several kernels under ONE authentication. Each removal runs as its
@@ -581,7 +910,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         --remove)      do_remove  "$ARG" ;;
         --remove-many) shift; do_remove_many "$@" ;;
         --boot-once)   do_boot_once "$ARG" ;;
-        *) die "Usage: $0 --install <dir-of-debs> | --remove <kernel-version> | --remove-many <kernel-version>... | --boot-once <kernel-version>" ;;
+        --setup-signing) do_setup_signing ;;
+        --sign)        do_sign "$ARG" ;;
+        *) die "Usage: $0 --install <dir-of-debs> | --remove <kernel-version> | --remove-many <kernel-version>... | --boot-once <kernel-version> | --setup-signing (password on stdin) | --sign <kernel-version>" ;;
     esac
     exit 0
 fi

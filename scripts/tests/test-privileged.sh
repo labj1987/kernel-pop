@@ -135,5 +135,149 @@ KERNEL_POP_GRUB_CFG="$tmp/grub.cfg" grub_entry_path_for_kver 9.9.9-generic >/dev
 # restore_grub_default with no previous default is a no-op that succeeds
 restore_grub_default "" || bad "restore_grub_default empty should succeed"
 
+# ── Kernel signing ───────────────────────────────────────────────────────
+for p in 'abcdefgh' 'Abc123!@#$%^&*()' 'p4ssw0rd~'; do
+    valid_mok_password "$p" || bad "valid_mok_password should accept [$p]"
+done
+for p in '' 'short' 'abcdefghijklmnopq' 'has space1' $'tab\there1' 'pässwörd1' $'new\nline12'; do
+    valid_mok_password "$p" && bad "valid_mok_password should reject [$p]"
+done
+got="$(printf 'input password: \ninput password again: \n$6$salt$hashvalue\n' | mok_hash_from_output)"
+[[ "$got" == '$6$salt$hashvalue' ]] || bad "mok_hash_from_output got [$got]"
+got="$(printf 'input password: \nerror\n' | mok_hash_from_output)"
+[[ -z "$got" ]] || bad "mok_hash_from_output should be empty without a hash line, got [$got]"
+
+export KERNEL_POP_MOK_DIR="$tmp/mok" KERNEL_POP_SIGNED_DIR="$tmp/signed" KERNEL_POP_BOOT="$tmp/sboot"
+mkdir -p "$KERNEL_POP_BOOT"
+signing_key_present && bad "signing_key_present should be false with no key"
+# Without a key, sign_kernel refuses and touches nothing
+echo "image" > "$KERNEL_POP_BOOT/vmlinuz-1.0.0-nokey"
+sign_kernel 1.0.0-nokey >/dev/null && bad "sign_kernel should fail without a key"
+[[ "$(cat "$KERNEL_POP_BOOT/vmlinuz-1.0.0-nokey")" == "image" ]] || bad "sign_kernel without a key changed the image"
+rm -f "$KERNEL_POP_BOOT/vmlinuz-1.0.0-nokey"
+
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "SKIP: openssl not installed — key generation and signing tests skipped"
+else
+    generate_signing_key >/dev/null || bad "generate_signing_key failed"
+    signing_key_present || bad "signing_key_present should be true after generation"
+    [[ "$(stat -c '%a' "$KERNEL_POP_MOK_DIR/signing.key")" == "600" ]] || bad "signing.key should be mode 600"
+    [[ "$(stat -c '%a' "$KERNEL_POP_MOK_DIR/signing.pem")" == "644" ]] || bad "signing.pem should be mode 644"
+    [[ "$(stat -c '%a' "$KERNEL_POP_MOK_DIR/signing.der")" == "644" ]] || bad "signing.der should be mode 644"
+    [[ "$(stat -c '%a' "$KERNEL_POP_MOK_DIR")" == "755" ]] || bad "the MOK dir should be mode 755"
+    certtext="$(openssl x509 -in "$KERNEL_POP_MOK_DIR/signing.pem" -noout -text)"
+    grep -qF "$SIGN_OID_MODULE_ONLY" <<< "$certtext" && bad "certificate must not carry the module-only EKU"
+    grep -q "Code Signing" <<< "$certtext" || bad "certificate should carry the codeSigning EKU"
+    grep -q "CA:FALSE" <<< "$certtext" || bad "certificate should be CA:FALSE"
+    grep -q "CN *= *Kernel Pop kernel signing key" <<< "$certtext" || bad "certificate subject CN"
+    openssl x509 -inform DER -in "$KERNEL_POP_MOK_DIR/signing.der" -noout >/dev/null 2>&1 || bad "signing.der is not a DER certificate"
+    keysum="$(sha256sum < "$KERNEL_POP_MOK_DIR/signing.key")"
+    generate_signing_key >/dev/null || bad "second generate_signing_key should succeed"
+    [[ "$(sha256sum < "$KERNEL_POP_MOK_DIR/signing.key")" == "$keysum" ]] || bad "generate_signing_key overwrote an existing key"
+    # An incomplete set is never overwritten
+    mkdir -p "$tmp/partial"
+    echo "keep" > "$tmp/partial/signing.key"
+    KERNEL_POP_MOK_DIR="$tmp/partial" generate_signing_key >/dev/null && bad "generate_signing_key should refuse an incomplete key set"
+    [[ "$(cat "$tmp/partial/signing.key")" == "keep" ]] || bad "generate_signing_key touched an incomplete key set"
+
+    pe=""
+    for f in /usr/lib/systemd/boot/efi/linuxx64.efi.stub /usr/lib/systemd/boot/efi/*.efi \
+             /usr/lib/systemd/boot/efi/*.efi.stub /usr/lib/shim/*.efi; do
+        if [[ -f "$f" && -r "$f" && "$(head -c 2 "$f" 2>/dev/null)" == "MZ" ]]; then pe="$f"; break; fi
+    done
+    if ! command -v sbsign >/dev/null 2>&1 || ! command -v sbverify >/dev/null 2>&1; then
+        echo "SKIP: sbsign/sbverify not installed — kernel signing tests skipped"
+    elif [[ -z "$pe" ]]; then
+        echo "SKIP: no readable PE/EFI binary found — kernel signing tests skipped"
+    else
+        k=9.9.9-070909-generic
+        img="$KERNEL_POP_BOOT/vmlinuz-$k"
+        cp "$pe" "$img"; chmod 0640 "$img"
+        kernel_signed "$k" && bad "a copied unsigned EFI binary should not verify against our key"
+        out="$(sign_kernel "$k")" || bad "sign_kernel failed on $pe: $out"
+        kernel_signed "$k" || bad "the image should verify after sign_kernel"
+        sbverify --cert "$KERNEL_POP_MOK_DIR/signing.pem" "$img" >/dev/null 2>&1 || bad "sbverify should accept the signed image"
+        [[ "$(stat -c '%a' "$img")" == "640" ]] || bad "sign_kernel should keep the image mode, got $(stat -c '%a' "$img")"
+        [[ "$(cat "$KERNEL_POP_SIGNED_DIR/$k")" == "$(stat -c '%s %Y' "$img")" ]] || bad "signed marker should hold size and mtime"
+        [[ "$(stat -c '%a' "$KERNEL_POP_SIGNED_DIR/$k")" == "644" ]] || bad "signed marker should be mode 644"
+        [[ -z "$(compgen -G "$KERNEL_POP_BOOT/.vmlinuz-*")" ]] || bad "sign_kernel left a temp file behind"
+        # Second call is a no-op
+        sum="$(sha256sum < "$img")"
+        out="$(sign_kernel "$k")" || bad "second sign_kernel should succeed"
+        grep -q "Already signed" <<< "$out" || bad "second sign_kernel should report already signed"
+        [[ "$(sha256sum < "$img")" == "$sum" ]] || bad "second sign_kernel changed the image"
+        got="$(KERNEL_POP_BOOT="$tmp/sboot" installed_kvers)"
+        [[ "$got" == "$k" ]] || bad "installed_kvers should list only the kernel, got [$got]"
+        remove_signed_marker "$k"
+        [[ -e "$KERNEL_POP_SIGNED_DIR/$k" ]] && bad "remove_signed_marker left the marker"
+
+        # sbsign failure (not a PE image): original byte-identical, no temp file, no marker
+        bk=9.9.8-bad
+        printf 'not a kernel image\n' > "$KERNEL_POP_BOOT/vmlinuz-$bk"
+        cp "$KERNEL_POP_BOOT/vmlinuz-$bk" "$tmp/orig-bad"
+        out="$(sign_kernel "$bk")" && bad "sign_kernel should fail on a non-PE image"
+        grep -q "SIGN WARNING" <<< "$out" || bad "a failed sign should log a SIGN WARNING"
+        cmp -s "$KERNEL_POP_BOOT/vmlinuz-$bk" "$tmp/orig-bad" || bad "a failed sign changed the original"
+        [[ -z "$(compgen -G "$KERNEL_POP_BOOT/.vmlinuz-*")" ]] || bad "a failed sign left a temp file behind"
+        [[ -e "$KERNEL_POP_SIGNED_DIR/$bk" ]] && bad "a failed sign wrote a marker"
+        rm -f "$KERNEL_POP_BOOT/vmlinuz-$bk"
+
+        # sbsign "succeeds" but writes garbage: the verify step must catch it
+        gk=9.9.7-garbage
+        cp "$pe" "$KERNEL_POP_BOOT/vmlinuz-$gk"
+        cp "$pe" "$tmp/orig-garbage"
+        sbsign() { local o="" a; for a in "$@"; do [[ "$o" == "--output" ]] && echo junk > "$a"; o="$a"; done; return 0; }
+        out="$(sign_kernel "$gk")" && bad "sign_kernel should fail when the signed copy does not verify"
+        unset -f sbsign
+        cmp -s "$KERNEL_POP_BOOT/vmlinuz-$gk" "$tmp/orig-garbage" || bad "an unverified sign changed the original"
+        [[ -z "$(compgen -G "$KERNEL_POP_BOOT/.vmlinuz-*")" ]] || bad "an unverified sign left a temp file behind"
+
+        # do_setup_signing end to end, with mokutil, apt-get and the boot
+        # loader stubbed: signs every kernel it can, carries on past one
+        # that fails, and the password never reaches an argument list.
+        (
+            calls="$tmp/mokutil-calls"
+            : > "$calls"
+            mokutil() {
+                echo "ARGS: $*" >> "$calls"
+                case "$1" in
+                    --test-key) echo "$2 is not enrolled" ;;
+                    --generate-hash)
+                        local a b; IFS= read -r a; IFS= read -r b
+                        [[ "$a" == "$b" ]] || return 1
+                        echo "input password:"; echo '$6$teststalt$fakehash' ;;
+                    --import)
+                        [[ "$3" == "--hash-file" && "$(stat -c '%a' "$4")" == "600" ]] || return 1
+                        cat "$4" >> "$calls"; echo "$4" > "$tmp/hashfile-path" ;;
+                esac
+            }
+            apt-get() { echo "apt-get should not run: tools are installed" >> "$calls"; return 1; }
+            detect_bootloader() { echo "grub"; }
+            rm -rf "$KERNEL_POP_SIGNED_DIR"
+            cp "$pe" "$KERNEL_POP_BOOT/vmlinuz-9.9.6-setup"
+            printf 'not a kernel image\n' > "$KERNEL_POP_BOOT/vmlinuz-9.9.5-broken"
+            out="$(printf 'Secret-pw1\n' | do_setup_signing 2>&1)" || { echo "FAIL: do_setup_signing failed: $out"; exit 1; }
+            r=0
+            grep -q "Kernels: 2 signed now, 1 already signed, 1 failed" <<< "$out" || { echo "FAIL: setup summary: $out"; r=1; }
+            grep -q "Enrollment queued" <<< "$out" || { echo "FAIL: setup should queue the enrollment"; r=1; }
+            grep -q "Secret-pw1" "$calls" && { echo "FAIL: the password reached mokutil's argv"; r=1; }
+            grep -q "Secret-pw1" <<< "$out" && { echo "FAIL: the password was printed"; r=1; }
+            grep -q -- "--import $KERNEL_POP_MOK_DIR/signing.der --hash-file" "$calls" || { echo "FAIL: mokutil --import call"; r=1; }
+            grep -qF '$6$teststalt$fakehash' "$calls" || { echo "FAIL: the hash file did not hold the hash"; r=1; }
+            [[ -e "$(cat "$tmp/hashfile-path")" ]] && { echo "FAIL: the hash file was left behind"; r=1; }
+            grep -q "apt-get should not run" "$calls" && { echo "FAIL: apt-get ran with every tool installed"; r=1; }
+            kernel_signed 9.9.6-setup || { echo "FAIL: setup did not sign 9.9.6-setup"; r=1; }
+            [[ -f "$KERNEL_POP_SIGNED_DIR/$k" && -f "$KERNEL_POP_SIGNED_DIR/9.9.6-setup" ]] || { echo "FAIL: setup markers"; r=1; }
+            [[ -e "$KERNEL_POP_SIGNED_DIR/9.9.5-broken" ]] && { echo "FAIL: marker for a kernel that failed"; r=1; }
+            # Bad passwords are refused before anything runs
+            : > "$calls"
+            (printf 'short\n' | do_setup_signing >/dev/null 2>&1) && { echo "FAIL: setup accepted a short password"; r=1; }
+            [[ -s "$calls" ]] && { echo "FAIL: setup ran mokutil despite a bad password"; r=1; }
+            exit "$r"
+        ) || bad "do_setup_signing end-to-end checks"
+    fi
+fi
+unset KERNEL_POP_MOK_DIR KERNEL_POP_SIGNED_DIR KERNEL_POP_BOOT
+
 if (( fails )); then echo "$fails failure(s)"; exit 1; fi
 echo "all privileged-install helper tests passed"

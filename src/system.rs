@@ -4,7 +4,8 @@
 //! /boot is checked for a matching initrd.img and /lib/modules directory,
 //! so a kernel that would VFS-panic on boot is visible BEFORE the reboot.
 
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Default)]
@@ -14,6 +15,7 @@ pub struct SystemInfo {
     pub free_boot_bytes: Option<u64>,
     pub free_root_bytes: Option<u64>,
     pub secure_boot: SecureBoot,
+    pub kernel_signing: KernelSigning,
     /// Roughly what one more kernel needs in /boot: the largest existing
     /// kernel image plus twice the largest existing initramfs (the margin
     /// covers update-initramfs briefly needing more than the final size).
@@ -37,6 +39,29 @@ pub enum SecureBoot {
     Unknown,
 }
 
+/// State of Kernel Pop's own kernel-signing key (set up once with the
+/// privileged script's `--setup-signing`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum KernelSigning {
+    /// No key: kernels are installed unsigned, exactly as before.
+    NoKey,
+    /// A key exists but is neither in the MOK list nor queued for it.
+    KeyNotEnrolled,
+    /// Queued with mokutil; confirmed at MOK Manager on the next reboot.
+    EnrollmentPending,
+    /// In the MOK list: kernels signed with it boot under Secure Boot.
+    Enrolled,
+    /// A key exists but its enrollment state could not be read.
+    #[default]
+    Unknown,
+}
+
+impl KernelSigning {
+    pub fn key_present(&self) -> bool {
+        !matches!(self, KernelSigning::NoKey)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InstalledKernel {
     /// Full version string, e.g. "7.1.3-070103-generic"
@@ -48,6 +73,10 @@ pub struct InstalledKernel {
     /// entry under the ESP, since nothing else guarantees one exists.
     pub has_boot_entry: bool,
     pub running: bool,
+    /// Signed with Kernel Pop's key, from the marker the privileged script
+    /// writes after signing. None when signing is not set up. Not part of
+    /// `healthy()`: an unsigned kernel boots fine with Secure Boot off.
+    pub signed: Option<bool>,
 }
 
 impl InstalledKernel {
@@ -153,14 +182,134 @@ fn has_boot_entry(version: &str, bootloader: &Bootloader) -> bool {
 pub fn query_system() -> SystemInfo {
     let running_kernel = get_running_kernel();
     let bootloader = detect_bootloader();
+    let kernel_signing = detect_kernel_signing();
     SystemInfo {
-        kernels: get_installed_kernels(&running_kernel, &bootloader),
+        kernels: get_installed_kernels(&running_kernel, &bootloader, kernel_signing.key_present()),
         running_kernel,
         free_boot_bytes: get_free_disk("/boot"),
         free_root_bytes: get_free_disk("/"),
         secure_boot: detect_secure_boot(),
+        kernel_signing,
         boot_needed_bytes: boot_needed_bytes(),
     }
+}
+
+// ── Kernel signing ───────────────────────────────────────────────────────
+
+fn mok_dir() -> PathBuf {
+    std::env::var_os("KERNEL_POP_MOK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/kernel-pop/mok"))
+}
+
+fn signed_dir() -> PathBuf {
+    std::env::var_os("KERNEL_POP_SIGNED_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/kernel-pop/signed"))
+}
+
+/// Parse `mokutil --test-key <der>`: "<file> is already enrolled" (also
+/// printed for a key already in the enrollment request) or "<file> is not
+/// enrolled". None when the output says neither.
+pub fn parse_mokutil_test_key(text: &str) -> Option<bool> {
+    if text.contains("is not enrolled") {
+        Some(false)
+    } else if text.contains("is already") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Lowercase hex digits only: "AB:cd:01" -> "abcd01".
+fn normalize_fingerprint(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Parse `openssl x509 -noout -fingerprint -sha1` ("SHA1 Fingerprint=AB:CD:…"
+/// or "sha1 Fingerprint=…") into a normalized fingerprint.
+pub fn parse_openssl_fingerprint(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| l.to_ascii_lowercase().contains("fingerprint="))?;
+    let fp = normalize_fingerprint(line.split_once('=')?.1);
+    (fp.len() == 40).then_some(fp)
+}
+
+/// Whether `mokutil --list-new` output (one "SHA1 Fingerprint: ab:cd:…"
+/// line per pending key; empty when nothing is pending) includes the key
+/// with this normalized SHA1 fingerprint.
+pub fn list_new_contains(text: &str, fingerprint: &str) -> bool {
+    !fingerprint.is_empty()
+        && text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("SHA1 Fingerprint:"))
+            .any(|fp| normalize_fingerprint(fp) == fingerprint)
+}
+
+pub fn combine_kernel_signing(
+    key_present: bool,
+    test_key: Option<bool>,
+    pending: bool,
+) -> KernelSigning {
+    match (key_present, pending, test_key) {
+        (false, _, _) => KernelSigning::NoKey,
+        (true, true, _) => KernelSigning::EnrollmentPending,
+        (true, false, Some(true)) => KernelSigning::Enrolled,
+        (true, false, Some(false)) => KernelSigning::KeyNotEnrolled,
+        (true, false, None) => KernelSigning::Unknown,
+    }
+}
+
+fn stdout_of(cmd: &mut Command) -> Option<String> {
+    cmd.output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+fn detect_kernel_signing() -> KernelSigning {
+    let dir = mok_dir();
+    let der = dir.join("signing.der");
+    let key_present = ["signing.key", "signing.pem", "signing.der"]
+        .iter()
+        .all(|f| dir.join(f).exists());
+    if !key_present {
+        return KernelSigning::NoKey;
+    }
+    let test_key = stdout_of(Command::new("mokutil").arg("--test-key").arg(&der))
+        .and_then(|t| parse_mokutil_test_key(&t));
+    let fingerprint = stdout_of(
+        Command::new("openssl")
+            .args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"])
+            .arg(&der),
+    )
+    .and_then(|t| parse_openssl_fingerprint(&t));
+    let pending = match (fingerprint, stdout_of(Command::new("mokutil").arg("--list-new"))) {
+        (Some(fp), Some(list)) => list_new_contains(&list, &fp),
+        _ => false,
+    };
+    combine_kernel_signing(true, test_key, pending)
+}
+
+/// Whether a signed marker ("<size> <mtime>", written by the privileged
+/// script right after signing) still describes the kernel image on disk.
+/// Any change to the image since (a reinstall, say) makes it stale.
+pub fn marker_matches(marker: &str, size: u64, mtime: i64) -> bool {
+    let mut it = marker.split_whitespace();
+    matches!(
+        (it.next().and_then(|s| s.parse::<u64>().ok()),
+         it.next().and_then(|s| s.parse::<i64>().ok()),
+         it.next()),
+        (Some(s), Some(m), None) if s == size && m == mtime
+    )
+}
+
+/// The image itself is root-only (0600), but it can be stat'ed.
+fn kernel_signed(version: &str) -> bool {
+    let Ok(marker) = std::fs::read_to_string(signed_dir().join(version)) else { return false };
+    let Ok(meta) = std::fs::metadata(format!("/boot/vmlinuz-{version}")) else { return false };
+    marker_matches(&marker, meta.len(), meta.mtime())
 }
 
 // ── Secure Boot ──────────────────────────────────────────────────────────
@@ -255,12 +404,37 @@ fn boot_needed_bytes() -> u64 {
 pub fn install_warnings(info: &SystemInfo) -> Vec<String> {
     let mut out = vec![];
     if info.secure_boot == SecureBoot::Enabled {
-        out.push(
-            "Secure Boot is enabled. Mainline kernels are unsigned, so this machine will \
-             refuse to boot the new kernel unless Secure Boot is turned off or you sign \
-             the kernel yourself. The kernel you are running now will keep working."
-                .to_string(),
-        );
+        match info.kernel_signing {
+            // Signed with an enrolled key: it boots, nothing to say.
+            KernelSigning::Enrolled => {}
+            KernelSigning::EnrollmentPending => out.push(
+                "Secure Boot is enabled. The new kernel will be signed, but the signing key \
+                 is still waiting to be enrolled: finish the enrollment at the blue MOK \
+                 Manager screen on the next reboot first, or the new kernel will not boot. \
+                 The kernel you are running now will keep working."
+                    .to_string(),
+            ),
+            KernelSigning::KeyNotEnrolled => out.push(
+                "Secure Boot is enabled. The new kernel will be signed, but the signing key \
+                 is not enrolled yet: run Set Up Signing on the System tab and finish the \
+                 enrollment at the next reboot first, or the new kernel will not boot. The \
+                 kernel you are running now will keep working."
+                    .to_string(),
+            ),
+            KernelSigning::Unknown => out.push(
+                "Secure Boot is enabled. The new kernel will be signed, but Kernel Pop could \
+                 not confirm that the signing key is enrolled; if it is not, the new kernel \
+                 will not boot. The kernel you are running now will keep working."
+                    .to_string(),
+            ),
+            KernelSigning::NoKey => out.push(
+                "Secure Boot is enabled. Mainline kernels are unsigned, so this machine will \
+                 refuse to boot the new kernel unless Secure Boot is turned off or you sign \
+                 the kernel yourself (Set Up Signing on the System tab). The kernel you are \
+                 running now will keep working."
+                    .to_string(),
+            ),
+        }
     }
     if let Some(f) = info.free_boot_bytes {
         if info.boot_low() {
@@ -309,7 +483,11 @@ fn get_running_kernel() -> String {
 
 /// Every vmlinuz-* in /boot, with initrd and modules presence checks.
 /// Sorted newest-looking first, with the running kernel pinned to the top.
-fn get_installed_kernels(running: &str, bootloader: &Bootloader) -> Vec<InstalledKernel> {
+fn get_installed_kernels(
+    running: &str,
+    bootloader: &Bootloader,
+    signing_key_present: bool,
+) -> Vec<InstalledKernel> {
     let mut kernels = vec![];
 
     let Ok(entries) = std::fs::read_dir("/boot") else { return kernels };
@@ -327,6 +505,7 @@ fn get_installed_kernels(running: &str, bootloader: &Bootloader) -> Vec<Installe
             has_modules,
             has_boot_entry: has_boot_entry(version, bootloader),
             running: version == running,
+            signed: signing_key_present.then(|| kernel_signed(version)),
         });
     }
 
@@ -424,6 +603,100 @@ mod tests {
             has_modules: true,
             has_boot_entry: true,
             running,
+            signed: None,
+        }
+    }
+
+    #[test]
+    fn mokutil_test_key_parsing() {
+        assert_eq!(
+            parse_mokutil_test_key(
+                "Failed to access kernel trusted keyring: Required key not available\n\
+                 /var/lib/kernel-pop/mok/signing.der is not enrolled\n"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            parse_mokutil_test_key("/var/lib/kernel-pop/mok/signing.der is already enrolled\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_mokutil_test_key("signing.der is already in the enrollment request\n"),
+            Some(true)
+        );
+        assert_eq!(parse_mokutil_test_key("EFI variables are not supported on this system\n"), None);
+        assert_eq!(parse_mokutil_test_key(""), None);
+    }
+
+    #[test]
+    fn fingerprint_and_list_new_parsing() {
+        let fp = parse_openssl_fingerprint(
+            "SHA1 Fingerprint=76:A0:9A:00:72:12:89:2F:0F:A8:D2:C5:1E:B6:D0:C8:F4:2A:C6:4D\n",
+        )
+        .unwrap();
+        assert_eq!(fp, "76a09a007212892f0fa8d2c51eb6d0c8f42ac64d");
+        assert_eq!(
+            parse_openssl_fingerprint("sha1 Fingerprint=76:a0:9a:00:72:12:89:2f:0f:a8:d2:c5:1e:b6:d0:c8:f4:2a:c6:4d"),
+            Some(fp.clone())
+        );
+        assert_eq!(parse_openssl_fingerprint("Could not open file\n"), None);
+        assert_eq!(parse_openssl_fingerprint("SHA1 Fingerprint=AB:CD\n"), None);
+
+        let list = "[key 1]\n\
+                    SHA1 Fingerprint: 11:22:33:44:55:66:77:88:99:00:aa:bb:cc:dd:ee:ff:11:22:33:44\n\
+                    Certificate:\n    Data:\n\
+                    [key 2]\n\
+                    SHA1 Fingerprint: 76:a0:9a:00:72:12:89:2f:0f:a8:d2:c5:1e:b6:d0:c8:f4:2a:c6:4d\n\
+                    Certificate:\n";
+        assert!(list_new_contains(list, &fp));
+        assert!(!list_new_contains(list, "ffffffffffffffffffffffffffffffffffffffff"));
+        // Nothing pending: mokutil prints nothing.
+        assert!(!list_new_contains("", &fp));
+        assert!(!list_new_contains(list, ""));
+    }
+
+    #[test]
+    fn kernel_signing_combination() {
+        use KernelSigning::*;
+        assert_eq!(combine_kernel_signing(false, Some(true), true), NoKey);
+        assert_eq!(combine_kernel_signing(true, Some(true), true), EnrollmentPending);
+        assert_eq!(combine_kernel_signing(true, Some(false), true), EnrollmentPending);
+        assert_eq!(combine_kernel_signing(true, Some(true), false), Enrolled);
+        assert_eq!(combine_kernel_signing(true, Some(false), false), KeyNotEnrolled);
+        assert_eq!(combine_kernel_signing(true, None, false), Unknown);
+        assert!(!NoKey.key_present());
+        assert!(Unknown.key_present());
+    }
+
+    #[test]
+    fn signed_marker_matching() {
+        assert!(marker_matches("15234560 1759920000\n", 15234560, 1759920000));
+        assert!(!marker_matches("15234560 1759920000\n", 15234561, 1759920000));
+        assert!(!marker_matches("15234560 1759920000\n", 15234560, 1759920001));
+        assert!(!marker_matches("", 0, 0));
+        assert!(!marker_matches("15234560", 15234560, 0));
+        assert!(!marker_matches("15234560 1759920000 extra", 15234560, 1759920000));
+        assert!(!marker_matches("abc def", 0, 0));
+    }
+
+    #[test]
+    fn install_warnings_follow_signing_state() {
+        let mut info = SystemInfo { secure_boot: SecureBoot::Enabled, ..Default::default() };
+        info.kernel_signing = KernelSigning::Enrolled;
+        assert!(install_warnings(&info).is_empty());
+        info.kernel_signing = KernelSigning::EnrollmentPending;
+        let w = install_warnings(&info);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("next reboot"));
+        info.kernel_signing = KernelSigning::KeyNotEnrolled;
+        assert!(install_warnings(&info)[0].contains("next reboot"));
+        info.kernel_signing = KernelSigning::NoKey;
+        assert!(install_warnings(&info)[0].contains("unsigned"));
+        // Secure Boot off: no signing warning whatever the state.
+        info.secure_boot = SecureBoot::Disabled;
+        for s in [KernelSigning::NoKey, KernelSigning::KeyNotEnrolled, KernelSigning::Unknown] {
+            info.kernel_signing = s;
+            assert!(install_warnings(&info).is_empty());
         }
     }
 
@@ -513,7 +786,9 @@ mod tests {
             has_modules: true,
             has_boot_entry: true,
             running: false,
+            signed: Some(false),
         };
+        // An unsigned kernel is still healthy: signing is not a boot check.
         assert!(k.healthy());
         k.has_initrd = false;
         assert!(!k.healthy());

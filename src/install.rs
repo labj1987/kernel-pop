@@ -1,8 +1,9 @@
 //! install.rs — Invoke the privileged script via pkexec.
 
 use anyhow::{bail, Context, Result};
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const SCRIPT: &str = "/usr/lib/kernel-pop/privileged-install.sh";
 
@@ -13,6 +14,12 @@ const ERROR_TAIL_LINES: usize = 15;
 /// also go to /var/log/kernel-pop.log, but returning them lets the UI show
 /// per-step results (DKMS in particular) in its own Log tab.
 fn run_script(args: &[String]) -> Result<String> {
+    run_script_with_stdin(args, None)
+}
+
+/// Same, optionally writing `secret` (plus a newline) to the script's stdin,
+/// so it never appears in an argument list or the environment.
+fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String> {
     if !Path::new(SCRIPT).exists() {
         bail!("Privileged script not found at {}", SCRIPT);
     }
@@ -20,10 +27,18 @@ fn run_script(args: &[String]) -> Result<String> {
     let mut full = vec![SCRIPT.to_string()];
     full.extend_from_slice(args);
 
-    let output = Command::new("pkexec")
-        .args(&full)
-        .output()
+    let mut cmd = Command::new("pkexec");
+    cmd.args(&full).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if secret.is_some() { Stdio::piped() } else { Stdio::null() });
+    let mut child = cmd
+        .spawn()
         .context("Failed to launch pkexec — is polkit installed?")?;
+    if let (Some(secret), Some(mut stdin)) = (secret, child.stdin.take()) {
+        // A write error (the script exited early, e.g. on a cancelled
+        // authentication) shows up in the exit status below.
+        let _ = stdin.write_all(format!("{secret}\n").as_bytes());
+    }
+    let output = child.wait_with_output().context("Failed to wait for pkexec")?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
     if !output.status.success() {
@@ -51,6 +66,40 @@ fn tail_lines(text: &str, n: usize) -> String {
 /// driver) may be missing after reboot.
 pub fn dkms_warnings(output: &str) -> Vec<&str> {
     output.lines().filter(|l| l.contains("DKMS WARNING")).collect()
+}
+
+/// Lines the script flagged as signing problems. A non-empty result means a
+/// kernel (or its ESP copy) may be unsigned.
+pub fn sign_warnings(output: &str) -> Vec<&str> {
+    output.lines().filter(|l| l.contains("SIGN WARNING")).collect()
+}
+
+/// MOK Manager asks for this password at the next boot, on a US keyboard
+/// layout: 8-16 printable ASCII characters, no spaces, typed twice the same.
+pub fn validate_mok_password(password: &str, confirm: &str) -> Result<(), &'static str> {
+    let n = password.chars().count();
+    if !(8..=16).contains(&n) {
+        return Err("Use 8 to 16 characters");
+    }
+    if !password.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("Use plain letters, digits and symbols only (no spaces or accents)");
+    }
+    if password != confirm {
+        return Err("The two passwords do not match");
+    }
+    Ok(())
+}
+
+/// One-time signing setup: installs the signing tools if missing, creates
+/// the key, signs every installed kernel and queues the key for MOK
+/// enrollment with `password` (sent on stdin).
+pub fn run_privileged_setup_signing(password: &str) -> Result<String> {
+    run_script_with_stdin(&["--setup-signing".to_string()], Some(password))
+}
+
+/// Sign one installed kernel with the existing key.
+pub fn run_privileged_sign(version: &str) -> Result<String> {
+    run_script(&["--sign".to_string(), version.to_string()])
 }
 
 /// Install a downloaded .deb set. The script derives the kernel version
@@ -96,6 +145,28 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("nvidia/550"));
         assert!(dkms_warnings("all fine\n").is_empty());
+    }
+
+    #[test]
+    fn sign_warnings_are_picked_out() {
+        let out = "[kernel-pop] Signed: /boot/vmlinuz-7.1\n\
+                   [kernel-pop] SIGN WARNING: the ESP copy /boot/efi/x/linux does not carry the Kernel Pop signature\n\
+                   [kernel-pop] DKMS WARNING: nvidia/550 is 'built' for 7.1\n";
+        let w = sign_warnings(out);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("ESP copy"));
+        assert!(sign_warnings("[kernel-pop] Kernel signing not set up\n").is_empty());
+    }
+
+    #[test]
+    fn mok_password_validation() {
+        assert!(validate_mok_password("abcdefgh", "abcdefgh").is_ok());
+        assert!(validate_mok_password("Abc123!@#$%^&*()", "Abc123!@#$%^&*()").is_ok());
+        assert!(validate_mok_password("short", "short").is_err());
+        assert!(validate_mok_password("abcdefghijklmnopq", "abcdefghijklmnopq").is_err());
+        assert!(validate_mok_password("has space1", "has space1").is_err());
+        assert!(validate_mok_password("pässwörd1", "pässwörd1").is_err());
+        assert!(validate_mok_password("abcdefgh", "abcdefgx").is_err());
     }
 
     #[test]

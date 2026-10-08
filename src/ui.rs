@@ -1,17 +1,18 @@
 use crate::download::{download_deb_set, Progress};
 use crate::install::{
     dkms_warnings, run_privileged_boot_once, run_privileged_install, run_privileged_remove,
-    run_privileged_remove_many,
+    run_privileged_remove_many, run_privileged_setup_signing, run_privileged_sign,
+    sign_warnings, validate_mok_password,
 };
 use crate::system::{
     compare_to_running, format_bytes, install_warnings, prune_candidates, query_system,
-    SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
+    KernelSigning, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
 use crate::versions::{fetch_deb_list, fetch_versions, KernelVersion};
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, ListBox, Orientation, ProgressBar,
+    Align, Box as GtkBox, Button, Label, ListBox, Orientation, PasswordEntry, ProgressBar,
     ScrolledWindow, SelectionMode, SpinButton, Spinner, Stack, Switch, TextView, WrapMode,
 };
 use libadwaita::prelude::*;
@@ -28,6 +29,9 @@ use std::sync::Arc;
 // ─────────────────────────────────────────────────────────────────────────────
 //  App state
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Late-bound handle to load_sysinfo, for callbacks created inside it.
+type ReloadSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
 #[derive(Default)]
 struct AppState {
@@ -68,6 +72,64 @@ where
 fn log_output(log_fn: &impl Fn(String), output: &str) {
     for line in output.lines().filter(|l| !l.trim().is_empty()) {
         log_fn(line.to_string());
+    }
+}
+
+/// Secure Boot row subtitle, taking the signing state into account.
+fn secure_boot_subtitle(sb: SecureBoot, signing: KernelSigning) -> &'static str {
+    match (sb, signing) {
+        (SecureBoot::Enabled, KernelSigning::Enrolled) =>
+            "Enabled — kernels are signed with your enrolled key, so they boot",
+        (SecureBoot::Enabled, KernelSigning::EnrollmentPending) =>
+            "Enabled — finish enrolling the signing key at the next reboot, or newly signed kernels will not boot",
+        (SecureBoot::Enabled, KernelSigning::KeyNotEnrolled | KernelSigning::Unknown) =>
+            "Enabled — signed kernels boot only once the signing key is enrolled",
+        (SecureBoot::Enabled, KernelSigning::NoKey) =>
+            "Enabled — unsigned mainline kernels will not boot while it is on",
+        (SecureBoot::Disabled, KernelSigning::NoKey) =>
+            "Off — unsigned mainline kernels can boot",
+        (SecureBoot::Disabled, _) =>
+            "Off — every kernel can boot; kernels are still signed as they are installed",
+        (SecureBoot::Unknown, _) =>
+            "Could not determine (mokutil missing or EFI variables unreadable)",
+    }
+}
+
+fn signing_subtitle(signing: KernelSigning) -> &'static str {
+    match signing {
+        KernelSigning::NoKey => "Not set up — kernels are installed unsigned",
+        KernelSigning::KeyNotEnrolled =>
+            "Key created but not enrolled — set up again to queue the enrollment",
+        KernelSigning::EnrollmentPending =>
+            "Enrollment pending — confirm it at the blue MOK Manager screen on the next reboot",
+        KernelSigning::Enrolled => "Set up — every kernel Kernel Pop installs is signed with an enrolled key",
+        KernelSigning::Unknown =>
+            "Key present; could not read its enrollment state (mokutil missing?)",
+    }
+}
+
+/// Log a summary line and pick a toast for a run that may have printed
+/// DKMS or SIGN warnings. Returns None when there were no warnings.
+fn warnings_toast(log_fn: &impl Fn(String), out: &str) -> Option<&'static str> {
+    let dkms = dkms_warnings(out).len();
+    let sign = sign_warnings(out).len();
+    if dkms > 0 {
+        log_fn(format!(
+            "WARNING: {} DKMS problem(s) — out-of-tree modules such as the NVIDIA driver may be missing after reboot. See the DKMS lines above.",
+            dkms
+        ));
+    }
+    if sign > 0 {
+        log_fn(format!(
+            "WARNING: {} signing problem(s) — a kernel or its boot loader copy may be unsigned. See the SIGN lines above.",
+            sign
+        ));
+    }
+    match (dkms > 0, sign > 0) {
+        (false, false) => None,
+        (true, false) => Some("Kernel installed, but DKMS modules failed — see Log tab before rebooting"),
+        (false, true) => Some("Kernel installed, but signing had problems — see Log tab before rebooting"),
+        (true, true) => Some("Kernel installed, but DKMS and signing had problems — see Log tab before rebooting"),
     }
 }
 
@@ -141,6 +203,15 @@ pub fn build_ui(app: &Application) {
     let safety_group = PreferencesGroup::builder().title("Boot Safety").build();
     let secure_boot_row = ActionRow::builder().title("Secure Boot").subtitle("Checking…").build();
     safety_group.add(&secure_boot_row);
+    let signing_row = ActionRow::builder().title("Kernel signing").subtitle("Checking…").build();
+    let setup_signing_btn = Button::builder()
+        .label("Set Up Signing")
+        .tooltip_text("Create a signing key, sign the installed kernels and queue the key for enrollment")
+        .valign(Align::Center)
+        .visible(false)
+        .build();
+    signing_row.add_suffix(&setup_signing_btn);
+    safety_group.add(&signing_row);
     sysinfo_page.append(&safety_group);
 
     let disk_group = PreferencesGroup::builder().title("Disk").build();
@@ -393,6 +464,8 @@ pub fn build_ui(app: &Application) {
         let boot_row = boot_row.clone();
         let root_row = root_row.clone();
         let secure_boot_row = secure_boot_row.clone();
+        let signing_row = signing_row.clone();
+        let setup_signing_btn = setup_signing_btn.clone();
         let health_banner = health_banner.clone();
         let update_banner = update_banner.clone();
         let state = state.clone();
@@ -404,7 +477,7 @@ pub fn build_ui(app: &Application) {
         // Forward declaration hack: the remove action needs load_sysinfo,
         // which is what we're building. A Rc<RefCell<Option<…>>> slot breaks
         // the cycle: the closure looks the callable up at click time.
-        let self_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let self_slot: ReloadSlot = Rc::new(RefCell::new(None));
         let self_slot_outer = self_slot.clone();
 
         let f: Rc<dyn Fn()> = Rc::new(move || {
@@ -416,6 +489,8 @@ pub fn build_ui(app: &Application) {
             let boot_row = boot_row.clone();
             let root_row = root_row.clone();
             let secure_boot_row = secure_boot_row.clone();
+            let signing_row = signing_row.clone();
+            let setup_signing_btn = setup_signing_btn.clone();
             let health_banner = health_banner.clone();
             let update_banner = update_banner.clone();
             let state = state.clone();
@@ -431,15 +506,15 @@ pub fn build_ui(app: &Application) {
                     running_row.set_title(&info.running_kernel);
                     running_row.set_subtitle("uname -r");
 
+                    // Boot safety rows
+                    secure_boot_row.set_subtitle(secure_boot_subtitle(info.secure_boot, info.kernel_signing));
+                    signing_row.set_subtitle(signing_subtitle(info.kernel_signing));
+                    setup_signing_btn.set_visible(matches!(
+                        info.kernel_signing,
+                        KernelSigning::NoKey | KernelSigning::KeyNotEnrolled
+                    ));
+
                     // Disk rows
-                    match info.secure_boot {
-                        SecureBoot::Enabled => secure_boot_row.set_subtitle(
-                            "Enabled — unsigned mainline kernels will not boot while it is on"),
-                        SecureBoot::Disabled => secure_boot_row.set_subtitle(
-                            "Off — unsigned mainline kernels can boot"),
-                        SecureBoot::Unknown => secure_boot_row.set_subtitle(
-                            "Could not determine (mokutil missing or EFI variables unreadable)"),
-                    }
                     match info.free_boot_bytes {
                         Some(f) if info.boot_low() => {
                             boot_row.set_subtitle(&format!(
@@ -472,8 +547,63 @@ pub fn build_ui(app: &Application) {
 
                         let row = ActionRow::builder()
                             .title(&k.version)
-                            .subtitle(&subtitle_parts.join(" · "))
+                            .subtitle(subtitle_parts.join(" · "))
                             .build();
+
+                        // Signed/Unsigned badge, only once signing is set up.
+                        if let Some(signed) = k.signed {
+                            let badge = Label::new(Some(if signed { "Signed" } else { "Unsigned" }));
+                            badge.add_css_class("caption");
+                            badge.add_css_class(if signed { "success" } else { "warning" });
+                            badge.set_valign(Align::Center);
+                            row.add_suffix(&badge);
+                        }
+                        if k.signed == Some(false) {
+                            let sign_btn = Button::builder()
+                                .label("Sign")
+                                .tooltip_text("Sign this kernel with the Kernel Pop key")
+                                .valign(Align::Center)
+                                .build();
+                            sign_btn.add_css_class("flat");
+                            let ver = k.version.clone();
+                            let toast_overlay = toast_overlay.clone();
+                            let log_fn = log_fn.clone();
+                            let self_slot = self_slot.clone();
+                            sign_btn.connect_clicked(move |_| {
+                                log_fn(format!("Signing kernel {}…", ver));
+                                let ver2 = ver.clone();
+                                let toast_overlay = toast_overlay.clone();
+                                let log_fn = log_fn.clone();
+                                let self_slot = self_slot.clone();
+                                spawn_async(
+                                    async move {
+                                        tokio::task::spawn_blocking(move || run_privileged_sign(&ver2)).await
+                                    },
+                                    move |result| {
+                                        match result {
+                                            Ok(Ok(out)) => {
+                                                log_output(&log_fn, &out);
+                                                let n = sign_warnings(&out).len();
+                                                toast_overlay.add_toast(Toast::new(if n == 0 {
+                                                    "Kernel signed"
+                                                } else {
+                                                    "Kernel signed, with warnings — see Log tab"
+                                                }));
+                                            }
+                                            Ok(Err(e)) => {
+                                                log_fn(format!("Signing failed: {}", e));
+                                                toast_overlay.add_toast(Toast::new("Signing failed — see Log tab"));
+                                            }
+                                            Err(e) => log_fn(format!("Task error: {}", e)),
+                                        }
+                                        if let Some(reload) = self_slot.borrow().clone() {
+                                            reload();
+                                        }
+                                    },
+                                );
+                            });
+                            row.add_suffix(&sign_btn);
+                        }
 
                         if k.running {
                             let badge = Label::new(Some("running"));
@@ -531,7 +661,7 @@ pub fn build_ui(app: &Application) {
 
                             remove_btn.connect_clicked(move |_| {
                                 let dialog = AlertDialog::builder()
-                                    .heading(&format!("Remove kernel {}?", ver))
+                                    .heading(format!("Remove kernel {}?", ver))
                                     .body("Its packages will be purged and the boot loader updated. The running kernel is never touched.")
                                     .build();
                                 dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
@@ -727,6 +857,114 @@ pub fn build_ui(app: &Application) {
                 confirm.present(Some(&window2));
             });
             ask.present(Some(&window));
+        });
+    }
+
+    // Set up kernel signing: ask for a one-time MOK enrollment password
+    // (twice), then create the key, sign the installed kernels and queue the
+    // enrollment under one authentication. The password goes to the script on
+    // stdin, never on its command line.
+    {
+        let window = window.clone();
+        let log_fn = log_fn.clone();
+        let toast_overlay = toast_overlay.clone();
+        let load_sysinfo = load_sysinfo.clone();
+        setup_signing_btn.connect_clicked(move |btn| {
+            let pw1 = PasswordEntry::builder()
+                .placeholder_text("One-time password")
+                .show_peek_icon(true)
+                .build();
+            let pw2 = PasswordEntry::builder()
+                .placeholder_text("Same password again")
+                .show_peek_icon(true)
+                .activates_default(true)
+                .build();
+            let hint = Label::new(Some("8 to 16 characters: letters, digits and symbols, no spaces"));
+            hint.add_css_class("dim-label");
+            hint.add_css_class("caption");
+            hint.set_wrap(true);
+            let fields = GtkBox::new(Orientation::Vertical, 8);
+            fields.append(&pw1);
+            fields.append(&pw2);
+            fields.append(&hint);
+
+            let dialog = AlertDialog::builder()
+                .heading("Set up kernel signing")
+                .body("Choose a one-time password for enrolling Kernel Pop's signing key. On the next reboot a blue MOK Manager screen appears: choose Enroll MOK and type this same password once to finish.")
+                .build();
+            dialog.set_extra_child(Some(&fields));
+            dialog.add_responses(&[("cancel", "Cancel"), ("setup", "Set Up")]);
+            dialog.set_response_appearance("setup", libadwaita::ResponseAppearance::Suggested);
+            dialog.set_response_enabled("setup", false);
+            dialog.set_default_response(Some("setup"));
+            dialog.set_close_response("cancel");
+
+            let revalidate = {
+                let dialog = dialog.clone();
+                let pw1 = pw1.clone();
+                let pw2 = pw2.clone();
+                let hint = hint.clone();
+                move || {
+                    let (a, b) = (pw1.text(), pw2.text());
+                    let res = validate_mok_password(&a, &b);
+                    dialog.set_response_enabled("setup", res.is_ok());
+                    hint.set_label(match res {
+                        Ok(()) => "Remember it: you type it once at the next reboot",
+                        Err(_) if a.is_empty() => "8 to 16 characters: letters, digits and symbols, no spaces",
+                        Err(msg) => msg,
+                    });
+                }
+            };
+            { let r = revalidate.clone(); pw1.connect_changed(move |_| r()); }
+            { let r = revalidate.clone(); pw2.connect_changed(move |_| r()); }
+
+            let btn = btn.clone();
+            let log_fn = log_fn.clone();
+            let toast_overlay = toast_overlay.clone();
+            let load_sysinfo = load_sysinfo.clone();
+            dialog.connect_response(None, move |_, resp| {
+                if resp != "setup" { return; }
+                let password = pw1.text().to_string();
+                if validate_mok_password(&password, &pw2.text()).is_err() { return; }
+                pw1.set_text("");
+                pw2.set_text("");
+                btn.set_sensitive(false);
+                log_fn("Setting up kernel signing…".to_string());
+                let btn = btn.clone();
+                let log_fn = log_fn.clone();
+                let toast_overlay = toast_overlay.clone();
+                let load_sysinfo = load_sysinfo.clone();
+                spawn_async(
+                    async move {
+                        tokio::task::spawn_blocking(move || run_privileged_setup_signing(&password)).await
+                    },
+                    move |result| {
+                        btn.set_sensitive(true);
+                        match result {
+                            Ok(Ok(out)) => {
+                                log_output(&log_fn, &out);
+                                let n = sign_warnings(&out).len();
+                                if n > 0 {
+                                    log_fn(format!(
+                                        "WARNING: {} signing problem(s) — see the SIGN lines above.", n));
+                                }
+                                toast_overlay.add_toast(Toast::new(if n == 0 {
+                                    "Signing set up — confirm the key at the next reboot"
+                                } else {
+                                    "Signing set up, with warnings — see Log tab"
+                                }));
+                            }
+                            Ok(Err(e)) => {
+                                log_fn(format!("Signing setup failed: {}", e));
+                                toast_overlay.add_toast(Toast::new("Signing setup failed — see Log tab"));
+                            }
+                            Err(e) => log_fn(format!("Task error: {}", e)),
+                        }
+                        load_sysinfo();
+                    },
+                );
+            });
+            dialog.present(Some(&window));
         });
     }
 
@@ -1113,19 +1351,15 @@ pub fn build_ui(app: &Application) {
                         Ok(Ok(out)) => {
                             log_output(&log_fn, &out);
                             log_fn("Install completed — initramfs verified in /boot.".to_string());
-                            // A DKMS failure never fails the install, but it
-                            // must not go unnoticed before a reboot.
-                            let dkms = dkms_warnings(&out);
-                            if dkms.is_empty() {
-                                log_fn("Reboot to switch to the new kernel.".to_string());
-                                toast_overlay.add_toast(Toast::new("Kernel installed — reboot to activate"));
-                            } else {
-                                log_fn(format!(
-                                    "WARNING: {} DKMS problem(s) — out-of-tree modules such as the NVIDIA driver may be missing after reboot. See the DKMS lines above.",
-                                    dkms.len()
-                                ));
-                                toast_overlay.add_toast(Toast::new(
-                                    "Kernel installed, but DKMS modules failed — see Log tab before rebooting"));
+                            // DKMS and signing failures never fail the
+                            // install, but they must not go unnoticed before
+                            // a reboot.
+                            match warnings_toast(&log_fn, &out) {
+                                None => {
+                                    log_fn("Reboot to switch to the new kernel.".to_string());
+                                    toast_overlay.add_toast(Toast::new("Kernel installed — reboot to activate"));
+                                }
+                                Some(msg) => toast_overlay.add_toast(Toast::new(msg)),
                             }
                             load_sysinfo();
                         }

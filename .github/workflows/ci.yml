@@ -34,7 +34,10 @@ jobs:
           bash -n build-appimage.sh
       - name: ShellCheck
         run: |
-          sudo apt-get install -y -qq shellcheck
+          sudo apt-get update -qq || true
+          # sbsigntool/openssl and an EFI binary (systemd-boot-efi) let the
+          # signing tests run instead of being skipped.
+          sudo apt-get install -y -qq shellcheck sbsigntool openssl systemd-boot-efi
           shellcheck -S warning scripts/privileged-install.sh scripts/tests/test-privileged.sh build-appimage.sh
       - name: Privileged-script helper tests
         run: bash scripts/tests/test-privileged.sh

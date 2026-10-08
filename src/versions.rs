@@ -96,7 +96,7 @@ fn parse_versions(html: &str) -> Vec<KernelVersion> {
         })
         .collect();
 
-    versions.sort_by(|a, b| version_sort_key(&b.version).cmp(&version_sort_key(&a.version)));
+    versions.sort_by_key(|v| std::cmp::Reverse(version_sort_key(&v.version)));
     versions.dedup_by(|a, b| a.version == b.version);
     versions
 }
