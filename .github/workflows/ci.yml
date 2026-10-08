@@ -41,3 +41,5 @@ jobs:
           shellcheck -S warning scripts/privileged-install.sh scripts/tests/test-privileged.sh build-appimage.sh
       - name: Privileged-script helper tests
         run: bash scripts/tests/test-privileged.sh
+      - name: AppStream releases match the changelog
+        run: python3 scripts/sync_appdata_releases.py --check && python3 scripts/release_notes.py --self-test && python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d\" -f2)" > /dev/null

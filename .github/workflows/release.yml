@@ -22,10 +22,7 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${cargo_ver}" >&2
             exit 1
           fi
-          if ! grep -q "<release version=\"${cargo_ver}\"" data/io.github.labj1987.KernelPop.appdata.xml; then
-            echo "appdata.xml has no <release> entry for ${cargo_ver}" >&2
-            exit 1
-          fi
+          python3 scripts/sync_appdata_releases.py --check
 
       - name: Set up Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,9 +36,13 @@ jobs:
       - name: Build AppImage
         run: sudo -E env "PATH=$PATH" bash build-appimage.sh
 
+      # The release page carries this version's changes in full, from CHANGELOG.md: no link to it.
+      - name: Release notes from the changelog
+        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME}" > release-notes.md && cat release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             kernel-pop-*-x86_64.AppImage*
-          generate_release_notes: true
+          body_path: release-notes.md

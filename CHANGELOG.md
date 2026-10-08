@@ -1,24 +1,22 @@
 # Changelog
 
+One `## <version> — <date>` heading per released version, newest first. A release's page
+carries its section as written, and the AppStream `<releases>` list is generated from these
+headings.
+
 ## 1.5.0 — 2026-10-08
 
-- Kernel signing for Secure Boot. A one-time **Set Up Signing** action on
-  the System tab installs `sbsigntool`/`openssl`/`mokutil` if missing,
-  creates Kernel Pop's own kernel-signing key in `/var/lib/kernel-pop/mok/`
-  (codeSigning EKU, never Ubuntu's module-only MOK), signs every installed
-  kernel and queues the key for MOK enrollment with a one-time password
-  that is passed on stdin, never on a command line.
-- Once a key exists, every kernel the install signs right after it lands in
-  `/boot`: `sbsign` to a temp file, `sbverify`, then replace. On
-  systemd-boot and kernelstub the ESP copy is refreshed and checked too.
-  A signing failure is a `SIGN WARNING`, never an install failure; if
-  Secure Boot is enforcing, the final line says the kernel will not boot
-  until it is signed. With no key, installs behave as before.
-- The System tab shows a Kernel signing row (not set up, enrollment
-  pending, enrolled), a Signed/Unsigned badge and a Sign action per kernel,
-  and the Secure Boot row and install warning take the signing state into
-  account.
-- New privileged script modes: `--setup-signing` and `--sign <version>`.
+**Kernel signing for Secure Boot.** Kernel Pop can sign the mainline kernels it installs,
+so they can boot with Secure Boot on.
+
+- **Set Up Signing** on the System tab does the one-time setup. It creates Kernel Pop's own
+  signing key, signs every installed kernel and queues the key for enrollment. You choose
+  a one-time password and type it once at the blue MOK Manager screen on the next reboot.
+- After that, every kernel you install is signed. If signing fails, the install still
+  finishes and the log says so with a `SIGN WARNING` line.
+- Each kernel on the System tab shows Signed or Unsigned, with a Sign button for unsigned
+  ones. The Kernel signing row shows whether the key is enrolled or waiting for the reboot.
+- If you never set up signing, installs work as before.
 
 ## 1.4.1 — 2026-10-02
 
@@ -160,9 +158,9 @@
   pre-rename `MKI` repo — it now points at `KernelPop`, matching where
   the 1.1.0 release actually lives.
 
-## 1.1.0 — Rebrand to KernelPop, new icon set
+## 1.1.0 — 2026-08-05
 
-MKI is now KernelPop. Full rename — crate/package name, application ID
+**Rebrand to KernelPop, new icon set.** MKI is now KernelPop. Full rename — crate/package name, application ID
 (`io.github.labj1987.KernelPop`), prgname, window title, About dialog,
 desktop file, appdata, polkit policy, install-script/log paths
 (`/usr/lib/kernelpop/`, `/var/log/kernelpop.log`), and the HTTP user
@@ -182,7 +180,9 @@ agent. Pure rebrand, no behavior change.
 The GitHub repo itself (`labj1987/MKI`) is intentionally left unrenamed
 for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
 
-## 1.0.12 — Fix phantom taskbar entry: app_id/StartupWMClass mismatch
+## 1.0.12 — 2026-08-04
+
+**Fix phantom taskbar entry: app_id/StartupWMClass mismatch.**
 
 - Root cause confirmed with `WAYLAND_DEBUG=1 <appimage> 2>&1 | grep
   set_app_id`: on Wayland, GTK4 announces the GApplication ID
@@ -200,6 +200,8 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   from 1.0.7–1.0.11 were reasonable but orthogonal — this is the actual
   fix.
 
+## 1.0.11 — 2026-08-04
+
 - The 1.0.7/1.0.9/1.0.10 fixes addressed real GTK-window-subclass dialogs
   but the phantom dock icon persisted immediately at launch, before any
   dialog could fire. Root cause: `mainline-kernel-installer.desktop` was
@@ -210,7 +212,9 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   real, correctly-iconed window. NVI already had `StartupNotify=true` and
   never exhibited this. Added the line to match.
 
-## 1.0.10 — Fix phantom taskbar window from the About dialog
+## 1.0.10 — 2026-08-04
+
+**Fix phantom taskbar window from the About dialog.**
 
 - The About dialog used `gtk4::AboutDialog`, which — like the
   `MessageDialog` fixed in 1.0.7 — is a `Gtk.Window` subclass and creates
@@ -219,7 +223,9 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   subclass, requires the `v1_5` feature, already enabled), which renders
   as a sheet inside the main window's own surface.
 
-## 1.0.9 — Fix UPDATE_INFORMATION not being embedded at all
+## 1.0.9 — 2026-08-04
+
+**Fix UPDATE_INFORMATION not being embedded at all.**
 
 - 1.0.8 corrected the `UPDATE_INFORMATION` string but the fix never took
   effect: `build-appimage.sh` passed it to `appimagetool` as an
@@ -231,7 +237,9 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   `-u`, appimagetool never attempts its own zsync generation either.
   Switched to passing `-u "$UPDATE_INFORMATION"` as an argument.
 
-## 1.0.8 — Fix UPDATE_INFORMATION to reference .zsync sidecar
+## 1.0.8 — 2026-08-04
+
+**Fix UPDATE_INFORMATION to reference .zsync sidecar.**
 
 - Per the AppImage update spec, the GitHub Releases zsync transport string
   must end in the `.zsync` sidecar filename, not the AppImage filename.
@@ -241,7 +249,9 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   sidecar itself was already being generated and published correctly.
   Packaging-only fix, no application behavior changes.
 
-## 1.0.7 — Fix phantom taskbar window on kernel removal
+## 1.0.7 — 2026-08-04
+
+**Fix phantom taskbar window on kernel removal.**
 
 - The "Remove kernel X?" confirmation used `libadwaita::MessageDialog`,
   which is deprecated (libadwaita 1.2+, replaced by `AlertDialog`) and is
@@ -253,7 +263,9 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   floating sheet inside the parent window's own surface, so no second
   top-level window is created. Requires the `v1_5` libadwaita feature.
 
-## 1.0.6 — Generate .zsync directly with zsyncmake
+## 1.0.6 — 2026-07-17
+
+**Generate .zsync directly with zsyncmake.**
 
 - The 1.0.5 diagnostics showed zsync is installed and zsyncmake is on
   PATH and works — but appimagetool's own built-in zsync generation was
@@ -269,7 +281,9 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   any reason, the build still succeeds since the AppImage itself is
   already valid without it.
 
-## 1.0.5 — Diagnostic-only release
+## 1.0.5 — 2026-07-17
+
+**Diagnostic-only release.**
 
 - 1.0.4 made zsync's install unconditional, but the release still isn't
   producing a .zsync file. Added explicit diagnostic output right before
@@ -278,7 +292,9 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   whether zsync is installed, whether zsyncmake is on PATH, and whether
   it actually runs on the CI runner. No functional change otherwise.
 
-## 1.0.4 — Fix zsync still not installing in CI
+## 1.0.4 — 2026-07-17
+
+**Fix zsync still not installing in CI.**
 
 - 1.0.3 added zsync to the build-dependencies apt-get install line, but
   that whole block is gated behind a check for whether cargo is already
@@ -287,14 +303,37 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   included — was silently skipped, same as before 1.0.3. zsync is now
   installed unconditionally, ahead of the guarded block.
 
-## 1.0.3 — Fix missing .zsync file
+## 1.0.3 — 2026-07-17
+
+**Fix missing .zsync file.**
 
 - The build runner never had zsync installed, so appimagetool silently
   skipped generating the .zsync file even though UPDATE_INFORMATION was
   already set in 1.0.2 — update-aware tools had nothing to delta-update
   against. zsync is now installed alongside the other build dependencies.
 
-## 1.0.0 — Initial release
+## 1.0.2 — 2026-07-17
+
+**Enable update checking.**
+
+- Embedded UPDATE_INFORMATION in the AppImage so update-aware tools
+  (Gear Lever, AppImageUpdate) can check GitHub Releases for newer
+  versions and delta-update via zsync. CI now also uploads the .zsync
+  file alongside the AppImage.
+
+## 1.0.1 — 2026-07-17
+
+**Fix AppImage version metadata.**
+
+- build-appimage.sh computed VERSION from Cargo.toml but never exported
+  it to appimagetool, which fell back to a git commit hash. Package
+  managers like Gear Lever showed "Mainline Kernel Installer (05706c)"
+  instead of a real version. VERSION is now passed into appimagetool's
+  environment alongside ARCH.
+
+## 1.0.0 — 2026-07-17
+
+**Initial release.**
 
 - Browse stable Ubuntu mainline kernel versions from kernel.ubuntu.com,
   with badges comparing each version against the running kernel and a
@@ -318,18 +357,3 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   updated); the running kernel is never removable.
 - AppImage-only distribution. First launch installs the privileged
   script and polkit policy to system paths via pkexec.
-
-## 1.0.1 — Fix AppImage version metadata
-
-- build-appimage.sh computed VERSION from Cargo.toml but never exported
-  it to appimagetool, which fell back to a git commit hash. Package
-  managers like Gear Lever showed "Mainline Kernel Installer (05706c)"
-  instead of a real version. VERSION is now passed into appimagetool's
-  environment alongside ARCH.
-
-## 1.0.2 — Enable update checking
-
-- Embedded UPDATE_INFORMATION in the AppImage so update-aware tools
-  (Gear Lever, AppImageUpdate) can check GitHub Releases for newer
-  versions and delta-update via zsync. CI now also uploads the .zsync
-  file alongside the AppImage.

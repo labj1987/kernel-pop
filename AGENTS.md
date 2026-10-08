@@ -88,18 +88,32 @@ machine.
 ## Release process
 
 1. Bump `version` in `Cargo.toml` (and let `Cargo.lock` follow).
-2. Add a `CHANGELOG.md` entry.
-3. Add a `<release version="X.Y.Z" date="..."/>` entry to
-   `data/io.github.labj1987.KernelPop.appdata.xml`. The release workflow
-   fails if it is missing, and `build-appimage.sh` injects one into the
-   packaged copy as a safety net, but the source file should be right.
+2. Add a `CHANGELOG.md` entry (see Changelog below).
+3. Run `python3 scripts/sync_appdata_releases.py` to regenerate the
+   appdata `<releases>` list; CI and the release workflow fail if it is
+   out of date.
 4. Commit, push to `main` (`.github/workflows/ci.yml` builds, tests and
    shellchecks on push/PR).
 5. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 6. The tag push triggers `.github/workflows/release.yml` ("Build and
    Release"), which checks the tag matches `Cargo.toml`, runs the tests,
    runs `build-appimage.sh` and uploads the AppImage (+ `.zsync`) to a
-   GitHub Release via `softprops/action-gh-release`.
+   GitHub Release via `softprops/action-gh-release`, with that version's
+   changelog section as the release text.
+
+## Changelog
+
+- One `## X.Y.Z — YYYY-MM-DD` heading per released version, newest
+  first. No entries for builds that were never released.
+- Write each entry for the people using the app: what changed for them
+  and anything they need to do. Leave out implementation detail (file
+  paths, flags, internal names, CI and packaging changes) unless a user
+  needs it to act.
+- The release page is the version's section written out in full
+  (`scripts/release_notes.py`), never a link to the changelog. The
+  release fails if the section is missing.
+- The appdata `<releases>` list is generated from the headings
+  (`scripts/sync_appdata_releases.py`). Don't edit it by hand.
 
 ## Conventions
 
