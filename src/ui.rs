@@ -1415,12 +1415,15 @@ pub fn build_ui(app: &Application) {
                 .application_name("Kernel Pop")
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
+                .license_type(gtk4::License::Agpl30)
+                .website("https://github.com/labj1987/kernel-pop")
+                .issue_url("https://github.com/labj1987/kernel-pop/issues")
                 .comments(format!(
                     "GTK4 + Rust GUI for installing Ubuntu mainline kernels with a verified initramfs.\n\nRunning kernel: {}\nInstalled kernels: {}",
                     running, count
                 ))
                 .build();
-            dialog.add_acknowledgement_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
+            dialog.add_credit_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
             dialog.present(Some(&window));
         });
     }

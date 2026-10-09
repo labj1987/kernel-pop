@@ -149,7 +149,7 @@ so they can boot with Secure Boot on.
   existing download/verify/install path — including the safety checks
   that never touch the running kernel — works unmodified for RCs.
 - Dependency bump: gtk4 0.11, libadwaita 0.9, glib/gio 0.22, reqwest 0.13,
-  scraper 0.27, matching GreenLight's target versions.
+  scraper 0.27.
 - AppStream metadata: added `developer`, `url`, and `content_rating` tags.
 
 ## 1.1.1 — 2026-08-05
@@ -168,9 +168,8 @@ agent. Pure rebrand, no behavior change.
 
 - Replaces the single 256px icon with the approved three-popcorn-kernel
   design, rendered natively at 16/32/48/64/128/256/512px (not just
-  downscaled from one size) — bringing the icon set up to the same
-  multi-size convention GreenLight already has, for consistency between
-  apps. `build-appimage.sh`'s icon-copy lines now source from
+  downscaled from one size) — bringing the icon set up to the usual
+  multi-size convention. `build-appimage.sh`'s icon-copy lines now source from
   `data/$APP-256.png` instead of `data/$APP.png` accordingly.
 - Adds a `.gitignore` — this repo never had one, which meant `target/`
   came within one `git add -A` of being committed wholesale while
@@ -191,8 +190,7 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   (`mainline-kernel-installer`), so GNOME Shell couldn't match the
   running window to the desktop launcher — one process, two dock
   entries: the correctly-branded launcher entry and an unmatched generic
-  one. NVI never showed this because it runs under XWayland (bundled
-  linuxdeploy GTK stack falls back to X11), where WM_CLASS comes from
+  one. This does not show under XWayland/X11, where WM_CLASS comes from
   prgname, which did match. Fixed by setting both `prgname` (in
   `main.rs`) and `StartupWMClass` (in the `.desktop` file) to the
   application ID, so the match works on either backend. The
@@ -209,8 +207,7 @@ for now — `build-appimage.sh`'s `UPDATE_INFORMATION` still points at MKI.
   associate the launch sequence with the eventual mapped window, so it
   leaves an orphaned placeholder entry in the dock (generic icon, tooltip
   showing only the raw `io.github.labj1987.MKI` app ID) alongside the
-  real, correctly-iconed window. NVI already had `StartupNotify=true` and
-  never exhibited this. Added the line to match.
+  real, correctly-iconed window. Added the line.
 
 ## 1.0.10 — 2026-08-04
 

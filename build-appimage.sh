@@ -13,27 +13,27 @@ APPDIR="$BUILD_DIR/AppDir"
 echo "==> Building $APP $VERSION AppImage"
 
 # ── Build dependencies ────────────────────────────────────────────────
-# The package index is refreshed and zsync installed unconditionally: the
-# guard below evaluates false in CI (a prior workflow step already installs
-# cargo), so anything inside it — zsync included — would be silently skipped.
-# Update first so the install can't 404 on a stale index. Tolerate an
-# unrelated third-party repo (e.g. the runner image's preinstalled Google
-# Chrome source) failing to refresh; only failing to install zsync is fatal.
+# The package index is refreshed and the tools this script itself uses are
+# installed unconditionally: the guard below evaluates false in CI (a prior
+# workflow step already installs cargo), so anything inside it would be
+# silently skipped. Update first so the install can't 404 on a stale index.
+# Tolerate an unrelated third-party repo (e.g. the runner image's preinstalled
+# Google Chrome source) failing to refresh; only a failed install is fatal.
 apt-get update -qq || true
-apt-get install -y -qq zsync
+apt-get install -y -qq zsync wget file desktop-file-utils
 
 if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null; then
     echo "==> Installing build dependencies"
     apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
-        pkg-config libssl-dev wget file desktop-file-utils zsync
+        pkg-config
 fi
 
 # ── Release build ─────────────────────────────────────────────────────
-echo "==> cargo build --release"
-cargo build --release
+echo "==> cargo build --release --locked"
+cargo build --release --locked
 
 # ── AppDir layout ─────────────────────────────────────────────────────
-# Only the AppDir is wiped: $BUILD_DIR also holds the cached appimagetool.
+# Only the AppDir is wiped; the cached appimagetool lives in .cache/.
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/lib/$APP" \
@@ -56,6 +56,8 @@ cp data/io.github.labj1987.KernelPop.appdata.xml    "$APPDIR/usr/share/metainfo/
 # Top-level AppImage requirements
 cp data/$APP.desktop "$APPDIR/"
 cp data/$APP-256.png "$APPDIR/$APP.png"
+
+desktop-file-validate "$APPDIR/$APP.desktop"
 
 # ── AppRun ────────────────────────────────────────────────────────────
 # On first launch the privileged script and polkit policy must exist at
@@ -110,13 +112,22 @@ APPRUN
 chmod 755 "$APPDIR/AppRun"
 
 # ── appimagetool ──────────────────────────────────────────────────────
-TOOL="$BUILD_DIR/appimagetool"
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+TOOL_DIR=".cache"
+TOOL="$TOOL_DIR/appimagetool-$APPIMAGETOOL_VERSION"
 if [[ ! -f "$TOOL" ]]; then
-    echo "==> Downloading appimagetool"
-    wget -q -O "$TOOL" \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-    chmod +x "$TOOL"
+    mkdir -p "$TOOL_DIR"
+    wget -q -O "$TOOL.part" \
+        "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+    mv "$TOOL.part" "$TOOL"
 fi
+if ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status -; then
+    echo "==> ERROR: appimagetool checksum mismatch" >&2
+    rm -f "$TOOL"
+    exit 1
+fi
+chmod +x "$TOOL"
 
 echo "==> Packing AppImage"
 OUT="$APP-$VERSION-$ARCH.AppImage"

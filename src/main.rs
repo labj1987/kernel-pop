@@ -8,6 +8,8 @@ use gtk4::prelude::*;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
+const APP_ID: &str = "io.github.labj1987.KernelPop";
+
 static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 
 pub fn runtime() -> &'static Runtime {
@@ -26,11 +28,11 @@ fn main() {
     // the GApplication ID, not prgname; on X11 it's prgname. Setting both
     // prgname and StartupWMClass (in the .desktop file) to the application
     // ID makes the running window match the desktop file on either backend.
-    glib::set_prgname(Some("io.github.labj1987.KernelPop"));
+    glib::set_prgname(Some(APP_ID));
     glib::set_application_name("Kernel Pop");
 
     let app = libadwaita::Application::builder()
-        .application_id("io.github.labj1987.KernelPop")
+        .application_id(APP_ID)
         .flags(gio::ApplicationFlags::FLAGS_NONE)
         .build();
 

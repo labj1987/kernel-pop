@@ -1,8 +1,7 @@
 # Kernel Pop
 
 GTK4 + libadwaita desktop app for installing Ubuntu mainline kernels from
-kernel.ubuntu.com, written in Rust. Distributed as an AppImage. (Formerly
-known as MKI / Mainline Kernel Installer.)
+kernel.ubuntu.com, written in Rust. Distributed as an AppImage.
 
 ## Why this exists
 
@@ -85,8 +84,9 @@ helper script and polkit policy to system paths.
 
 ## Notes
 
-Developed and tested on Ubuntu 26.04, GNOME on Wayland. Release
-candidates and daily builds are intentionally not listed.
+Developed and tested on Ubuntu 26.04, GNOME on Wayland. Daily builds are
+intentionally not listed; release candidates are hidden unless "Show
+release candidates" is turned on in the Browse tab.
 
 ### Secure Boot and kernel signing
 
@@ -111,10 +111,11 @@ the setup, kernels are installed unsigned exactly as before.
 
 ## Building from source
 
-    apt install -y cargo rustc libgtk-4-dev libadwaita-1-dev pkg-config libssl-dev
+    apt install -y cargo rustc libgtk-4-dev libadwaita-1-dev pkg-config
     cargo build --release
 
-Or build the AppImage the same way CI does:
+Or build the AppImage. The script installs its build dependencies with
+apt-get, so run it as root (or with those dependencies already installed):
 
     bash build-appimage.sh
 
@@ -129,3 +130,5 @@ AGPL-3.0-or-later — see [LICENSE](LICENSE).
 Code at or before commit `8cb172eb68a8ed7c417ae0f04c4b2adaae858c34` remains available
 under the MIT License per its original release. From this commit forward,
 AGPL-3.0-or-later.
+
+Linnard Alex Brown Jr.

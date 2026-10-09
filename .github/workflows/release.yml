@@ -18,8 +18,8 @@ jobs:
       - name: Check tag matches Cargo.toml version
         run: |
           cargo_ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          if [ "${GITHUB_REF_NAME}" != "v${cargo_ver}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${cargo_ver}" >&2
+          if [[ "${GITHUB_REF_NAME}" != "v${cargo_ver}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_ver}" >&2
             exit 1
           fi
           python3 scripts/sync_appdata_releases.py --check
@@ -30,7 +30,7 @@ jobs:
       - name: Run tests
         run: |
           sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config libssl-dev
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config
           cargo test --locked
 
       - name: Build AppImage
