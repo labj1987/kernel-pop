@@ -114,9 +114,10 @@ the setup, kernels are installed unsigned exactly as before.
     apt install -y cargo rustc libgtk-4-dev libadwaita-1-dev pkg-config
     cargo build --release
 
-Or build the AppImage. The script installs its build dependencies with
-apt-get, so run it as root (or with those dependencies already installed):
+Or build the AppImage. An ordinary user is enough once the build
+dependencies are installed:
 
+    apt install -y cargo rustc libgtk-4-dev libadwaita-1-dev pkg-config zsync wget file desktop-file-utils
     bash build-appimage.sh
 
 ## Acknowledgements

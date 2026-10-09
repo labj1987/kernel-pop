@@ -55,20 +55,31 @@ boot is flagged *before* the reboot, not after.
 
 ## Build process
 
-`build-appimage.sh` builds the AppImage:
-1. Installs build deps via apt: `zsync`, `wget`, `file` and
-   `desktop-file-utils` unconditionally (see gotcha below); cargo, rustc,
-   gtk4/adwaita dev headers and pkg-config when missing.
-2. `cargo build --release --locked`.
+`build-appimage.sh` builds the AppImage. It runs as an ordinary user and
+writes only inside the checkout:
+1. Only on a machine with no toolchain (cargo or the gtk4 headers missing)
+   does it install build deps via apt, which is the one part needing root:
+   cargo, rustc, gtk4/adwaita dev headers, pkg-config, `zsync`, `wget`,
+   `file` and `desktop-file-utils`. It then checks `wget`, `file` and
+   `desktop-file-validate` exist and fails clearly if one is missing.
+2. `cargo build --release --locked`, with the compiler pinned in
+   `rust-toolchain.toml`.
 3. Assembles the AppDir (binary, privileged script, polkit policy,
    desktop file, icon, appdata) and runs `desktop-file-validate` on the
    desktop file.
-4. Downloads `appimagetool` (pinned 1.9.1, SHA256-verified, cached in
-   `.cache/`) and packs the AppDir into
+4. Downloads `appimagetool` (pinned 1.9.1) and the AppImage type2 runtime
+   (pinned 20251108, passed with `--runtime-file`; otherwise appimagetool
+   downloads the moving `continuous` build), both SHA256-verified and
+   cached in `.cache/`, and packs the AppDir into
    `kernel-pop-$VERSION-x86_64.AppImage`, with
    `UPDATE_INFORMATION` set for `gh-releases-zsync` delta updates.
 5. Runs `zsyncmake` directly on the built AppImage to produce the
    `.zsync` sidecar.
+
+Rust is pinned in `rust-toolchain.toml`; bump it there and in the toolchain
+steps of both workflows together (each workflow checks they agree). The
+workflows' actions are pinned to full commit SHAs, and Dependabot
+(`.github/dependabot.yml`) proposes the updates.
 
 **Gotcha (fixed in v1.0.6):** `appimagetool`'s own built-in zsync
 generation silently no-ops on the GitHub Actions runner even when
@@ -79,15 +90,16 @@ flag (e.g. `--version`) that the installed short-option-only zsyncmake
 build rejects, and appimagetool treats that as "zsyncmake unavailable"
 without logging it. Do not rely on appimagetool to generate the
 `.zsync` — call `zsyncmake "$OUT"` directly right after packing, as the
-script does now. Keep that call non-fatal (the AppImage is valid without
-the sidecar).
+script does now. That call is fatal when `CI` is set (a missing or failing
+`zsyncmake` exits 1, because the update information points at a `.zsync`
+and a release without one cannot update); a local build only warns.
 
-Also note the apt-get install for `zsync`, `wget`, `file` and
-`desktop-file-utils` is deliberately unconditional
-(not inside the `command -v cargo` guard) — CI's "Set up Rust Toolchain"
-step means that guard evaluates false, so anything gated behind it gets
-silently skipped in CI even though it runs fine locally on a clean
-machine.
+Also note CI's "Set up Rust Toolchain" step means the script's
+`command -v cargo` guard evaluates false there, so nothing inside it runs
+in CI. The workflow's "Install build dependencies" step installs the GTK
+headers and the packaging tools (`zsync`, `wget`, `file`,
+`desktop-file-utils`) instead, and the script checks the tools exist and
+fails clearly if one is missing.
 
 ## Release process
 
@@ -100,10 +112,13 @@ machine.
    shellchecks on push/PR).
 5. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 6. The tag push triggers `.github/workflows/release.yml` ("Build and
-   Release"), which checks the tag matches `Cargo.toml`, runs the tests,
-   runs `build-appimage.sh` and uploads the AppImage (+ `.zsync`) to a
-   GitHub Release via `softprops/action-gh-release`, with that version's
-   changelog section as the release text.
+   Release"). Its `build` job has a read-only token: it checks the tag
+   matches `Cargo.toml`, runs the tests, runs `build-appimage.sh` and
+   uploads the AppImage, `.zsync` and release notes as a workflow
+   artifact. A separate `publish` job, the only one with write access,
+   attaches those files to a GitHub Release via
+   `softprops/action-gh-release`, with that version's changelog section
+   as the release text.
 
 ## Changelog
 
