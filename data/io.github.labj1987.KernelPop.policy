@@ -3,6 +3,7 @@
  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
 <policyconfig>
   <vendor>Kernel Pop</vendor>
+  <vendor_url>https://github.com/labj1987/kernel-pop</vendor_url>
   <action id="io.github.labj1987.KernelPop.install">
     <description>Install or remove a Linux kernel</description>
     <message>Authentication is required to install or remove a Linux kernel</message>
