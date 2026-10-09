@@ -56,12 +56,15 @@ boot is flagged *before* the reboot, not after.
 ## Build process
 
 `build-appimage.sh` builds the AppImage:
-1. Installs build deps via apt (cargo, rustc, gtk4/adwaita dev headers,
-   `zsync` — see gotcha below).
-2. `cargo build --release`.
+1. Installs build deps via apt: `zsync`, `wget`, `file` and
+   `desktop-file-utils` unconditionally (see gotcha below); cargo, rustc,
+   gtk4/adwaita dev headers and pkg-config when missing.
+2. `cargo build --release --locked`.
 3. Assembles the AppDir (binary, privileged script, polkit policy,
-   desktop file, icon, appdata).
-4. Downloads `appimagetool` (continuous build) and packs the AppDir into
+   desktop file, icon, appdata) and runs `desktop-file-validate` on the
+   desktop file.
+4. Downloads `appimagetool` (pinned 1.9.1, SHA256-verified, cached in
+   `.cache/`) and packs the AppDir into
    `kernel-pop-$VERSION-x86_64.AppImage`, with
    `UPDATE_INFORMATION` set for `gh-releases-zsync` delta updates.
 5. Runs `zsyncmake` directly on the built AppImage to produce the
@@ -79,7 +82,8 @@ without logging it. Do not rely on appimagetool to generate the
 script does now. Keep that call non-fatal (the AppImage is valid without
 the sidecar).
 
-Also note the apt-get install for `zsync` is deliberately unconditional
+Also note the apt-get install for `zsync`, `wget`, `file` and
+`desktop-file-utils` is deliberately unconditional
 (not inside the `command -v cargo` guard) — CI's "Set up Rust Toolchain"
 step means that guard evaluates false, so anything gated behind it gets
 silently skipped in CI even though it runs fine locally on a clean
