@@ -28,17 +28,24 @@ on boot. This app is built around not letting that happen:
   to the running kernel
 - A banner on the System tab when a newer mainline kernel is available
 - Optional release-candidate visibility on the Browse tab (off by default)
-- SHA256 verification against the published CHECKSUMS file
+- Every package is verified before it is installed: the CHECKSUMS file
+  must carry a valid signature from Ubuntu's kernel team (the "Kernel PPA"
+  key, built into the app), and each package must match its SHA256 there.
+  A version without signed checksums is not offered for install. The
+  install step repeats the whole check as root on a private copy, so the
+  files in your Downloads folder are never what gets installed
 - Per-file download progress with retries and cancellation
 - Remove old kernels (running kernel is never removable), singly or
   "keep the newest N" in one step
 - Boot a chosen installed kernel on the next restart only
 - Secure Boot warning before installing a kernel that will not be signed
-  with an enrolled key
+  with an enrolled key; a kernel that will not boot is never made the
+  default, and the next restart starts the running kernel instead
 - Optional kernel signing: a one-time Set Up Signing step creates Kernel
   Pop's own signing key, signs the installed kernels and queues the key for
   MOK enrollment; from then on every kernel it installs is signed
-  automatically, with a Signed/Unsigned badge per kernel
+  automatically, with a Signed / Signed by Ubuntu / Unsigned badge per
+  kernel
 - DKMS modules (such as NVIDIA) are built for the new kernel and reported
   per module; a failure is a warning, not an install error
 - Disk space checks for / and for /boot (sized from the kernels already there)
@@ -52,14 +59,19 @@ Download the AppImage from the Releases page:
     ./kernel-pop-*-x86_64.AppImage
 
 First launch asks for authentication once to install the privileged
-helper script and polkit policy to system paths.
+helper script, the Ubuntu kernel signing key it checks downloads with, and
+the polkit policy to system paths. A new version asks once more to update
+them. If that authentication is cancelled, the app still opens but shows a
+banner, and installing, removing and signing kernels stay off until you
+restart it and authenticate.
 
 ## Using it
 
 1. The System tab shows the running kernel and the health of every
    installed kernel.
 2. Pick a version on the Browse tab and hit Download. Packages land in
-   ~/Downloads/mainline-kernel-vX.Y.Z/ and are checksum-verified.
+   ~/Downloads/mainline-kernel-vX.Y.Z/, next to the signed CHECKSUMS they
+   were verified against.
 3. Review the staged packages on the Install tab and hit Install Kernel.
 4. Reboot when ready. The new kernel only reports success after its
    initramfs is verified on disk.
@@ -90,8 +102,9 @@ release candidates" is turned on in the Browse tab.
 
 ### Secure Boot and kernel signing
 
-Mainline kernels are unsigned: with Secure Boot enforcing, shim refuses to
-boot them. Kernel signing fixes that:
+Mainline kernels are unsigned. With Secure Boot enforcing, shim refuses to
+boot an unsigned kernel, so a mainline kernel needs Kernel Pop's signing
+setup (or Secure Boot turned off) before it can boot:
 
 1. On the System tab, Kernel signing → **Set Up Signing**. Choose a
    one-time password (8-16 characters). Kernel Pop installs `sbsigntool`,
@@ -105,9 +118,18 @@ From then on every kernel Kernel Pop installs is signed (`sbsign`, then
 `sbverify` before the image in `/boot` is replaced), whether Secure Boot is
 on or off. A signing failure is a `SIGN WARNING` in the log, never an
 install failure. Signing adds a signature, so a kernel already signed by
-Ubuntu keeps its original one too. Kernel Pop uses its own key rather than
-Ubuntu's module-signing MOK, which shim does not accept for kernels. Without
-the setup, kernels are installed unsigned exactly as before.
+Ubuntu keeps its original one too; Ubuntu's own kernels show "Signed by
+Ubuntu" and boot under Secure Boot without the setup. Kernel Pop uses its
+own key rather than Ubuntu's module-signing MOK, which shim does not accept
+for kernels. Without the setup, kernels are installed unsigned exactly as
+before.
+
+When Secure Boot is enforcing and a newly installed kernel cannot boot yet
+(it is unsigned, or the key is not enrolled), the install says so in a
+`BOOT BLOCKED` line, does not make that kernel the default, and selects the
+running kernel for the next restart, so a reboot never lands on a kernel
+shim refuses. When the key is only waiting for its enrollment, the install
+reminds you to confirm it at the MOK Manager screen.
 
 ## Building from source
 
