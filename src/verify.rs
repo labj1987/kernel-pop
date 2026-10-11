@@ -120,9 +120,11 @@ mod tests {
     #[test]
     fn tampered_checksums_are_refused() {
         let mut changed = CHECKSUMS.to_vec();
-        // Flip one hex digit of a SHA256 line.
-        let pos = changed.len() - 80;
-        changed[pos] = if changed[pos] == b'0' { b'1' } else { b'0' };
+        // Change the first hex digit of the linux-image package's SHA256.
+        let hash = b"9484aeadaa7438a080dbd2d24d219d361b62ed18f44907e7bd4e81651f296bc7";
+        let pos = changed.windows(hash.len()).position(|w| w == hash).expect("fixture hash");
+        assert_eq!(changed[pos], b'9');
+        changed[pos] = b'8';
         assert!(verify_checksums_signature(&changed, SIGNATURE).is_err());
         assert!(verify_checksums_signature(CHECKSUMS, b"not a signature").is_err());
         assert!(verify_checksums_signature(CHECKSUMS, b"").is_err());

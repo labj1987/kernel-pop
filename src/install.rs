@@ -141,14 +141,15 @@ pub enum BootOutlook {
     Ok,
     /// Boots once the signing key's enrollment is confirmed at the next reboot.
     AfterEnrollment,
-    /// Will not boot while Secure Boot is enforcing.
-    Blocked,
 }
 
 /// The problems a run of the privileged script reported, read from the
 /// markers at the start of its lines (see the protocol at the top of the
-/// script): one DKMS WARNING / SIGN WARNING line per problem, BOOT BLOCKED /
-/// BOOT PENDING for whether the kernel boots. Summary lines carry no marker.
+/// script): one DKMS WARNING / SIGN WARNING line per problem, BOOT PENDING
+/// when the kernel boots only after the key enrollment is confirmed. (A
+/// kernel that could not boot at all is never left installed: the script
+/// refuses or undoes that install and exits with an error.) Summary lines
+/// carry no marker.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ScriptReport {
     pub dkms_problems: usize,
@@ -165,9 +166,7 @@ impl ScriptReport {
                 r.dkms_problems += 1;
             } else if text.starts_with("SIGN WARNING:") {
                 r.sign_problems += 1;
-            } else if text.starts_with("BOOT BLOCKED:") {
-                r.boot = BootOutlook::Blocked;
-            } else if text.starts_with("BOOT PENDING:") && r.boot == BootOutlook::Ok {
+            } else if text.starts_with("BOOT PENDING:") {
                 r.boot = BootOutlook::AfterEnrollment;
             }
         }
@@ -258,15 +257,10 @@ mod tests {
 
     #[test]
     fn report_reads_the_boot_outlook() {
-        let blocked = "[kernel-pop] BOOT BLOCKED: 7.1 will not boot while Secure Boot is enforcing: x.\n";
-        assert_eq!(ScriptReport::parse(blocked).boot, BootOutlook::Blocked);
         let pending = "[kernel-pop] BOOT PENDING: 7.1 is signed, but the key is waiting.\n";
         assert_eq!(ScriptReport::parse(pending).boot, BootOutlook::AfterEnrollment);
-        // Blocked wins whatever the order.
-        assert_eq!(ScriptReport::parse(&format!("{blocked}{pending}")).boot, BootOutlook::Blocked);
-        assert_eq!(ScriptReport::parse(&format!("{pending}{blocked}")).boot, BootOutlook::Blocked);
         // Mentioned mid-line is not a marker.
-        assert_eq!(ScriptReport::parse("[kernel-pop] see BOOT BLOCKED: above\n").boot, BootOutlook::Ok);
+        assert_eq!(ScriptReport::parse("[kernel-pop] see BOOT PENDING: above\n").boot, BootOutlook::Ok);
     }
 
     #[test]

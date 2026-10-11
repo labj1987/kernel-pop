@@ -17,23 +17,26 @@ wrong checksum file, so in practice no package was ever verified. Now:
 
 **Secure Boot**
 
-- A new kernel that cannot boot with Secure Boot on (unsigned, or signed with a key that
-  is not enrolled yet) is no longer made the default boot entry, and the next restart
-  starts the kernel you are running now. The install says plainly that the new kernel
-  will not boot, and why.
-- If the signing key is still waiting for enrollment, the install reminds you to confirm
-  it at the blue MOK Manager screen on the next reboot.
+- With Secure Boot on, Kernel Pop no longer installs a kernel that could not boot. If
+  signing is not set up, or the signing key is neither enrolled nor waiting for
+  enrollment, the install is refused before anything changes and points you to Set Up
+  Signing. If signing the new kernel fails, it is removed again, so nothing unbootable is
+  left in the boot menu.
+- If the signing key is still waiting for enrollment, the kernel is installed and signed,
+  and the install reminds you to confirm the enrollment at the blue MOK Manager screen on
+  the next reboot.
 - A key waiting for enrollment is no longer sometimes shown as enrolled.
 - Ubuntu's own kernels show "Signed by Ubuntu" instead of a misleading "Unsigned".
 - On Pop!_OS, signing a kernel checks the boot loader copy of that kernel, not whichever
-  kernel happens to be the default, and only kernels that really have a boot menu entry
-  show one.
+  kernel happens to be the default. Kernels beyond the current and previous one show
+  "not in the boot menu" as information (that is how Pop!_OS works) instead of being
+  marked broken, and the warning banner names the actual problem.
 - On systemd-boot, re-signing a kernel no longer drops its initramfs from the boot entry.
 
 **Boot menu**
 
 - With the GRUB submenu turned off, new kernels are made the default again and Boot Next
-  Time works.
+  Time works. On systemd-boot, Boot Next Time also works with boot counting.
 - Kernel versions are matched exactly, so removing or selecting one kernel can no longer
   pick up another whose version merely contains it.
 

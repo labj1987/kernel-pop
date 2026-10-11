@@ -62,8 +62,9 @@ boot is flagged *before* the reboot, not after.
   CHECKSUMS without a valid signature, is an error: the version is not
   installable.
 - The privileged script trusts nothing in the download directory: it
-  checks owner (`PKEXEC_UID`) and modes, copies the set into a root-only
-  dir under `/var/tmp`, verifies the signature (with the keyring AppRun
+  enters it once, checks owner (`PKEXEC_UID`) and modes on each file it
+  has opened (`copy_trusted_file`, perl: O_NOFOLLOW|O_NONBLOCK and fstat),
+  copies the set into a root-only dir under `/var/tmp`, verifies the signature (with the keyring AppRun
   installs as `/usr/lib/kernel-pop/kernel-ppa.gpg`) and every hash on that
   copy, and installs only the copy.
 - `src/testdata/` holds a real signed CHECKSUMS pair for the tests. To
@@ -74,11 +75,19 @@ boot is flagged *before* the reboot, not after.
 
 Every line starts with `[kernel-pop] `. The app reacts to markers at the
 start of a line's text, so each is printed once per problem and never in
-a summary: `DKMS WARNING:`, `SIGN WARNING:`, `BOOT BLOCKED:` (will not
-boot while Secure Boot is enforcing), `BOOT PENDING:` (boots once the key
-enrollment is confirmed). Summaries use `DKMS SUMMARY:`/`SIGN SUMMARY:`.
-A blocked kernel is never made the GRUB saved default, and the running
-kernel is selected for the next boot instead.
+a summary: `DKMS WARNING:`, `SIGN WARNING:`, `BOOT PENDING:` (boots once
+the key enrollment is confirmed). Summaries use `DKMS SUMMARY:`/`SIGN
+SUMMARY:`.
+
+## Secure Boot rule
+
+No kernel that shim would refuse is ever left installed. With Secure Boot
+enforcing, `--install` requires the key set, the sbsign tools and a key
+that is enrolled or queued (`secure_boot_preflight`, before dpkg; the app
+checks the same in `install_blocker` and refuses up front). If signing
+then fails, the just-installed packages are purged again
+(`rollback_install`) and the run fails. A queued key is fine: the kernel
+boots once MOK Manager enrolls it.
 
 ## Kernel signing
 

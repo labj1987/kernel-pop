@@ -72,7 +72,7 @@ pub struct InstalledKernel {
     /// Whether the active boot loader actually has a menu entry for this
     /// kernel. On GRUB this greps grub.cfg for the vmlinuz; on systemd-boot this checks for a real
     /// entry under the ESP, since nothing else guarantees one exists.
-    pub has_boot_entry: bool,
+    pub boot_entry: BootEntry,
     pub running: bool,
     /// Who signed the image, shown once signing is set up (None before
     /// that). Not part of `healthy()`: an unsigned kernel boots fine with
@@ -95,12 +95,48 @@ pub enum KernelSignature {
     Unsigned,
 }
 
+/// A kernel's place in the boot menu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BootEntry {
+    Present,
+    /// The boot loader should have an entry for it and has none: a problem.
+    Missing,
+    /// kernelstub (Pop!_OS) keeps only the current and the previous kernel
+    /// on the ESP, so any other installed kernel is simply not in the menu.
+    /// That is how kernelstub works, not a fault.
+    NotKept,
+}
+
 impl InstalledKernel {
-    /// A kernel is bootable when its initrd, modules, and boot menu entry
-    /// are all in place.
+    /// A kernel is healthy when its initrd and modules are in place and the
+    /// boot loader has the entry it should have.
     pub fn healthy(&self) -> bool {
-        self.has_initrd && self.has_modules && self.has_boot_entry
+        self.has_initrd && self.has_modules && self.boot_entry != BootEntry::Missing
     }
+}
+
+/// The banner text for the kernels that are not healthy, naming what is
+/// actually wrong; None when every kernel is fine.
+pub fn health_summary(kernels: &[InstalledKernel]) -> Option<String> {
+    let mut problems = vec![];
+    if kernels.iter().any(|k| !k.has_initrd) {
+        problems.push("missing its initramfs");
+    }
+    if kernels.iter().any(|k| !k.has_modules) {
+        problems.push("missing its modules directory");
+    }
+    if kernels.iter().any(|k| k.boot_entry == BootEntry::Missing) {
+        problems.push("missing from the boot menu");
+    }
+    if problems.is_empty() {
+        return None;
+    }
+    let advice = if kernels.iter().any(|k| !k.has_initrd || !k.has_modules) {
+        " — do not reboot into it."
+    } else {
+        "."
+    };
+    Some(format!("A kernel in /boot is {}{advice} See System tab.", problems.join(" or ")))
 }
 
 /// Which boot loader actually controls this machine's boot menu, detected
@@ -168,22 +204,34 @@ pub fn kernelstub_slot(version: &str, root: &Path, boot: &Path) -> Option<&'stat
     }
 }
 
-/// Whether kernelstub put `version` on the ESP: it must have a slot and that
-/// slot's file must exist under some EFI/Pop_OS-* directory. An ESP the user
-/// may not read gets the benefit of the doubt, like an unreadable grub.cfg.
-fn kernelstub_has_image(version: &str, root: &Path, boot: &Path, efi_dirs: &[&Path]) -> bool {
-    let Some(slot) = kernelstub_slot(version, root, boot) else { return false };
-    efi_dirs.iter().any(|dir| match std::fs::read_dir(dir) {
+/// Where kernelstub stands with `version`: no slot is NotKept; a slot whose
+/// file exists under some EFI/Pop_OS-* directory is Present, otherwise
+/// Missing. An ESP the user may not read gets the benefit of the doubt, like
+/// an unreadable grub.cfg.
+fn kernelstub_entry(version: &str, root: &Path, boot: &Path, efi_dirs: &[&Path]) -> BootEntry {
+    let Some(slot) = kernelstub_slot(version, root, boot) else { return BootEntry::NotKept };
+    let present = efi_dirs.iter().any(|dir| match std::fs::read_dir(dir) {
         Ok(entries) => entries.flatten().any(|e| {
             e.file_name().to_str().is_some_and(|n| n.starts_with("Pop_OS-")) && e.path().join(slot).exists()
         }),
         Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
-    })
+    });
+    if present { BootEntry::Present } else { BootEntry::Missing }
 }
 
-/// A systemd-boot entry file for exactly `version`: "<token>-<version>.conf",
-/// or "<token>-<version>+<tries>.conf" with boot counting.
-fn sdboot_entry_name_matches(name: &str, version: &str) -> bool {
+/// Whether a systemd-boot entry file belongs to exactly `version`, the same
+/// way the privileged script decides: its "version" line, or else its file
+/// name ("<token>-<version>.conf", "+<tries>" boot counter allowed).
+fn sdboot_entry_matches(name: &str, content: Option<&str>, version: &str) -> bool {
+    if let Some(text) = content {
+        if text.lines().any(|l| {
+            l.trim_end_matches('\r')
+                .strip_prefix("version")
+                .is_some_and(|rest| rest.starts_with([' ', '\t']) && rest.trim() == version)
+        }) {
+            return true;
+        }
+    }
     let Some(stem) = name.strip_suffix(".conf") else { return false };
     let stem = match stem.rfind('+') {
         Some(i) if stem[i + 1..].chars().all(|c| c.is_ascii_digit() || c == '-') => &stem[..i],
@@ -202,27 +250,31 @@ fn grub_cfg_mentions(version: &str) -> bool {
 }
 
 /// Whether the boot loader has a menu entry for this exact kernel version.
-/// Unknown boot loaders are given the benefit of the doubt (true) rather
+/// Unknown boot loaders are given the benefit of the doubt (Present) rather
 /// than marking every kernel unhealthy for a check we can't perform.
-fn has_boot_entry(version: &str, bootloader: &Bootloader) -> bool {
+fn boot_entry(version: &str, bootloader: &Bootloader) -> BootEntry {
+    let present = |yes: bool| if yes { BootEntry::Present } else { BootEntry::Missing };
     match bootloader {
-        Bootloader::Unknown => true,
-        Bootloader::Kernelstub => kernelstub_has_image(
+        Bootloader::Unknown => BootEntry::Present,
+        Bootloader::Kernelstub => kernelstub_entry(
             version,
             Path::new("/"),
             Path::new("/boot"),
             &[Path::new("/boot/efi/EFI"), Path::new("/boot/EFI")],
         ),
-        Bootloader::Grub => grub_cfg_mentions(version),
+        Bootloader::Grub => present(grub_cfg_mentions(version)),
         Bootloader::SystemdBoot { esp } => {
             let entries_dir = format!("{esp}/loader/entries");
-            match std::fs::read_dir(&entries_dir) {
+            present(match std::fs::read_dir(&entries_dir) {
                 Ok(entries) => entries.flatten().any(|e| {
-                    e.file_name().to_str().is_some_and(|n| sdboot_entry_name_matches(n, version))
+                    let content = std::fs::read_to_string(e.path()).ok();
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| sdboot_entry_matches(n, content.as_deref(), version))
                 }),
                 // The ESP is often mounted readable by root only.
                 Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
-            }
+            })
         }
     }
 }
@@ -494,42 +546,45 @@ fn boot_needed_bytes() -> u64 {
     estimate_boot_needed(&kernels, &initrds).unwrap_or(MIN_BOOT_BYTES)
 }
 
+/// Why an install must not start at all, or None. With Secure Boot on, a
+/// mainline kernel boots only when signed with a key that is enrolled or
+/// queued for enrollment; anything else would leave a kernel shim refuses.
+/// The privileged script makes the same check itself before installing.
+pub fn install_blocker(info: &SystemInfo) -> Option<&'static str> {
+    if info.secure_boot != SecureBoot::Enabled {
+        return None;
+    }
+    match info.kernel_signing {
+        KernelSigning::Enrolled | KernelSigning::EnrollmentPending => None,
+        KernelSigning::NoKey => Some(
+            "Secure Boot is on and kernel signing is not set up, so a mainline kernel could \
+             not boot on this machine. Use Set Up Signing on the System tab first, or turn \
+             Secure Boot off.",
+        ),
+        KernelSigning::KeyNotEnrolled => Some(
+            "Secure Boot is on, but Kernel Pop's signing key is not enrolled, so a kernel \
+             signed with it could not boot. Use Set Up Signing on the System tab to queue the \
+             enrollment, then confirm it at the next reboot.",
+        ),
+        KernelSigning::Unknown => Some(
+            "Secure Boot is on, and Kernel Pop could not confirm that its signing key is \
+             enrolled, so the new kernel might not boot. Check that mokutil is installed.",
+        ),
+    }
+}
+
 /// Everything worth a confirmation before an install starts. Empty means
 /// nothing to warn about.
 pub fn install_warnings(info: &SystemInfo) -> Vec<String> {
     let mut out = vec![];
-    if info.secure_boot == SecureBoot::Enabled {
-        match info.kernel_signing {
-            // Signed with an enrolled key: it boots, nothing to say.
-            KernelSigning::Enrolled => {}
-            KernelSigning::EnrollmentPending => out.push(
-                "Secure Boot is enabled. The new kernel will be signed, but the signing key \
-                 is still waiting to be enrolled: finish the enrollment at the blue MOK \
-                 Manager screen on the next reboot first, or the new kernel will not boot. \
-                 The kernel you are running now will keep working."
-                    .to_string(),
-            ),
-            KernelSigning::KeyNotEnrolled => out.push(
-                "Secure Boot is enabled. The new kernel will be signed, but the signing key \
-                 is not enrolled yet: run Set Up Signing on the System tab and finish the \
-                 enrollment at the next reboot first, or the new kernel will not boot. The \
-                 kernel you are running now will keep working."
-                    .to_string(),
-            ),
-            KernelSigning::Unknown => out.push(
-                "Secure Boot is enabled. The new kernel will be signed, but Kernel Pop could \
-                 not confirm that the signing key is enrolled; if it is not, the new kernel \
-                 will not boot. The kernel you are running now will keep working."
-                    .to_string(),
-            ),
-            KernelSigning::NoKey => out.push(
-                "Secure Boot is enabled. Mainline kernels are unsigned, so this machine will \
-                 refuse to boot the new kernel unless Secure Boot is turned off or you sign \
-                 the kernel yourself (Set Up Signing on the System tab). The kernel you are \
-                 running now will keep working."
-                    .to_string(),
-            ),
-        }
+    if info.secure_boot == SecureBoot::Enabled && info.kernel_signing == KernelSigning::EnrollmentPending {
+        out.push(
+            "Secure Boot is on. The new kernel will be signed, but the signing key is still \
+             waiting to be enrolled: confirm the enrollment at the blue MOK Manager screen on \
+             the next reboot, or the new kernel will not boot. The kernel you are running now \
+             keeps working."
+                .to_string(),
+        );
     }
     if let Some(f) = info.free_boot_bytes {
         if info.boot_low() {
@@ -599,7 +654,7 @@ fn get_installed_kernels(
             version: version.to_string(),
             has_initrd,
             has_modules,
-            has_boot_entry: has_boot_entry(version, bootloader),
+            boot_entry: boot_entry(version, bootloader),
             running: version == running,
             signed: signing_key_present.then(|| {
                 classify_signature(
@@ -702,7 +757,7 @@ mod tests {
             version: version.into(),
             has_initrd: true,
             has_modules: true,
-            has_boot_entry: true,
+            boot_entry: BootEntry::Present,
             running,
             signed: None,
         }
@@ -797,11 +852,11 @@ mod tests {
 
         let dirs = [efi.as_path()];
         std::fs::write(efi.join("Pop_OS-1234/vmlinuz.efi"), b"x").unwrap();
-        assert!(kernelstub_has_image("7.1.3-070103-generic", &root, &boot, &dirs));
-        // Its slot file is missing on the ESP
-        assert!(!kernelstub_has_image("6.8.0-45-generic", &root, &boot, &dirs));
-        // No slot at all: not in the boot menu, whatever the ESP holds
-        assert!(!kernelstub_has_image("6.5.0-1-generic", &root, &boot, &dirs));
+        assert_eq!(kernelstub_entry("7.1.3-070103-generic", &root, &boot, &dirs), BootEntry::Present);
+        // Its slot file is missing on the ESP: a real problem
+        assert_eq!(kernelstub_entry("6.8.0-45-generic", &root, &boot, &dirs), BootEntry::Missing);
+        // No slot at all: kernelstub keeps no copy of it, which is normal
+        assert_eq!(kernelstub_entry("6.5.0-1-generic", &root, &boot, &dirs), BootEntry::NotKept);
 
         // Links in / win over /boot
         symlink("boot/vmlinuz-6.5.0-1-generic", root.join("vmlinuz")).unwrap();
@@ -811,13 +866,20 @@ mod tests {
     }
 
     #[test]
-    fn systemd_boot_entry_names_match_exactly() {
-        assert!(sdboot_entry_name_matches("abc-7.1.3-070103-generic.conf", "7.1.3-070103-generic"));
-        assert!(sdboot_entry_name_matches("abc-7.1.3-070103-generic+3.conf", "7.1.3-070103-generic"));
-        assert!(sdboot_entry_name_matches("abc-7.1.3-070103-generic+2-1.conf", "7.1.3-070103-generic"));
-        assert!(!sdboot_entry_name_matches("abc-17.1.3-070103-generic.conf", "7.1.3-070103-generic"));
-        assert!(!sdboot_entry_name_matches("abc-7.1.3-070103-generic-64k.conf", "7.1.3-070103-generic"));
-        assert!(!sdboot_entry_name_matches("abc-7.1.3-070103-generic.conf.bak", "7.1.3-070103-generic"));
+    fn systemd_boot_entries_match_exactly() {
+        let v = "7.1.3-070103-generic";
+        let m = |name: &str| sdboot_entry_matches(name, None, v);
+        assert!(m("abc-7.1.3-070103-generic.conf"));
+        assert!(m("abc-7.1.3-070103-generic+3.conf"));
+        assert!(m("abc-7.1.3-070103-generic+2-1.conf"));
+        assert!(!m("abc-17.1.3-070103-generic.conf"));
+        assert!(!m("abc-7.1.3-070103-generic-64k.conf"));
+        assert!(!m("abc-7.1.3-070103-generic.conf.bak"));
+        // The version line counts too, whatever the file is called (as in the script).
+        assert!(sdboot_entry_matches("custom.conf", Some("title Ubuntu\nversion 7.1.3-070103-generic\n"), v));
+        assert!(sdboot_entry_matches("custom.conf", Some("version\t7.1.3-070103-generic  \r\n"), v));
+        assert!(!sdboot_entry_matches("custom.conf", Some("version 17.1.3-070103-generic\n"), v));
+        assert!(!sdboot_entry_matches("custom.conf", Some("versionx 7.1.3-070103-generic\n"), v));
     }
 
     #[test]
@@ -866,6 +928,29 @@ mod tests {
     }
 
     #[test]
+    fn install_is_refused_when_the_kernel_could_not_boot() {
+        let mut info = SystemInfo { secure_boot: SecureBoot::Enabled, ..Default::default() };
+        for (s, blocked) in [
+            (KernelSigning::NoKey, true),
+            (KernelSigning::KeyNotEnrolled, true),
+            (KernelSigning::Unknown, true),
+            (KernelSigning::EnrollmentPending, false),
+            (KernelSigning::Enrolled, false),
+        ] {
+            info.kernel_signing = s;
+            assert_eq!(install_blocker(&info).is_some(), blocked, "{s:?}");
+        }
+        info.kernel_signing = KernelSigning::NoKey;
+        assert!(install_blocker(&info).unwrap().contains("Set Up Signing"));
+        // Secure Boot off or unknown: never refused here (the script checks
+        // the real state itself).
+        for sb in [SecureBoot::Disabled, SecureBoot::Unknown] {
+            info.secure_boot = sb;
+            assert!(install_blocker(&info).is_none());
+        }
+    }
+
+    #[test]
     fn install_warnings_follow_signing_state() {
         let mut info = SystemInfo { secure_boot: SecureBoot::Enabled, ..Default::default() };
         info.kernel_signing = KernelSigning::Enrolled;
@@ -874,16 +959,25 @@ mod tests {
         let w = install_warnings(&info);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("next reboot"));
-        info.kernel_signing = KernelSigning::KeyNotEnrolled;
-        assert!(install_warnings(&info)[0].contains("next reboot"));
-        info.kernel_signing = KernelSigning::NoKey;
-        assert!(install_warnings(&info)[0].contains("unsigned"));
-        // Secure Boot off: no signing warning whatever the state.
         info.secure_boot = SecureBoot::Disabled;
-        for s in [KernelSigning::NoKey, KernelSigning::KeyNotEnrolled, KernelSigning::Unknown] {
-            info.kernel_signing = s;
-            assert!(install_warnings(&info).is_empty());
-        }
+        assert!(install_warnings(&info).is_empty());
+    }
+
+    #[test]
+    fn health_summary_names_the_real_problem() {
+        let mut ks = vec![kernel("7.1.3-070103-generic", false), kernel("6.8.0-45-generic", true)];
+        assert_eq!(health_summary(&ks), None);
+        // kernelstub keeping no copy is information, not a problem
+        ks[0].boot_entry = BootEntry::NotKept;
+        assert!(ks[0].healthy());
+        assert_eq!(health_summary(&ks), None);
+        ks[0].boot_entry = BootEntry::Missing;
+        assert!(!ks[0].healthy());
+        let t = health_summary(&ks).unwrap();
+        assert!(t.contains("missing from the boot menu") && !t.contains("initramfs"), "{t}");
+        ks[1].has_initrd = false;
+        let t = health_summary(&ks).unwrap();
+        assert!(t.contains("missing its initramfs") && t.contains("do not reboot"), "{t}");
     }
 
     #[test]
@@ -929,18 +1023,15 @@ mod tests {
     }
 
     #[test]
-    fn install_warnings_cover_secure_boot_and_space() {
+    fn install_warnings_cover_space() {
         let mut info = SystemInfo::default();
         assert!(install_warnings(&info).is_empty());
-        info.secure_boot = SecureBoot::Enabled;
-        assert_eq!(install_warnings(&info).len(), 1);
         info.free_boot_bytes = Some(50);
         info.boot_needed_bytes = 100;
         assert!(info.boot_low());
-        assert_eq!(install_warnings(&info).len(), 2);
+        assert_eq!(install_warnings(&info).len(), 1);
         info.free_boot_bytes = Some(100);
         assert!(!info.boot_low());
-        info.secure_boot = SecureBoot::Unknown;
         assert!(install_warnings(&info).is_empty());
     }
 
@@ -970,7 +1061,7 @@ mod tests {
             version: "6.8.0-45-generic".into(),
             has_initrd: true,
             has_modules: true,
-            has_boot_entry: true,
+            boot_entry: BootEntry::Present,
             running: false,
             signed: Some(KernelSignature::Unsigned),
         };

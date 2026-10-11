@@ -197,6 +197,14 @@ printf 'title Ubuntu\nversion 17.1.3-070103-generic\nlinux /mid/17.1.3-070103-ge
 printf 'title Ubuntu\nlinux /mid/6.8.0-45-generic/linux\n' > "$tmp/sd/loader/entries/mid-6.8.0-45-generic+3-0.conf"
 got="$(sdboot_entry_for_kver "$tmp/sd" 7.1.3-070103-generic)"
 [[ "$got" == "$tmp/sd/loader/entries/mid-7.1.3-070103-generic.conf" ]] || bad "sdboot_entry_for_kver by version line got [$got]"
+[[ "$(sdboot_entry_id "$tmp/sd/loader/entries/mid-6.8.0-45-generic+3-0.conf")" == "mid-6.8.0-45-generic.conf" ]] || bad "sdboot_entry_id should strip the boot counter"
+[[ "$(sdboot_entry_id mid-6.8.0-45-generic+3.conf)" == "mid-6.8.0-45-generic.conf" ]] || bad "sdboot_entry_id should strip a +N counter"
+[[ "$(sdboot_entry_id mid-7.1.3-generic.conf)" == "mid-7.1.3-generic.conf" ]] || bad "sdboot_entry_id should keep a plain name"
+(
+    bootctl() { echo "$*" > "$tmp/bootctl-args"; }
+    set_boot_once systemd-boot "$tmp/sd" 6.8.0-45-generic >/dev/null
+) || bad "set_boot_once systemd-boot failed"
+[[ "$(cat "$tmp/bootctl-args")" == "set-oneshot mid-6.8.0-45-generic.conf" ]] || bad "set-oneshot should get the entry ID without the counter, got $(cat "$tmp/bootctl-args")"
 got="$(sdboot_entry_for_kver "$tmp/sd" 6.8.0-45-generic)"
 [[ "$got" == "$tmp/sd/loader/entries/mid-6.8.0-45-generic+3-0.conf" ]] || bad "sdboot_entry_for_kver boot-counted file name got [$got]"
 [[ -z "$(sdboot_entry_for_kver "$tmp/sd" 1.3-070103-generic)" ]] || bad "sdboot_entry_for_kver matched a partial version"
@@ -220,7 +228,7 @@ ln -s boot/vmlinuz-6.5.0-1-generic "$tmp/ksroot/vmlinuz"
 [[ -z "$(kernelstub_slot_for_kver 7.1.3-070103-generic)" ]] || bad "kernelstub slot should ignore /boot links when / has them"
 unset KERNEL_POP_BOOT KERNEL_POP_ROOTFS
 
-# ── Enrollment state and boot outlook ────────────────────────────────────
+# ── Enrollment state and the Secure Boot preflight ───────────────────────
 for pair in "is already enrolled:enrolled" "is already in the enrollment request:pending" \
             "is not enrolled:not-enrolled" "EFI variables are not supported:unknown"; do
     MOKUTIL_TEXT="/x/signing.der ${pair%%:*}"
@@ -230,19 +238,27 @@ for pair in "is already enrolled:enrolled" "is already in the enrollment request
 done
 unset -f mokutil
 (
+    export KERNEL_POP_MOK_DIR="$tmp/pf-mok"
+    mkdir -p "$KERNEL_POP_MOK_DIR"
+    sbsign() { :; }; sbverify() { :; }
     secure_boot_enforcing() { return 1; }
-    [[ "$(boot_outlook 0)" == "ok" ]] || exit 1
+    (secure_boot_preflight) >/dev/null || exit 1                     # Secure Boot off: anything goes
     secure_boot_enforcing() { return 0; }
-    [[ "$(boot_outlook 0)" == "blocked unsigned" ]] || exit 2
+    out="$(secure_boot_preflight)" && exit 2                          # no key: refused
+    grep -q "not set up.*Nothing was installed" <<< "$out" || exit 3
+    touch "$KERNEL_POP_MOK_DIR/signing.key" "$KERNEL_POP_MOK_DIR/signing.pem" "$KERNEL_POP_MOK_DIR/signing.der"
     key_enrollment_state() { echo enrolled; }
-    [[ "$(boot_outlook 1)" == "ok" ]] || exit 3
+    secure_boot_preflight >/dev/null || exit 4
+    (( SB_PENDING == 0 )) || exit 5
     key_enrollment_state() { echo pending; }
-    [[ "$(boot_outlook 1)" == "pending" ]] || exit 4
+    secure_boot_preflight >/dev/null || exit 6
+    (( SB_PENDING == 1 )) || exit 7
     key_enrollment_state() { echo not-enrolled; }
-    [[ "$(boot_outlook 1)" == "blocked not-enrolled" ]] || exit 5
+    (secure_boot_preflight >/dev/null) && exit 8
     key_enrollment_state() { echo unknown; }
-    [[ "$(boot_outlook 1)" == "blocked unknown" ]] || exit 6
-) || bad "boot_outlook case $?"
+    (secure_boot_preflight >/dev/null) && exit 9
+    exit 0
+) || bad "secure_boot_preflight case $?"
 
 # ── Download verification (root side) ───────────────────────────────────
 printf 'hash file\n' > "$tmp/ck"
@@ -266,6 +282,24 @@ chmod 0646 "$tmp/trust/f"; path_trusted "$tmp/trust/f" >/dev/null && bad "path_t
 chmod 0644 "$tmp/trust/f"; ln -s f "$tmp/trust/l"
 path_trusted "$tmp/trust/l" >/dev/null && bad "path_trusted should refuse a symlink"
 PKEXEC_UID=$(( $(id -u) + 1 )) path_trusted "$tmp/trust/f" >/dev/null && bad "path_trusted should refuse a file owned by someone other than the caller"
+
+# copy_trusted_file checks the file it opened and never blocks
+(
+    cd "$tmp/trust" || exit 1
+    copy_trusted_file f "$tmp/trust-copy" >/dev/null || exit 2
+    [[ "$(cat "$tmp/trust-copy")" == x ]] || exit 3
+    copy_trusted_file l "$tmp/trust-copy" >/dev/null && exit 4                 # symlink
+    mkfifo fifo; chmod 0644 fifo
+    export -f copy_trusted_file caller_uid
+    out="$(timeout 10 bash -c 'copy_trusted_file fifo "$1"' _ "$tmp/trust-copy" 2>&1)"
+    rc=$?; (( rc != 0 && rc != 124 )) || exit 5                                # refused, did not hang
+    grep -q "not a regular file" <<< "$out" || exit 6
+    chmod 0664 f; copy_trusted_file f "$tmp/trust-copy" >/dev/null && exit 7   # group-writable
+    chmod 0644 f
+    PKEXEC_UID=$(( $(id -u) + 1 )) copy_trusted_file f "$tmp/trust-copy" >/dev/null && exit 8
+    rm -f fifo
+    exit 0
+) || bad "copy_trusted_file case $?"
 
 # The real Ubuntu kernel PPA signature over a real mainline CHECKSUMS
 if ! command -v gpgv >/dev/null 2>&1; then
@@ -571,7 +605,7 @@ EOF2
                 shift; printf '%s\n' "$@" > "$root/dpkg-args"
                 touch "$KERNEL_POP_BOOT/vmlinuz-$kv"; mkdir -p "$KERNEL_POP_MODULES/$kv/build"
             }
-            apt-get() { return 1; }
+            apt-get() { echo "$*" >> "$root/apt-args"; [[ "$1" == "purge" ]]; }
             update-initramfs() { touch "$KERNEL_POP_BOOT/initrd.img-$3"; }   # -c|-u -k <kver>
             if [[ -n "${DKMS_BROKEN:-}" ]]; then
                 dkms() { [[ "$1" == "status" ]] && echo "nvidia/550.54, $kv, x86_64: built"; [[ "$1" == "status" ]]; }
@@ -596,7 +630,7 @@ EOF2
     root="$tmp/inst-off"
     [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$kv-advanced-x" ]] || bad "saved default should point at the new kernel, got $(cat "$root/saved")"
     grep -q "Reboot when ready" <<< "$out" || bad "a bootable install should end with Reboot when ready"
-    grep -q "BOOT BLOCKED\|BOOT PENDING" <<< "$out" && bad "no BOOT marker expected with Secure Boot off"
+    grep -q "BOOT PENDING" <<< "$out" && bad "no BOOT marker expected with Secure Boot off"
     [[ "$(count 'DKMS WARNING:' "$out")" == 1 ]] || bad "one broken module should give one DKMS WARNING line, got $(count 'DKMS WARNING:' "$out")"
     [[ "$(count 'DKMS SUMMARY:' "$out")" == 1 ]] || bad "a DKMS problem should give one DKMS SUMMARY line"
     while IFS= read -r f; do
@@ -609,25 +643,32 @@ EOF2
     out="$(FLAT_GRUB=1 run_install flat)" || bad "do_install (flat GRUB menu) failed: $out"
     [[ "$(cat "$tmp/inst-flat/saved")" == "gnulinux-$kv-advanced-x" ]] || bad "flat menu saved default got $(cat "$tmp/inst-flat/saved")"
 
-    # Secure Boot enforcing, no key: not made the default, next boot pinned to the running kernel
-    out="$(SB_ON=1 run_install nokey)" || bad "do_install (no key) failed: $out"
+    # Secure Boot enforcing, no key: refused before anything is installed
+    out="$(SB_ON=1 run_install nokey)" && bad "do_install should refuse with Secure Boot on and no key"
     root="$tmp/inst-nokey"
-    [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "an unbootable kernel became the saved default"
-    [[ "$(cat "$root/next" 2>/dev/null)" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "the next boot should be the running kernel, got $(cat "$root/next" 2>/dev/null)"
-    [[ "$(count 'BOOT BLOCKED:' "$out")" == 1 ]] || bad "an unbootable kernel needs one BOOT BLOCKED line: $out"
-    grep -q "BOOT BLOCKED: .*signing is not set up" <<< "$out" || bad "BOOT BLOCKED should say signing is not set up"
-    grep -q "Reboot when ready" <<< "$out" && bad "an unbootable kernel must not end with Reboot when ready"
-    grep -q "will NOT boot while Secure Boot is enforcing" <<< "$out" || bad "the final line should say it will not boot"
+    [[ -e "$root/dpkg-args" ]] && bad "dpkg ran although the kernel could not boot"
+    grep -q "kernel signing is not set up.*Nothing was installed" <<< "$out" || bad "the refusal should say signing is not set up: $out"
+    [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "a refused install changed the default"
 
-    # Key present but signing fails: one SIGN WARNING (no summary counted), blocked
-    out="$(SB_ON=1 WITH_KEY=1 run_install signfail)" || bad "do_install (sign fails) failed: $out"
+    # Key neither enrolled nor queued: refused before anything is installed
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=not-enrolled run_install notenrolled)" && bad "do_install should refuse a key that is not enrolled"
+    [[ -e "$tmp/inst-notenrolled/dpkg-args" ]] && bad "dpkg ran with a key that is not enrolled"
+    grep -q "neither enrolled nor waiting" <<< "$out" || bad "the refusal should say the key is not enrolled"
+
+    # Signing fails with Secure Boot on: the just-installed packages are purged again
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled run_install signfail)" && bad "do_install should fail when signing fails under Secure Boot"
+    root="$tmp/inst-signfail"
     [[ "$(count 'SIGN WARNING:' "$out")" == 1 ]] || bad "a failed sign should give exactly one SIGN WARNING line, got $(count 'SIGN WARNING:' "$out")"
-    grep -q "BOOT BLOCKED: .*could not be signed" <<< "$out" || bad "BOOT BLOCKED should say it could not be signed"
+    [[ "$(cat "$root/apt-args" 2>/dev/null)" == "purge -y linux-headers-7.7.7-070707 linux-image-unsigned-$kv linux-modules-$kv" ]] \
+        || bad "the rollback should purge exactly the installed packages, got [$(cat "$root/apt-args" 2>/dev/null)]"
+    grep -q "removed again. Nothing is left installed" <<< "$out" || bad "the rollback should be reported: $out"
+    [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "a rolled-back install changed the default"
 
-    # Signed, key not enrolled (KeyNotEnrolled): blocked, says so
-    out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=not-enrolled run_install notenrolled)" || bad "do_install (not enrolled) failed: $out"
-    grep -q "BOOT BLOCKED: .*not enrolled" <<< "$out" || bad "BOOT BLOCKED should say the key is not enrolled"
-    [[ "$(cat "$tmp/inst-notenrolled/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "not-enrolled kernel became the default"
+    # Signing fails with Secure Boot off: kept, one SIGN WARNING, summary not counted
+    out="$(WITH_KEY=1 run_install signfail-off)" || bad "do_install (sign fails, Secure Boot off) failed: $out"
+    [[ "$(count 'SIGN WARNING:' "$out")" == 1 ]] || bad "Secure Boot off: one SIGN WARNING line expected"
+    [[ "$(count 'SIGN SUMMARY:' "$out")" == 1 ]] || bad "Secure Boot off: one SIGN SUMMARY line expected"
+    [[ -e "$tmp/inst-signfail-off/apt-args" ]] && bad "Secure Boot off: nothing should be rolled back"
 
     # Signed, enrollment pending: default moves, BOOT PENDING says what to do
     out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=pending run_install pending)" || bad "do_install (pending) failed: $out"

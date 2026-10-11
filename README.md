@@ -38,9 +38,9 @@ on boot. This app is built around not letting that happen:
 - Remove old kernels (running kernel is never removable), singly or
   "keep the newest N" in one step
 - Boot a chosen installed kernel on the next restart only
-- Secure Boot warning before installing a kernel that will not be signed
-  with an enrolled key; a kernel that will not boot is never made the
-  default, and the next restart starts the running kernel instead
+- With Secure Boot on, a kernel that could not boot is never installed:
+  the install is refused until signing is set up, and a kernel whose
+  signing fails is removed again
 - Optional kernel signing: a one-time Set Up Signing step creates Kernel
   Pop's own signing key, signs the installed kernels and queues the key for
   MOK enrollment; from then on every kernel it installs is signed
@@ -124,12 +124,21 @@ own key rather than Ubuntu's module-signing MOK, which shim does not accept
 for kernels. Without the setup, kernels are installed unsigned exactly as
 before.
 
-When Secure Boot is enforcing and a newly installed kernel cannot boot yet
-(it is unsigned, or the key is not enrolled), the install says so in a
-`BOOT BLOCKED` line, does not make that kernel the default, and selects the
-running kernel for the next restart, so a reboot never lands on a kernel
-shim refuses. When the key is only waiting for its enrollment, the install
-reminds you to confirm it at the MOK Manager screen.
+With Secure Boot enforcing, Kernel Pop only installs a kernel that will be
+signed with a key that is enrolled or waiting for enrollment:
+
+- Without the signing setup, or with a key that is neither enrolled nor
+  queued (or whose state mokutil cannot report), the install is refused
+  before anything changes, and the app points you to Set Up Signing.
+- If signing the new kernel fails, its packages are removed again, so no
+  kernel that shim would refuse is left in the boot menu.
+- If the key is still waiting for enrollment, the kernel is installed and
+  signed, and the install reminds you to confirm the enrollment at the MOK
+  Manager screen on the next reboot; skip that and it will not boot.
+
+With Secure Boot off, every kernel installs; one that could not be signed
+is reported with a `SIGN WARNING`, and boots until Secure Boot is turned
+on.
 
 ## Building from source
 

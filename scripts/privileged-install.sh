@@ -28,7 +28,6 @@
 # reacts to these markers at the start of a line's text, so each one is used
 # once per problem and never in a summary line:
 #   DKMS WARNING:  one DKMS problem        SIGN WARNING:  one signing problem
-#   BOOT BLOCKED:  the kernel will not boot while Secure Boot is enforcing
 #   BOOT PENDING:  it boots once the signing key's enrollment is confirmed
 # Summaries use "DKMS SUMMARY:" / "SIGN SUMMARY:", which are not counted.
 
@@ -149,11 +148,24 @@ sdboot_entry_for_kver() {
     done
     for f in "$esp"/loader/entries/*.conf; do
         [[ -f "$f" ]] || continue
-        case "${f##*/}" in
-            *"-$kver.conf"|*"-$kver+"*".conf") echo "$f"; return 0 ;;
-        esac
+        if [[ "$(sdboot_entry_id "$f")" == *"-$kver.conf" ]]; then
+            echo "$f"
+            return 0
+        fi
     done
     return 0
+}
+
+# The entry ID systemd-boot uses for an entry file (what bootctl
+# set-oneshot takes): the file name with any boot-counting suffix
+# ("+3.conf", "+2-1.conf") removed.
+sdboot_entry_id() {
+    local name="${1##*/}"
+    name="${name%.conf}"
+    if [[ "$name" =~ ^(.+)\+[0-9]+(-[0-9]+)?$ ]]; then
+        name="${BASH_REMATCH[1]}"
+    fi
+    echo "$name.conf"
 }
 
 # kernelstub (Pop!_OS) copies exactly two kernels to the ESP: the one the
@@ -211,7 +223,7 @@ set_boot_once() {
         systemd-boot)
             entry="$(sdboot_entry_for_kver "$esp" "$kver")"
             [[ -n "$entry" ]] || { log "No systemd-boot entry found for $kver in $esp/loader/entries"; return 1; }
-            id="$(basename "$entry")"
+            id="$(sdboot_entry_id "$entry")"
             bootctl set-oneshot "$id" >>"$LOGFILE" 2>&1 \
                 || { log "bootctl set-oneshot failed for $id"; return 1; }
             log "systemd-boot will boot $kver on the next boot only ($id)"
@@ -623,23 +635,41 @@ key_enrollment_state() {
     esac
 }
 
-# Whether a just-installed kernel will boot, given whether it carries the
-# Kernel Pop signature (1/0). Prints one of:
-#   ok                     Secure Boot is not enforcing, or signed with an enrolled key
-#   pending                signed, key queued: boots once the enrollment is confirmed
-#   blocked unsigned       enforcing, and the kernel is not signed
-#   blocked not-enrolled   enforcing, signed, but the key is neither enrolled nor queued
-#   blocked unknown        enforcing, signed, but the key's state could not be read
-boot_outlook() {
-    local signed="$1" state
-    if ! secure_boot_enforcing; then echo ok; return 0; fi
-    if (( ! signed )); then echo "blocked unsigned"; return 0; fi
-    state="$(key_enrollment_state)"
-    case "$state" in
-        enrolled) echo ok ;;
-        pending)  echo pending ;;
-        *)        echo "blocked $state" ;;
+# With Secure Boot enforcing, a kernel can only boot when it is signed with
+# a key that is enrolled, or queued for enrollment (it boots once MOK
+# Manager has enrolled it at the next start). So before anything is
+# installed: with Secure Boot enforcing, the signing setup must be done, its
+# tools present and the key enrolled or queued; otherwise the install is
+# refused and nothing changes. Sets SB_PENDING=1 when the key is queued.
+SB_PENDING=0
+secure_boot_preflight() {
+    secure_boot_enforcing || return 0
+    signing_key_present \
+        || die "Secure Boot is enforcing and kernel signing is not set up, so a mainline kernel could not boot. Nothing was installed. Use Set Up Signing on the System tab first, or turn Secure Boot off."
+    if ! command -v sbsign >/dev/null 2>&1 || ! command -v sbverify >/dev/null 2>&1; then
+        die "Secure Boot is enforcing and the signing tools (sbsigntool) are missing, so the kernel could not be signed. Nothing was installed. Run Set Up Signing on the System tab again."
+    fi
+    case "$(key_enrollment_state)" in
+        enrolled) ;;
+        pending)  SB_PENDING=1 ;;
+        not-enrolled)
+            die "Secure Boot is enforcing and Kernel Pop's signing key is neither enrolled nor waiting for enrollment, so a kernel signed with it could not boot. Nothing was installed. Use Set Up Signing on the System tab again and confirm the enrollment at the next reboot." ;;
+        *)
+            die "Secure Boot is enforcing and Kernel Pop could not confirm that its signing key is enrolled (mokutil gave no answer), so the kernel might not boot. Nothing was installed." ;;
     esac
+}
+
+# Undo a just-finished dpkg install: purge exactly the packages of the
+# staged .debs. Used when Secure Boot is enforcing and signing failed, so no
+# kernel that shim would refuse stays installed (their postrm hooks take the
+# kernel out of the boot menu again).
+rollback_install() {
+    local dir="$1" d pkgs=()
+    for d in "$dir"/*.deb; do
+        pkgs+=("$(dpkg-deb -f "$d" Package)")
+    done
+    log "Removing the just-installed packages again: ${pkgs[*]}"
+    apt-get purge -y "${pkgs[@]}" >>"$LOGFILE" 2>&1
 }
 
 # MOK Manager takes 8-16 characters, typed on a US keyboard layout at boot.
@@ -697,7 +727,7 @@ signer_fpr()   { echo "${KERNEL_POP_SIGNER_FPR:-60AA7B6F30434AE68E569963E50C6A09
 caller_uid() { echo "${PKEXEC_UID:-${SUDO_UID:-0}}"; }
 
 # A download path is used only when it is not a symlink, is owned by the
-# caller (or root) and is not writable by group or others.
+# caller and is not writable by group or others.
 path_trusted() {
     local p="$1" uid owner mode
     uid="$(caller_uid)"
@@ -705,7 +735,7 @@ path_trusted() {
     [[ -e "$p" ]] || { log "Refusing $p: it does not exist"; return 1; }
     owner="$(stat -c '%u' "$p")"
     mode="$(stat -c '%a' "$p")"
-    if [[ "$owner" != "$uid" && "$owner" != 0 ]]; then
+    if [[ "$owner" != "$uid" ]]; then
         log "Refusing $p: owned by uid $owner, not by uid $uid"
         return 1
     fi
@@ -713,6 +743,37 @@ path_trusted() {
         log "Refusing $p: writable by group or others (mode $mode)"
         return 1
     fi
+}
+
+# Copy file <name> (relative to the current directory) to <dst>. The file is
+# opened once, without following a symlink and without blocking on a FIFO,
+# and every check is made on that open file: a regular file, owned by the
+# caller, not writable by group or others. The copy is read from the same
+# open file, so swapping the name for something else after the check has
+# no effect. (perl is Essential on Debian/Ubuntu; bash cannot open with
+# O_NOFOLLOW|O_NONBLOCK or fstat.)
+copy_trusted_file() {
+    perl -e '
+        use strict; use warnings;
+        use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK F_GETFL F_SETFL S_ISREG);
+        my ($name, $dst, $uid) = @ARGV;
+        sysopen(my $in, $name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) or die "cannot open $name: $!\n";
+        my @st = stat($in) or die "cannot stat $name: $!\n";
+        S_ISREG($st[2]) or die "$name is not a regular file\n";
+        $st[4] == $uid or die "$name is owned by uid $st[4], not by uid $uid\n";
+        ($st[2] & 022) == 0 or die sprintf("%s is writable by group or others (mode %o)\n", $name, $st[2] & 07777);
+        my $fl = fcntl($in, F_GETFL, 0) or die "fcntl: $!\n";
+        fcntl($in, F_SETFL, $fl & ~O_NONBLOCK) or die "fcntl: $!\n";
+        open(my $out, ">", $dst) or die "cannot write $dst: $!\n";
+        binmode $in; binmode $out;
+        while (1) {
+            my $n = sysread($in, my $buf, 1 << 20);
+            defined $n or die "read error on $name: $!\n";
+            last if $n == 0;
+            print {$out} $buf or die "write error on $dst: $!\n";
+        }
+        close $out or die "write error on $dst: $!\n";
+    ' "$1" "$2" "$(caller_uid)" 2>&1
 }
 
 # The SHA256 a CHECKSUMS file lists for package file <name>, or nothing.
@@ -755,31 +816,35 @@ checksums_signature_ok() {
 # Copy <src>'s CHECKSUMS, CHECKSUMS.gpg and .debs into the root-only <dst>,
 # then verify the signature and every package there. Dies on any problem; a
 # package missing from the signed CHECKSUMS is an error, never "unverified".
+# The directory is entered once and checked as ".", so every file is opened
+# relative to that one directory even if <src> is swapped for a symlink.
 stage_verified_debs() {
-    local src="$1" dst="$2" f name want got n=0
-    path_trusted "$src" || die "Refusing the package directory $src"
-    for name in CHECKSUMS CHECKSUMS.gpg; do
-        [[ -f "$src/$name" ]] || die "$name is missing from $src — Kernel Pop installs only packages it can verify"
-        path_trusted "$src/$name" || die "Refusing $src/$name"
-        cat "$src/$name" > "$dst/$name" || die "Could not copy $name"
-    done
-    checksums_signature_ok "$dst" \
-        || die "The CHECKSUMS file is not signed by Ubuntu's kernel PPA key — refusing to install"
-    log "Verified: CHECKSUMS is signed by Ubuntu's kernel PPA key"
-    for f in "$src"/*.deb; do
-        [[ -e "$f" || -L "$f" ]] || continue
-        name="${f##*/}"
-        [[ -f "$f" ]] || die "Refusing $f: not a regular file"
-        path_trusted "$f" || die "Refusing $f"
-        want="$(checksum_for "$dst/CHECKSUMS" "$name")"
-        [[ -n "$want" ]] || die "$name is not listed in the signed CHECKSUMS — refusing to install it"
-        cat "$f" > "$dst/$name" || die "Could not copy $name"
-        got="$(sha256sum "$dst/$name" | cut -d' ' -f1)"
-        [[ "$got" == "$want" ]] || die "SHA256 mismatch for $name (expected $want, got $got) — refusing to install"
-        n=$((n + 1))
-    done
-    (( n > 0 )) || die "No .deb files found in $src"
-    log "Verified: $n package(s) match the signed CHECKSUMS"
+    local src="$1" dst="$2"
+    [[ -L "$src" ]] && die "Refusing the package directory $src: it is a symlink"
+    (
+        cd -P -- "$src" 2>/dev/null || die "Cannot enter the package directory $src"
+        path_trusted . || die "Refusing the package directory $src"
+        local f name want got out n=0
+        for name in CHECKSUMS CHECKSUMS.gpg; do
+            [[ -e "$name" || -L "$name" ]] || die "$name is missing from $src — Kernel Pop installs only packages it can verify"
+            out="$(copy_trusted_file "$name" "$dst/$name")" || die "Refusing $src/$name: $out"
+        done
+        checksums_signature_ok "$dst" \
+            || die "The CHECKSUMS file is not signed by Ubuntu's kernel PPA key — refusing to install"
+        log "Verified: CHECKSUMS is signed by Ubuntu's kernel PPA key"
+        for f in ./*.deb; do
+            [[ -e "$f" || -L "$f" ]] || continue
+            name="${f#./}"
+            want="$(checksum_for "$dst/CHECKSUMS" "$name")"
+            [[ -n "$want" ]] || die "$name is not listed in the signed CHECKSUMS — refusing to install it"
+            out="$(copy_trusted_file "$name" "$dst/$name")" || die "Refusing $src/$name: $out"
+            got="$(sha256sum "$dst/$name" | cut -d' ' -f1)"
+            [[ "$got" == "$want" ]] || die "SHA256 mismatch for $name (expected $want, got $got) — refusing to install"
+            n=$((n + 1))
+        done
+        (( n > 0 )) || die "No .deb files found in $src"
+        log "Verified: $n package(s) match the signed CHECKSUMS"
+    ) || exit 1
 }
 
 STAGE_DIR=""
@@ -812,6 +877,9 @@ do_install() {
     valid_kver "$kver" || die "The package metadata gives an invalid kernel version: '$kver'"
     log "Kernel version (from package metadata): $kver"
 
+    # Refuse up front what could not boot under Secure Boot.
+    secure_boot_preflight
+
     # Snapshot the modules directory so the post-install cross-check is honest
     local before_modules
     before_modules="$(ls -1 "$mods" 2>/dev/null || true)"
@@ -842,12 +910,18 @@ do_install() {
     log "Verified: $boot/vmlinuz-$kver exists"
 
     # ── Signing: only when the signing setup has been done ─────────────
-    # A failure is a warning, never an install error (same as DKMS below).
-    local signed_now=0 key=0
+    # With Secure Boot off, a failure is a warning, never an install error
+    # (same as DKMS below). With it enforcing, an unsigned kernel could not
+    # boot, so the install is undone instead.
+    local signed_now=0
     if signing_key_present; then
-        key=1
         if sign_kernel "$kver"; then
             signed_now=1
+        elif secure_boot_enforcing; then
+            if rollback_install "$dir"; then
+                die "$kver could not be signed (see the SIGN WARNING above), and with Secure Boot enforcing it could not boot, so it was removed again. Nothing is left installed. Try again, or check the signing setup on the System tab."
+            fi
+            die "$kver could not be signed and could not be removed again — it will NOT boot while Secure Boot is enforcing. Remove it on the System tab before rebooting."
         else
             SIGN_FAILED=$((SIGN_FAILED + 1))
             log "$kver was installed but could not be signed (see the SIGN WARNING above)"
@@ -855,11 +929,6 @@ do_install() {
     else
         log "Kernel signing not set up — $kver left unsigned"
     fi
-
-    # Will it boot? Decided now so the boot loader step never makes a kernel
-    # that shim will refuse the default.
-    local outlook why
-    outlook="$(boot_outlook "$signed_now")"
 
     # ── DKMS: build out-of-tree modules before the initramfs ───────────
     # The headers are installed by now. Running this before the initramfs
@@ -927,31 +996,27 @@ do_install() {
                 local prev_saved
                 prev_saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || prev_saved=""
                 log "Previous GRUB default: ${prev_saved:-<none>}"
-                if [[ "$outlook" == blocked* ]]; then
-                    log "GRUB_DEFAULT=saved detected — the saved default stays as it is, because $kver will not boot while Secure Boot is enforcing"
-                else
-                    # Remember the previous default so it can be put back if
-                    # the new one does not verify.
-                    log "GRUB_DEFAULT=saved detected — pointing the saved default at $kver…"
-                    local entry_path
-                    entry_path="$(grub_entry_path_for_kver "$kver")" || entry_path=""
-                    if [[ -n "$entry_path" ]]; then
-                        if grub-set-default "$entry_path" >>"$LOGFILE" 2>&1; then
-                            local saved
-                            saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || saved=""
-                            if [[ "$saved" == "$entry_path" ]]; then
-                                log "Verified: saved_entry now points to $kver"
-                            else
-                                log "WARNING: saved_entry is '$saved' after grub-set-default, expected '$entry_path' — verify manually before rebooting"
-                                restore_grub_default "$prev_saved"
-                            fi
+                # Remember the previous default so it can be put back if
+                # the new one does not verify.
+                log "GRUB_DEFAULT=saved detected — pointing the saved default at $kver…"
+                local entry_path
+                entry_path="$(grub_entry_path_for_kver "$kver")" || entry_path=""
+                if [[ -n "$entry_path" ]]; then
+                    if grub-set-default "$entry_path" >>"$LOGFILE" 2>&1; then
+                        local saved
+                        saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || saved=""
+                        if [[ "$saved" == "$entry_path" ]]; then
+                            log "Verified: saved_entry now points to $kver"
                         else
-                            log "WARNING: grub-set-default failed for $entry_path — $kver is installed but may not be the default boot entry"
+                            log "WARNING: saved_entry is '$saved' after grub-set-default, expected '$entry_path' — verify manually before rebooting"
                             restore_grub_default "$prev_saved"
                         fi
                     else
-                        log "WARNING: could not find a GRUB menu entry for $kver in grub.cfg — saved default left unchanged, verify manually before rebooting"
+                        log "WARNING: grub-set-default failed for $entry_path — $kver is installed but may not be the default boot entry"
+                        restore_grub_default "$prev_saved"
                     fi
+                else
+                    log "WARNING: could not find a GRUB menu entry for $kver in grub.cfg — saved default left unchanged, verify manually before rebooting"
                 fi
             fi
             ;;
@@ -964,56 +1029,15 @@ do_install() {
         log "DKMS SUMMARY: $DKMS_FAILED DKMS problem(s) for $kver — the kernel is installed, but out-of-tree modules (such as the NVIDIA driver) may be missing after reboot. See the DKMS lines above."
     fi
 
-    case "$outlook" in
-        ok)
-            if (( SIGN_FAILED > 0 )); then
-                log "SIGN SUMMARY: $kver is installed but unsigned. Secure Boot is not enforcing now, so it boots; sign it before turning Secure Boot on."
-            fi
-            log "==== Done. Kernel $kver installed with initramfs verified. Reboot when ready. ===="
-            ;;
-        pending)
-            log "BOOT PENDING: $kver is signed, but the signing key is still waiting for enrollment. On the next reboot the blue MOK Manager screen appears: choose Enroll MOK, Continue, Yes, then type your password. Skip it and $kver will not boot while Secure Boot is enforcing."
-            log "==== Done. Kernel $kver installed with initramfs verified. Confirm the key enrollment at the next reboot. ===="
-            ;;
-        *)
-            case "$outlook" in
-                "blocked unsigned")
-                    if (( key )); then
-                        why="it could not be signed (see the SIGN WARNING above); try Sign on the System tab"
-                    else
-                        why="it is unsigned and kernel signing is not set up; use Set Up Signing on the System tab, or turn Secure Boot off"
-                    fi ;;
-                "blocked not-enrolled")
-                    why="it is signed, but the signing key is not enrolled; use Set Up Signing on the System tab again and confirm the enrollment at the next reboot" ;;
-                *)
-                    why="it is signed, but Kernel Pop could not confirm that the signing key is enrolled (mokutil gave no answer)" ;;
-            esac
-            log "BOOT BLOCKED: $kver will not boot while Secure Boot is enforcing: $why."
-            keep_next_boot_safe "$bl" "$esp" "$kver"
-            log "==== Done. Kernel $kver installed with initramfs verified, but it will NOT boot while Secure Boot is enforcing. ===="
-            ;;
-    esac
-}
-
-# After installing a kernel that will not boot, make sure the next restart
-# does not try it: GRUB and systemd-boot put the newest kernel first, so the
-# running kernel (which evidently boots) is selected for the next boot only.
-keep_next_boot_safe() {
-    local bl="$1" esp="$2" kver="$3" running
-    running="$(uname -r)"
-    if [[ "$running" == "$kver" ]]; then return 0; fi
-    case "$bl" in
-        grub|systemd-boot)
-            if set_boot_once "$bl" "$esp" "$running"; then
-                log "The next restart starts the running kernel $running once, so it stays safe. After that the boot menu may pick $kver again: pick $running there until $kver can boot."
-            else
-                log "WARNING: could not select the running kernel $running for the next boot — pick it in the boot menu, not $kver"
-            fi
-            ;;
-        *)
-            log "Pick the running kernel $running in the boot menu, not $kver, until $kver can boot."
-            ;;
-    esac
+    if (( SIGN_FAILED > 0 )); then
+        log "SIGN SUMMARY: $kver is installed but unsigned. Secure Boot is not enforcing now, so it boots; sign it before turning Secure Boot on."
+    fi
+    if (( SB_PENDING )); then
+        log "BOOT PENDING: $kver is signed, but the signing key is still waiting for enrollment. On the next reboot the blue MOK Manager screen appears: choose Enroll MOK, Continue, Yes, then type your password. Skip it and $kver will not boot while Secure Boot is enforcing."
+        log "==== Done. Kernel $kver installed with initramfs verified. Confirm the key enrollment at the next reboot. ===="
+    else
+        log "==== Done. Kernel $kver installed with initramfs verified. Reboot when ready. ===="
+    fi
 }
 
 # Boot a different installed kernel on the NEXT boot only; the saved default
