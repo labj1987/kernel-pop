@@ -1,7 +1,7 @@
 //! download.rs — Download a kernel's .deb set with progress, cancel,
-//! retries, and SHA256 verification.
+//! retries, and SHA256 verification against the signed CHECKSUMS.
 
-use crate::versions::KernelDeb;
+use crate::versions::DebSet;
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
@@ -11,6 +11,38 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_SECS: u64 = 3;
+
+/// The error a download ends with when the user cancelled it. Recognise it
+/// with `err.downcast_ref::<Cancelled>()`, which works through any context
+/// added on the way up.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Download cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// True when `err` is (or wraps) a cancelled download.
+pub fn is_cancelled(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Cancelled>().is_some()
+}
+
+/// The privileged script refuses files that anyone but their owner can
+/// write, so the download directory and files get these modes explicitly
+/// rather than whatever the umask gives.
+const DIR_MODE: u32 = 0o755;
+const FILE_MODE: u32 = 0o644;
+
+async fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .await
+        .with_context(|| format!("Could not set the mode of {}", path.display()))
+}
 
 /// Progress event for the whole set.
 #[derive(Debug, Clone)]
@@ -47,7 +79,7 @@ where
 
     for attempt in 0..MAX_RETRIES {
         if cancel.load(Ordering::Relaxed) {
-            bail!("Download cancelled");
+            return Err(Cancelled.into());
         }
         if attempt > 0 {
             let wait = RETRY_BASE_SECS * (2u64.pow(attempt - 1));
@@ -77,7 +109,7 @@ where
             if cancel.load(Ordering::Relaxed) {
                 drop(file);
                 let _ = tokio::fs::remove_file(dest).await;
-                bail!("Download cancelled");
+                return Err(Cancelled.into());
             }
             match chunk {
                 Ok(bytes) => {
@@ -113,11 +145,17 @@ where
     Err(last_err).context(format!("Download failed after {} attempts", MAX_RETRIES))
 }
 
-/// Download every .deb into `dest_dir`, verifying each against its SHA256
-/// when one is published. A failed verification deletes the file and aborts
-/// the whole set. Returns the paths of the downloaded files.
+/// Download every .deb of `set` into `dest_dir`, verifying each against its
+/// SHA256 from the signed CHECKSUMS. Each file is written as `<name>.part`
+/// and only renamed into place once it verified, so a failed or cancelled
+/// download never leaves a bad file under a package's name. Anything left in
+/// `dest_dir` from an earlier download that is not part of this set is
+/// removed, and CHECKSUMS and CHECKSUMS.gpg are written last, so a
+/// directory holding them holds a complete, verified set: the privileged
+/// script installs exactly those files after checking them again itself.
+/// Returns the paths of the downloaded packages.
 pub async fn download_deb_set<F>(
-    debs: Vec<KernelDeb>,
+    set: DebSet,
     dest_dir: PathBuf,
     mut progress_cb: F,
     cancel: Arc<AtomicBool>,
@@ -128,19 +166,22 @@ where
     tokio::fs::create_dir_all(&dest_dir)
         .await
         .with_context(|| format!("Could not create download directory: {}", dest_dir.display()))?;
+    set_mode(&dest_dir, DIR_MODE).await?;
+    remove_stale_files(&dest_dir, &set).await?;
 
     let client = client()?;
-    let count = debs.len();
+    let count = set.debs.len();
     let mut paths = vec![];
 
-    for (i, deb) in debs.iter().enumerate() {
+    for (i, deb) in set.debs.iter().enumerate() {
         let dest = dest_dir.join(&deb.filename);
+        let part = dest_dir.join(format!("{}.part", deb.filename));
         let filename = deb.filename.clone();
 
         download_one(
             &client,
             &deb.url,
-            &dest,
+            &part,
             |downloaded, total| {
                 progress_cb(Progress {
                     file_index: i,
@@ -155,19 +196,57 @@ where
         .await
         .with_context(|| format!("Failed to download {}", deb.filename))?;
 
-        if let Some(expected) = &deb.sha256 {
-            if let Err(e) = verify_sha256(&dest, expected).await {
-                let _ = tokio::fs::remove_file(&dest).await;
-                return Err(e).with_context(|| {
-                    format!("SHA256 verification failed for {} — file deleted", deb.filename)
-                });
-            }
+        if let Err(e) = verify_sha256(&part, &deb.sha256).await {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e).with_context(|| {
+                format!("SHA256 verification failed for {} — file deleted", deb.filename)
+            });
         }
-
+        set_mode(&part, FILE_MODE).await?;
+        tokio::fs::rename(&part, &dest)
+            .await
+            .with_context(|| format!("Could not move {} into place", deb.filename))?;
         paths.push(dest);
     }
 
+    for (name, bytes) in [("CHECKSUMS", &set.checksums), ("CHECKSUMS.gpg", &set.checksums_sig)] {
+        let path = dest_dir.join(name);
+        tokio::fs::write(&path, bytes)
+            .await
+            .with_context(|| format!("Could not write {}", path.display()))?;
+        set_mode(&path, FILE_MODE).await?;
+    }
+
     Ok(paths)
+}
+
+/// Whether a file in the download directory belongs to an earlier download
+/// and should go: package files (and their `.part`s) not in this set, and
+/// the CHECKSUMS pair, which is rewritten once the set is complete.
+fn is_stale(name: &str, set: &DebSet) -> bool {
+    if name == "CHECKSUMS" || name == "CHECKSUMS.gpg" {
+        return true;
+    }
+    if name.ends_with(".part") {
+        return true;
+    }
+    name.ends_with(".deb") && !set.debs.iter().any(|d| d.filename == name)
+}
+
+async fn remove_stale_files(dir: &Path, set: &DebSet) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .with_context(|| format!("Could not read {}", dir.display()))?;
+    while let Some(e) = entries.next_entry().await? {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if is_stale(name, set) && e.file_type().await.is_ok_and(|t| t.is_file() || t.is_symlink()) {
+            tokio::fs::remove_file(e.path())
+                .await
+                .with_context(|| format!("Could not remove the old file {}", e.path().display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Verify SHA256 of a file against an expected hex string, streaming in
@@ -204,6 +283,91 @@ pub async fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::versions::KernelDeb;
+
+    #[test]
+    fn cancellation_is_recognised_through_context() {
+        let e: anyhow::Error = Cancelled.into();
+        let wrapped = Err::<(), _>(e)
+            .context("Failed to download linux-image.deb")
+            .context("outer")
+            .unwrap_err();
+        assert!(is_cancelled(&wrapped));
+        assert!(!is_cancelled(&anyhow::anyhow!("Download cancelled")));
+    }
+
+    fn set_of(names: &[&str]) -> DebSet {
+        DebSet {
+            debs: names
+                .iter()
+                .map(|n| KernelDeb { filename: n.to_string(), url: String::new(), sha256: "0".repeat(64) })
+                .collect(),
+            checksums: b"sums".to_vec(),
+            checksums_sig: b"sig".to_vec(),
+        }
+    }
+
+    #[test]
+    fn stale_files_are_old_packages_parts_and_checksums() {
+        let set = set_of(&["linux-image-a.deb", "linux-modules-a.deb"]);
+        assert!(!is_stale("linux-image-a.deb", &set));
+        assert!(is_stale("linux-image-old-build.deb", &set));
+        assert!(is_stale("linux-image-a.deb.part", &set));
+        assert!(is_stale("CHECKSUMS", &set));
+        assert!(is_stale("CHECKSUMS.gpg", &set));
+        assert!(!is_stale("notes.txt", &set));
+    }
+
+    #[tokio::test]
+    async fn stale_files_are_removed_and_modes_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kernel-pop-test-stale-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        for f in ["linux-image-a.deb", "linux-image-old.deb", "x.deb.part", "CHECKSUMS", "notes.txt"] {
+            tokio::fs::write(dir.join(f), b"x").await.unwrap();
+        }
+        remove_stale_files(&dir, &set_of(&["linux-image-a.deb"])).await.unwrap();
+        let mut left = vec![];
+        let mut rd = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            left.push(e.file_name().into_string().unwrap());
+        }
+        left.sort();
+        assert_eq!(left, ["linux-image-a.deb", "notes.txt"]);
+        set_mode(&dir.join("notes.txt"), FILE_MODE).await.unwrap();
+        let mode = std::fs::metadata(dir.join("notes.txt")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    /// Downloads the real v6.17 set (about 150 MB) into
+    /// $KERNEL_POP_LIVE_DEST (kept, for running the privileged script's
+    /// verification on it: KERNEL_POP_TEST_REAL_DEBS) or a temp dir.
+    #[tokio::test]
+    #[ignore]
+    async fn live_download_writes_a_verified_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let v = crate::versions::KernelVersion {
+            version: "6.17".into(),
+            url: format!("{}v6.17/", crate::versions::MAINLINE_BASE),
+            is_rc: false,
+        };
+        let keep = std::env::var_os("KERNEL_POP_LIVE_DEST").map(PathBuf::from);
+        let dest = keep.clone().unwrap_or_else(|| std::env::temp_dir().join("kernel-pop-live-download"));
+        let set = crate::versions::fetch_deb_list(&v).await.unwrap();
+        let paths = download_deb_set(set, dest.clone(), |_| {}, Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert_eq!(paths.len(), 4);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dest), 0o755);
+        for p in paths.iter().chain([&dest.join("CHECKSUMS"), &dest.join("CHECKSUMS.gpg")]) {
+            assert_eq!(mode(p), 0o644, "{}", p.display());
+        }
+        if keep.is_none() {
+            std::fs::remove_dir_all(&dest).unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn verify_sha256_accepts_match_and_rejects_mismatch() {

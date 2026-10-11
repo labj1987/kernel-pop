@@ -1,5 +1,6 @@
 //! versions.rs — Talk to kernel.ubuntu.com/mainline: list versions, resolve
-//! the generic-flavour amd64 .deb set for a version, and fetch checksums.
+//! the generic-flavour amd64 .deb set for a version, and fetch the signed
+//! CHECKSUMS published next to those .debs.
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -25,8 +26,19 @@ pub struct KernelVersion {
 pub struct KernelDeb {
     pub filename: String,
     pub url: String,
-    /// SHA256 from the CHECKSUMS file, if published.
-    pub sha256: Option<String>,
+    /// SHA256 from the signed CHECKSUMS file. Every package has one: a
+    /// package the CHECKSUMS does not list is never offered for install.
+    pub sha256: String,
+}
+
+/// A kernel version's packages plus the CHECKSUMS file (and its signature)
+/// they were checked against. The download keeps both files next to the
+/// .debs, because the privileged script verifies everything again as root.
+#[derive(Debug, Clone)]
+pub struct DebSet {
+    pub debs: Vec<KernelDeb>,
+    pub checksums: Vec<u8>,
+    pub checksums_sig: Vec<u8>,
 }
 
 fn client() -> Result<reqwest::Client> {
@@ -45,6 +57,8 @@ pub async fn fetch_versions() -> Result<Vec<KernelVersion>> {
         .send()
         .await
         .context("Failed to reach kernel.ubuntu.com")?
+        .error_for_status()
+        .context("kernel.ubuntu.com did not return the mainline index")?
         .text()
         .await?;
 
@@ -155,9 +169,65 @@ fn parse_checksums(text: &str) -> HashMap<String, String> {
     map
 }
 
+/// The directory part of a URL, with its trailing slash.
+fn url_dir(url: &str) -> &str {
+    match url.rfind('/') {
+        Some(i) => &url[..=i],
+        None => url,
+    }
+}
+
+/// The one directory every package of the set lives in. The CHECKSUMS file
+/// that covers them is in that same directory (`<version>/amd64/CHECKSUMS`
+/// on the current layout; the version page's own CHECKSUMS only covers a
+/// build bundle there). Packages spread over several directories would need
+/// several CHECKSUMS files, which no mainline layout has, so that is an error.
+fn common_dir<'a>(urls: impl IntoIterator<Item = &'a str>) -> Result<String> {
+    let mut dirs: Vec<&str> = urls.into_iter().map(url_dir).collect();
+    dirs.sort();
+    dirs.dedup();
+    match dirs.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => bail!("No packages to find checksums for"),
+        many => bail!("The packages are spread over several directories ({}) — refusing an unusual layout", many.join(", ")),
+    }
+}
+
+/// Wanted packages from the index links, de-duplicated by file name, with
+/// their SHA256 from `sums`. A wanted package missing from `sums` is an
+/// error: nothing unverified is ever downloaded for install.
+fn select_debs(found: Vec<(String, String)>, sums: &HashMap<String, String>) -> Result<Vec<KernelDeb>> {
+    let mut debs: Vec<KernelDeb> = vec![];
+    for (filename, url) in found {
+        if !wanted_deb(&filename) || debs.iter().any(|d| d.filename == filename) {
+            continue;
+        }
+        let Some(sha256) = sums.get(&filename).cloned() else {
+            bail!("{filename} is not listed in the signed CHECKSUMS — refusing to download it");
+        };
+        debs.push(KernelDeb { filename, url, sha256 });
+    }
+    debs.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(debs)
+}
+
+async fn fetch_bytes(client: &reqwest::Client, url: &str, what: &str) -> Result<Vec<u8>> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch {what}"))?
+        .error_for_status()
+        .with_context(|| format!("kernel.ubuntu.com has no {what} at {url}"))?;
+    Ok(resp.bytes().await?.to_vec())
+}
+
 /// Resolve the .deb set for one version. Tries the version page first
-/// (older flat layout), then the amd64/ subdirectory (newer layout).
-pub async fn fetch_deb_list(ver: &KernelVersion) -> Result<Vec<KernelDeb>> {
+/// (older flat layout), then the amd64/ subdirectory (newer layout). Then
+/// fetches the CHECKSUMS and CHECKSUMS.gpg from the packages' directory,
+/// checks the signature against Ubuntu's kernel PPA key and takes every
+/// package's SHA256 from it.
+pub async fn fetch_deb_list(ver: &KernelVersion) -> Result<DebSet> {
     let client = client()?;
 
     let top_html = client
@@ -165,6 +235,8 @@ pub async fn fetch_deb_list(ver: &KernelVersion) -> Result<Vec<KernelDeb>> {
         .send()
         .await
         .context("Failed to fetch kernel version page")?
+        .error_for_status()
+        .with_context(|| format!("kernel.ubuntu.com did not return the page for v{}", ver.version))?
         .text()
         .await?;
 
@@ -172,46 +244,46 @@ pub async fn fetch_deb_list(ver: &KernelVersion) -> Result<Vec<KernelDeb>> {
 
     if !found.iter().any(|(f, _)| wanted_deb(f)) {
         let amd64_url = format!("{}amd64/", ver.url);
-        if let Ok(resp) = client.get(&amd64_url).send().await {
-            if resp.status().is_success() {
-                let html = resp.text().await?;
-                found.extend(debs_from_page(&amd64_url, &html));
-            }
+        let resp = client
+            .get(&amd64_url)
+            .send()
+            .await
+            .context("Failed to fetch the amd64 package page")?;
+        // A 404 just means there is no amd64 build (reported below).
+        if resp.status() != reqwest::StatusCode::NOT_FOUND {
+            let html = resp
+                .error_for_status()
+                .context("kernel.ubuntu.com did not return the amd64 package page")?
+                .text()
+                .await?;
+            found.extend(debs_from_page(&amd64_url, &html));
         }
     }
 
-    // Checksums are optional — a missing CHECKSUMS file is not fatal.
-    let mut sums = HashMap::new();
-    let checksums_url = format!("{}CHECKSUMS", ver.url);
-    if let Ok(resp) = client.get(&checksums_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(text) = resp.text().await {
-                sums = parse_checksums(&text);
-            }
-        }
-    }
-
-    let mut debs: Vec<KernelDeb> = vec![];
-    for (filename, url) in found {
-        if !wanted_deb(&filename) {
-            continue;
-        }
-        if debs.iter().any(|d: &KernelDeb| d.filename == filename) {
-            continue;
-        }
-        let sha256 = sums.get(&filename).cloned();
-        debs.push(KernelDeb { filename, url, sha256 });
-    }
-
-    if debs.is_empty() {
+    found.retain(|(f, _)| wanted_deb(f));
+    if found.is_empty() {
         bail!(
             "No generic amd64 packages found for v{} — the build may have \
              failed for this architecture (check {} in a browser)",
             ver.version, ver.url
         );
     }
-    debs.sort_by(|a, b| a.filename.cmp(&b.filename));
-    Ok(debs)
+
+    let dir = common_dir(found.iter().map(|(_, url)| url.as_str()))?;
+
+    let checksums = fetch_bytes(&client, &format!("{dir}CHECKSUMS"), "CHECKSUMS file").await
+        .with_context(|| format!("v{} cannot be verified, so Kernel Pop will not install it", ver.version))?;
+    let checksums_sig = fetch_bytes(&client, &format!("{dir}CHECKSUMS.gpg"), "CHECKSUMS signature").await
+        .with_context(|| format!("v{} cannot be verified, so Kernel Pop will not install it", ver.version))?;
+
+    let (c, s) = (checksums.clone(), checksums_sig.clone());
+    tokio::task::spawn_blocking(move || crate::verify::verify_checksums_signature(&c, &s))
+        .await
+        .context("Signature check task failed")??;
+
+    let sums = parse_checksums(&String::from_utf8_lossy(&checksums));
+    let debs = select_debs(found, &sums)?;
+    Ok(DebSet { debs, checksums, checksums_sig })
 }
 
 #[cfg(test)]
@@ -300,6 +372,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checksums_parse_the_real_mainline_file() {
+        let text = include_str!("testdata/v6.17-amd64-CHECKSUMS");
+        let m = parse_checksums(text);
+        // Four packages; the sha1 section is ignored.
+        assert_eq!(m.len(), 4);
+        assert_eq!(
+            m["linux-image-unsigned-6.17.0-061700-generic_6.17.0-061700.202509282239_amd64.deb"],
+            "9484aeadaa7438a080dbd2d24d219d361b62ed18f44907e7bd4e81651f296bc7"
+        );
+    }
+
+    #[test]
+    fn checksums_come_from_the_packages_own_directory() {
+        let v = "https://kernel.ubuntu.com/mainline/v6.17/";
+        let set = [format!("{v}amd64/linux-a-generic_1_amd64.deb"), format!("{v}amd64/linux-headers-1_1_all.deb")];
+        assert_eq!(common_dir(set.iter().map(String::as_str)).unwrap(), format!("{v}amd64/"));
+        let flat = format!("{v}linux-a-generic_1_amd64.deb");
+        assert_eq!(common_dir([flat.as_str()]).unwrap(), v);
+        let mixed = [format!("{v}amd64/linux-a-generic_1_amd64.deb"), format!("{v}linux-b-generic_1_amd64.deb")];
+        assert!(common_dir(mixed.iter().map(String::as_str)).is_err());
+        assert!(common_dir([]).is_err());
+    }
+
+    #[test]
+    fn a_package_without_a_published_hash_is_an_error() {
+        let sums: HashMap<String, String> =
+            [("linux-modules-1-generic_1_amd64.deb".to_string(), "a".repeat(64))].into();
+        let ok = vec![
+            ("linux-modules-1-generic_1_amd64.deb".to_string(), "u1".to_string()),
+            ("linux-modules-1-generic_1_amd64.deb".to_string(), "u1-dup".to_string()),
+            ("linux-buildinfo-1-generic_1_amd64.deb".to_string(), "ignored".to_string()),
+        ];
+        let debs = select_debs(ok, &sums).unwrap();
+        assert_eq!(debs.len(), 1);
+        assert_eq!(debs[0].sha256, "a".repeat(64));
+        assert_eq!(debs[0].url, "u1");
+        let missing = vec![("linux-image-unsigned-1-generic_1_amd64.deb".to_string(), "u2".to_string())];
+        let err = select_debs(missing, &sums).unwrap_err().to_string();
+        assert!(err.contains("not listed in the signed CHECKSUMS"), "{err}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_stable_set_is_signed_and_fully_hashed() {
+        let v = KernelVersion {
+            version: "6.17".into(),
+            url: format!("{MAINLINE_BASE}v6.17/"),
+            is_rc: false,
+        };
+        let set = fetch_deb_list(&v).await.expect("v6.17 should resolve and verify");
+        assert_eq!(set.debs.len(), 4);
+        assert!(set.debs.iter().all(|d| d.url.contains("/v6.17/amd64/") && d.sha256.len() == 64));
+        assert_eq!(set.checksums, include_bytes!("testdata/v6.17-amd64-CHECKSUMS"));
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_fetch_includes_rc_entries_with_working_deb_layout() {
@@ -312,10 +440,10 @@ mod tests {
         assert!(!rcs.is_empty(), "expected at least one -rcN directory live");
         for rc in rcs.iter().take(1) {
             println!("checking RC {} deb layout at {}", rc.version, rc.url);
-            let debs = fetch_deb_list(rc).await.expect("RC deb layout differs from stable");
-            assert!(!debs.is_empty());
-            for d in &debs {
-                println!("  {} (sha256: {})", d.filename, d.sha256.is_some());
+            let set = fetch_deb_list(rc).await.expect("RC deb layout differs from stable");
+            assert_eq!(set.debs.len(), 4, "expected the four generic amd64 packages");
+            for d in &set.debs {
+                println!("  {} (sha256: {})", d.filename, d.sha256);
             }
         }
     }

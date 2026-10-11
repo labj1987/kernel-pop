@@ -2,6 +2,7 @@ mod download;
 mod install;
 mod system;
 mod ui;
+mod verify;
 mod versions;
 
 use gtk4::prelude::*;

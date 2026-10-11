@@ -1,12 +1,12 @@
-use crate::download::{download_deb_set, Progress};
+use crate::download::{download_deb_set, is_cancelled, Progress};
 use crate::install::{
-    dkms_warnings, run_privileged_boot_once, run_privileged_install, run_privileged_remove,
+    helper_problem, run_privileged_boot_once, run_privileged_install, run_privileged_remove,
     run_privileged_remove_many, run_privileged_setup_signing, run_privileged_sign,
-    sign_warnings, validate_mok_password,
+    validate_mok_password, BootOutlook, ScriptReport,
 };
 use crate::system::{
     compare_to_running, format_bytes, install_warnings, prune_candidates, query_system,
-    KernelSigning, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
+    KernelSignature, KernelSigning, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
 use crate::versions::{fetch_deb_list, fetch_versions, KernelVersion};
 
@@ -33,6 +33,10 @@ use std::sync::Arc;
 /// Late-bound handle to load_sysinfo, for callbacks created inside it.
 type ReloadSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
+/// Starts a download or privileged action under the global busy state, or
+/// returns false (with a toast) when another one is still running.
+type BeginBusy = Rc<dyn Fn(&'static str) -> bool>;
+
 #[derive(Default)]
 struct AppState {
     versions: Vec<KernelVersion>,
@@ -40,9 +44,14 @@ struct AppState {
     /// Directory of verified downloaded debs, ready to install.
     staged_dir: Option<PathBuf>,
     staged_version: Option<String>,
-    staged_files: Vec<(String, bool)>, // (filename, checksum_verified)
+    /// Package file names; every one verified against the signed CHECKSUMS.
+    staged_files: Vec<String>,
     sysinfo: SystemInfo,
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// What is running right now, if anything: one download or privileged
+    /// action at a time. While set, every control that would start another
+    /// one is insensitive (see refresh_controls).
+    busy: Option<&'static str>,
     /// RC-visibility toggle on the Browse tab. Off by default.
     show_rc: bool,
 }
@@ -108,29 +117,62 @@ fn signing_subtitle(signing: KernelSigning) -> &'static str {
     }
 }
 
-/// Log a summary line and pick a toast for a run that may have printed
-/// DKMS or SIGN warnings. Returns None when there were no warnings.
-fn warnings_toast(log_fn: &impl Fn(String), out: &str) -> Option<&'static str> {
-    let dkms = dkms_warnings(out).len();
-    let sign = sign_warnings(out).len();
-    if dkms > 0 {
+/// What a privileged run that can report DKMS/signing/boot problems did.
+#[derive(Clone, Copy)]
+enum Done {
+    Install,
+    Sign,
+    SetupSigning,
+}
+
+/// The toast for a finished run, from what the script reported. A kernel
+/// that will not boot is said first and plainly; other problems are listed.
+fn outcome_message(done: Done, r: &ScriptReport) -> String {
+    let (ok, subject) = match done {
+        Done::Install => ("Kernel installed — reboot to activate", "Kernel installed"),
+        Done::Sign => ("Kernel signed", "Kernel signed"),
+        Done::SetupSigning => ("Signing set up — confirm the key at the next reboot", "Signing set up"),
+    };
+    if r.boot == BootOutlook::Blocked {
+        return format!("{subject}, but it will not boot while Secure Boot is on — see Log tab");
+    }
+    let mut problems = vec![];
+    if r.dkms_problems > 0 {
+        problems.push("DKMS modules failed");
+    }
+    if r.sign_problems > 0 {
+        problems.push("signing had problems");
+    }
+    if !problems.is_empty() {
+        return format!("{subject}, but {} — see Log tab before rebooting", problems.join(" and "));
+    }
+    if r.boot == BootOutlook::AfterEnrollment {
+        return format!("{subject} — confirm the key enrollment at the next reboot, or it will not boot");
+    }
+    ok.to_string()
+}
+
+/// Log the script's output, a summary of the problems it reported, and
+/// return the toast to show.
+fn report_run(log_fn: &impl Fn(String), out: &str, done: Done) -> String {
+    log_output(log_fn, out);
+    let r = ScriptReport::parse(out);
+    if r.dkms_problems > 0 {
         log_fn(format!(
             "WARNING: {} DKMS problem(s) — out-of-tree modules such as the NVIDIA driver may be missing after reboot. See the DKMS lines above.",
-            dkms
+            r.dkms_problems
         ));
     }
-    if sign > 0 {
+    if r.sign_problems > 0 {
         log_fn(format!(
             "WARNING: {} signing problem(s) — a kernel or its boot loader copy may be unsigned. See the SIGN lines above.",
-            sign
+            r.sign_problems
         ));
     }
-    match (dkms > 0, sign > 0) {
-        (false, false) => None,
-        (true, false) => Some("Kernel installed, but DKMS modules failed — see Log tab before rebooting"),
-        (false, true) => Some("Kernel installed, but signing had problems — see Log tab before rebooting"),
-        (true, true) => Some("Kernel installed, but DKMS and signing had problems — see Log tab before rebooting"),
+    if r.boot == BootOutlook::Blocked {
+        log_fn("WARNING: the new kernel will not boot while Secure Boot is on — see the BOOT BLOCKED line above.".to_string());
     }
+    outcome_message(done, &r)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,7 +360,7 @@ pub fn build_ui(app: &Application) {
 
     let files_group = PreferencesGroup::builder()
         .title("Packages")
-        .description("Verified against the published CHECKSUMS where available")
+        .description("Each one verified against the CHECKSUMS signed by Ubuntu's kernel team")
         .build();
     let files_list = ListBox::new();
     files_list.set_selection_mode(SelectionMode::None);
@@ -328,8 +370,8 @@ pub fn build_ui(app: &Application) {
 
     let steps_group = PreferencesGroup::builder().title("Install Will").build();
     let step_row = ActionRow::builder()
-        .title("dpkg install, then generate and VERIFY the initramfs, then update the boot loader")
-        .subtitle("The install fails loudly if initrd.img or the boot menu entry does not appear — no silent unbootable kernels")
+        .title("Verify the packages again, dpkg install, then generate and VERIFY the initramfs, then update the boot loader")
+        .subtitle("The install fails loudly if a package does not match its signed checksum, or if initrd.img or the boot menu entry does not appear — no silent unbootable kernels")
         .build();
     steps_group.add(&step_row);
     install_page.append(&steps_group);
@@ -394,6 +436,19 @@ pub fn build_ui(app: &Application) {
     health_banner.set_revealed(false);
     content.append(&health_banner);
 
+    // The privileged helper must be the one this build ships: AppRun
+    // installs it at startup, and a cancelled or failed install leaves the
+    // old one (or none) in place. install.rs refuses to run a mismatched one.
+    let helper_banner = Banner::new("");
+    match helper_problem() {
+        Some(problem) => {
+            helper_banner.set_title(&problem);
+            helper_banner.set_revealed(true);
+        }
+        None => helper_banner.set_revealed(false),
+    }
+    content.append(&helper_banner);
+
     content.append(&stack);
     toast_overlay.set_child(Some(&content));
     window.set_content(Some(&toast_overlay));
@@ -413,11 +468,61 @@ pub fn build_ui(app: &Application) {
         }
     };
 
+    // Sensitivity of every control that starts a download or a privileged
+    // action, from the state: nothing can start while something is busy.
+    // The per-kernel Sign / Boot Next Time / Remove buttons live in
+    // kernels_list, so making the list insensitive covers them, including
+    // rows rebuilt while busy.
+    let refresh_controls: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let download_btn = download_btn.clone();
+        let install_btn = install_btn.clone();
+        let prune_btn = prune_btn.clone();
+        let setup_signing_btn = setup_signing_btn.clone();
+        let kernels_list = kernels_list.clone();
+        let cancel_dl_btn = cancel_dl_btn.clone();
+        Rc::new(move || {
+            let s = state.borrow();
+            let idle = s.busy.is_none();
+            download_btn.set_sensitive(idle && s.selected_version.is_some());
+            install_btn.set_sensitive(idle && s.staged_dir.is_some());
+            prune_btn.set_sensitive(idle);
+            setup_signing_btn.set_sensitive(idle);
+            kernels_list.set_sensitive(idle);
+            cancel_dl_btn.set_visible(s.download_cancel.is_some());
+        })
+    };
+
+    let begin_busy: BeginBusy = {
+        let state = state.clone();
+        let refresh_controls = refresh_controls.clone();
+        let toast_overlay = toast_overlay.clone();
+        Rc::new(move |what: &'static str| {
+            let running = state.borrow().busy;
+            if let Some(running) = running {
+                toast_overlay.add_toast(Toast::new(&format!("Wait until the {running} has finished")));
+                return false;
+            }
+            state.borrow_mut().busy = Some(what);
+            refresh_controls();
+            true
+        })
+    };
+
+    let end_busy: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let refresh_controls = refresh_controls.clone();
+        Rc::new(move || {
+            state.borrow_mut().busy = None;
+            refresh_controls();
+        })
+    };
+
     let update_install_tab = {
         let staged_row = staged_row.clone();
         let status_row = status_row.clone();
         let files_list = files_list.clone();
-        let install_btn = install_btn.clone();
+        let refresh_controls = refresh_controls.clone();
         let state = state.clone();
         move || {
             let s = state.borrow();
@@ -438,22 +543,22 @@ pub fn build_ui(app: &Application) {
                         VersionRelation::Unknown => status_row.set_subtitle("—"),
                     }
 
-                    for (fname, verified) in &s.staged_files {
+                    for fname in &s.staged_files {
                         let row = ActionRow::builder().title(fname).build();
-                        let badge = Label::new(Some(if *verified { "SHA256 ✓" } else { "no checksum" }));
-                        badge.add_css_class(if *verified { "success" } else { "dim-label" });
+                        let badge = Label::new(Some("SHA256 ✓"));
+                        badge.add_css_class("success");
                         row.add_suffix(&badge);
                         files_list.append(&row);
                     }
-                    install_btn.set_sensitive(true);
                 }
                 _ => {
                     staged_row.set_title("Nothing staged");
                     staged_row.set_subtitle("Go to Browse to download a kernel");
                     status_row.set_subtitle("—");
-                    install_btn.set_sensitive(false);
                 }
             }
+            drop(s);
+            refresh_controls();
         }
     };
 
@@ -473,6 +578,8 @@ pub fn build_ui(app: &Application) {
         let log_fn = log_fn.clone();
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
+        let begin_busy = begin_busy.clone();
+        let end_busy = end_busy.clone();
 
         // Forward declaration hack: the remove action needs load_sysinfo,
         // which is what we're building. A Rc<RefCell<Option<…>>> slot breaks
@@ -499,6 +606,8 @@ pub fn build_ui(app: &Application) {
             let window = window.clone();
             let toast_overlay = toast_overlay.clone();
             let self_slot = self_slot.clone();
+            let begin_busy = begin_busy.clone();
+            let end_busy = end_busy.clone();
 
             spawn_async(
                 async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() },
@@ -550,15 +659,20 @@ pub fn build_ui(app: &Application) {
                             .subtitle(subtitle_parts.join(" · "))
                             .build();
 
-                        // Signed/Unsigned badge, only once signing is set up.
-                        if let Some(signed) = k.signed {
-                            let badge = Label::new(Some(if signed { "Signed" } else { "Unsigned" }));
+                        // Signature badge, only once signing is set up.
+                        if let Some(sig) = k.signed {
+                            let (text, css) = match sig {
+                                KernelSignature::KernelPop => ("Signed", "success"),
+                                KernelSignature::Distro => ("Signed by Ubuntu", "success"),
+                                KernelSignature::Unsigned => ("Unsigned", "warning"),
+                            };
+                            let badge = Label::new(Some(text));
                             badge.add_css_class("caption");
-                            badge.add_css_class(if signed { "success" } else { "warning" });
+                            badge.add_css_class(css);
                             badge.set_valign(Align::Center);
                             row.add_suffix(&badge);
                         }
-                        if k.signed == Some(false) {
+                        if k.signed == Some(KernelSignature::Unsigned) {
                             let sign_btn = Button::builder()
                                 .label("Sign")
                                 .tooltip_text("Sign this kernel with the Kernel Pop key")
@@ -569,26 +683,26 @@ pub fn build_ui(app: &Application) {
                             let toast_overlay = toast_overlay.clone();
                             let log_fn = log_fn.clone();
                             let self_slot = self_slot.clone();
+                            let begin_busy = begin_busy.clone();
+                            let end_busy = end_busy.clone();
                             sign_btn.connect_clicked(move |_| {
+                                if !begin_busy("signing") { return; }
                                 log_fn(format!("Signing kernel {}…", ver));
                                 let ver2 = ver.clone();
                                 let toast_overlay = toast_overlay.clone();
                                 let log_fn = log_fn.clone();
                                 let self_slot = self_slot.clone();
+                                let end_busy = end_busy.clone();
                                 spawn_async(
                                     async move {
                                         tokio::task::spawn_blocking(move || run_privileged_sign(&ver2)).await
                                     },
                                     move |result| {
+                                        end_busy();
                                         match result {
                                             Ok(Ok(out)) => {
-                                                log_output(&log_fn, &out);
-                                                let n = sign_warnings(&out).len();
-                                                toast_overlay.add_toast(Toast::new(if n == 0 {
-                                                    "Kernel signed"
-                                                } else {
-                                                    "Kernel signed, with warnings — see Log tab"
-                                                }));
+                                                let msg = report_run(&log_fn, &out, Done::Sign);
+                                                toast_overlay.add_toast(Toast::new(&msg));
                                             }
                                             Ok(Err(e)) => {
                                                 log_fn(format!("Signing failed: {}", e));
@@ -628,26 +742,33 @@ pub fn build_ui(app: &Application) {
                                 let ver = k.version.clone();
                                 let toast_overlay = toast_overlay.clone();
                                 let log_fn = log_fn.clone();
+                                let begin_busy = begin_busy.clone();
+                                let end_busy = end_busy.clone();
                                 boot_btn.connect_clicked(move |_| {
+                                    if !begin_busy("boot selection") { return; }
                                     log_fn(format!("Selecting {} for the next boot only…", ver));
                                     let ver2 = ver.clone();
                                     let toast_overlay = toast_overlay.clone();
                                     let log_fn = log_fn.clone();
+                                    let end_busy = end_busy.clone();
                                     spawn_async(
                                         async move {
                                             tokio::task::spawn_blocking(move || run_privileged_boot_once(&ver2)).await
                                         },
-                                        move |result| match result {
-                                            Ok(Ok(out)) => {
-                                                log_output(&log_fn, &out);
-                                                toast_overlay.add_toast(Toast::new(
-                                                    "The next restart will boot that kernel once"));
+                                        move |result| {
+                                            end_busy();
+                                            match result {
+                                                Ok(Ok(out)) => {
+                                                    log_output(&log_fn, &out);
+                                                    toast_overlay.add_toast(Toast::new(
+                                                        "The next restart will boot that kernel once"));
+                                                }
+                                                Ok(Err(e)) => {
+                                                    log_fn(format!("Boot-once failed: {}", e));
+                                                    toast_overlay.add_toast(Toast::new("Could not set next boot — see Log tab"));
+                                                }
+                                                Err(e) => log_fn(format!("Task error: {}", e)),
                                             }
-                                            Ok(Err(e)) => {
-                                                log_fn(format!("Boot-once failed: {}", e));
-                                                toast_overlay.add_toast(Toast::new("Could not set next boot — see Log tab"));
-                                            }
-                                            Err(e) => log_fn(format!("Task error: {}", e)),
                                         },
                                     );
                                 });
@@ -658,6 +779,8 @@ pub fn build_ui(app: &Application) {
                             let toast_overlay = toast_overlay.clone();
                             let log_fn = log_fn.clone();
                             let self_slot = self_slot.clone();
+                            let begin_busy = begin_busy.clone();
+                            let end_busy = end_busy.clone();
 
                             remove_btn.connect_clicked(move |_| {
                                 let dialog = AlertDialog::builder()
@@ -672,18 +795,23 @@ pub fn build_ui(app: &Application) {
                                 let toast_overlay = toast_overlay.clone();
                                 let log_fn = log_fn.clone();
                                 let self_slot = self_slot.clone();
+                                let begin_busy = begin_busy.clone();
+                                let end_busy = end_busy.clone();
                                 dialog.connect_response(None, move |_, resp| {
                                     if resp != "remove" { return; }
+                                    if !begin_busy("kernel removal") { return; }
                                     let ver3 = ver2.clone();
                                     log_fn(format!("Removing kernel {}…", ver3));
                                     let toast_overlay = toast_overlay.clone();
                                     let log_fn = log_fn.clone();
                                     let self_slot = self_slot.clone();
+                                    let end_busy = end_busy.clone();
                                     spawn_async(
                                         async move {
                                             tokio::task::spawn_blocking(move || run_privileged_remove(&ver3)).await
                                         },
                                         move |result| {
+                                            end_busy();
                                             match result {
                                                 Ok(Ok(out)) => {
                                                     log_output(&log_fn, &out);
@@ -784,6 +912,8 @@ pub fn build_ui(app: &Application) {
         let log_fn = log_fn.clone();
         let toast_overlay = toast_overlay.clone();
         let load_sysinfo = load_sysinfo.clone();
+        let begin_busy = begin_busy.clone();
+        let end_busy = end_busy.clone();
         prune_btn.connect_clicked(move |_| {
             let keep_spin = SpinButton::with_range(1.0, 10.0, 1.0);
             keep_spin.set_value(2.0);
@@ -803,6 +933,8 @@ pub fn build_ui(app: &Application) {
             let log_fn = log_fn.clone();
             let toast_overlay = toast_overlay.clone();
             let load_sysinfo = load_sysinfo.clone();
+            let begin_busy = begin_busy.clone();
+            let end_busy = end_busy.clone();
             ask.connect_response(None, move |_, resp| {
                 if resp != "review" { return; }
                 let keep = keep_spin.value() as usize;
@@ -827,18 +959,23 @@ pub fn build_ui(app: &Application) {
                 let log_fn = log_fn.clone();
                 let toast_overlay = toast_overlay.clone();
                 let load_sysinfo = load_sysinfo.clone();
+                let begin_busy = begin_busy.clone();
+                let end_busy = end_busy.clone();
                 confirm.connect_response(None, move |_, resp| {
                     if resp != "remove" { return; }
+                    if !begin_busy("kernel removal") { return; }
                     log_fn(format!("Removing old kernels: {}", candidates.join(", ")));
                     let list = candidates.clone();
                     let log_fn = log_fn.clone();
                     let toast_overlay = toast_overlay.clone();
                     let load_sysinfo = load_sysinfo.clone();
+                    let end_busy = end_busy.clone();
                     spawn_async(
                         async move {
                             tokio::task::spawn_blocking(move || run_privileged_remove_many(&list)).await
                         },
                         move |result| {
+                            end_busy();
                             match result {
                                 Ok(Ok(out)) => {
                                     log_output(&log_fn, &out);
@@ -869,7 +1006,9 @@ pub fn build_ui(app: &Application) {
         let log_fn = log_fn.clone();
         let toast_overlay = toast_overlay.clone();
         let load_sysinfo = load_sysinfo.clone();
-        setup_signing_btn.connect_clicked(move |btn| {
+        let begin_busy = begin_busy.clone();
+        let end_busy = end_busy.clone();
+        setup_signing_btn.connect_clicked(move |_| {
             let pw1 = PasswordEntry::builder()
                 .placeholder_text("One-time password")
                 .show_peek_icon(true)
@@ -918,41 +1057,33 @@ pub fn build_ui(app: &Application) {
             { let r = revalidate.clone(); pw1.connect_changed(move |_| r()); }
             { let r = revalidate.clone(); pw2.connect_changed(move |_| r()); }
 
-            let btn = btn.clone();
             let log_fn = log_fn.clone();
             let toast_overlay = toast_overlay.clone();
             let load_sysinfo = load_sysinfo.clone();
+            let begin_busy = begin_busy.clone();
+            let end_busy = end_busy.clone();
             dialog.connect_response(None, move |_, resp| {
                 if resp != "setup" { return; }
                 let password = pw1.text().to_string();
                 if validate_mok_password(&password, &pw2.text()).is_err() { return; }
                 pw1.set_text("");
                 pw2.set_text("");
-                btn.set_sensitive(false);
+                if !begin_busy("signing setup") { return; }
                 log_fn("Setting up kernel signing…".to_string());
-                let btn = btn.clone();
                 let log_fn = log_fn.clone();
                 let toast_overlay = toast_overlay.clone();
                 let load_sysinfo = load_sysinfo.clone();
+                let end_busy = end_busy.clone();
                 spawn_async(
                     async move {
                         tokio::task::spawn_blocking(move || run_privileged_setup_signing(&password)).await
                     },
                     move |result| {
-                        btn.set_sensitive(true);
+                        end_busy();
                         match result {
                             Ok(Ok(out)) => {
-                                log_output(&log_fn, &out);
-                                let n = sign_warnings(&out).len();
-                                if n > 0 {
-                                    log_fn(format!(
-                                        "WARNING: {} signing problem(s) — see the SIGN lines above.", n));
-                                }
-                                toast_overlay.add_toast(Toast::new(if n == 0 {
-                                    "Signing set up — confirm the key at the next reboot"
-                                } else {
-                                    "Signing set up, with warnings — see Log tab"
-                                }));
+                                let msg = report_run(&log_fn, &out, Done::SetupSigning);
+                                toast_overlay.add_toast(Toast::new(&msg));
                             }
                             Ok(Err(e)) => {
                                 log_fn(format!("Signing setup failed: {}", e));
@@ -1022,18 +1153,21 @@ pub fn build_ui(app: &Application) {
         let list_box = list_box.clone();
         let list_spinner = list_spinner.clone();
         let selected_label = selected_label.clone();
-        let download_btn = download_btn.clone();
         let banner = banner.clone();
         let state = state.clone();
         let log_fn = log_fn.clone();
         let search_entry = search_entry.clone();
+        let refresh_controls = refresh_controls.clone();
 
         move || {
             list_spinner.start();
             list_spinner.set_visible(true);
             banner.set_revealed(false);
+            // Removing the rows deselects, which clears the selection and
+            // the Download button through row-selected.
             while let Some(c) = list_box.first_child() { list_box.remove(&c); }
-            download_btn.set_sensitive(false);
+            state.borrow_mut().selected_version = None;
+            refresh_controls();
             selected_label.set_label("Loading…");
             log_fn("Fetching version list from kernel.ubuntu.com…".to_string());
 
@@ -1087,7 +1221,7 @@ pub fn build_ui(app: &Application) {
     // ─────────────────────────────────────────────────────────────────────────
     {
         let state = state.clone();
-        let download_btn = download_btn.clone();
+        let refresh_controls = refresh_controls.clone();
         let selected_label = selected_label.clone();
         list_box.connect_row_selected(move |_, row| {
             let selected = row
@@ -1096,18 +1230,12 @@ pub fn build_ui(app: &Application) {
                     state.borrow().versions.iter().find(|v| v.version == title).cloned()
                 });
 
-            match selected {
-                Some(ver) => {
-                    selected_label.set_label(&format!("Selected: {}", ver.version));
-                    state.borrow_mut().selected_version = Some(ver);
-                    download_btn.set_sensitive(true);
-                }
-                None => {
-                    download_btn.set_sensitive(false);
-                    selected_label.set_label("No version selected");
-                    state.borrow_mut().selected_version = None;
-                }
+            match &selected {
+                Some(ver) => selected_label.set_label(&format!("Selected: {}", ver.version)),
+                None => selected_label.set_label("No version selected"),
             }
+            state.borrow_mut().selected_version = selected;
+            refresh_controls();
         });
     }
 
@@ -1150,11 +1278,14 @@ pub fn build_ui(app: &Application) {
         let update_install_tab = update_install_tab.clone();
         let stack = stack.clone();
         let toast_overlay = toast_overlay.clone();
-        let cancel_dl_btn = cancel_dl_btn.clone();
+        let begin_busy = begin_busy.clone();
+        let end_busy = end_busy.clone();
+        let refresh_controls = refresh_controls.clone();
 
-        download_btn.connect_clicked(move |btn| {
+        download_btn.connect_clicked(move |_| {
             let ver = { state.borrow().selected_version.clone() };
             let Some(ver) = ver else { return };
+            if !begin_busy("download") { return; }
 
             if let Some(f) = state.borrow().sysinfo.free_root_bytes {
                 if f < MIN_ROOT_BYTES {
@@ -1162,8 +1293,6 @@ pub fn build_ui(app: &Application) {
                 }
             }
 
-            btn.set_sensitive(false);
-            cancel_dl_btn.set_visible(true);
             progress.set_visible(true);
             progress.set_fraction(0.0);
             progress.set_text(Some(&format!("Resolving packages for {}…", ver.version)));
@@ -1171,13 +1300,24 @@ pub fn build_ui(app: &Application) {
             log_fn(format!("Resolving package list for Linux {}…", ver.version));
 
             let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            state.borrow_mut().download_cancel = Some(cancel_flag.clone());
 
             let dest_dir = PathBuf::from(format!(
                 "{}/Downloads/mainline-kernel-v{}",
                 std::env::var("HOME").unwrap_or("/tmp".into()),
                 ver.version
             ));
+            {
+                let mut s = state.borrow_mut();
+                s.download_cancel = Some(cancel_flag.clone());
+                // The download rewrites this directory, so what was staged
+                // from it is no longer a verified set.
+                if s.staged_dir.as_ref() == Some(&dest_dir) {
+                    s.staged_dir = None;
+                    s.staged_version = None;
+                    s.staged_files.clear();
+                }
+            }
+            update_install_tab();
 
             // Progress channel — sent from the Tokio side, drained on the GTK
             // main context; the loop exits when the sender drops.
@@ -1223,39 +1363,34 @@ pub fn build_ui(app: &Application) {
             let progress = progress.clone();
             let log_fn = log_fn.clone();
             let update_install_tab = update_install_tab.clone();
-            let btn = btn.clone();
             let toast_overlay = toast_overlay.clone();
-            let cancel_dl_btn = cancel_dl_btn.clone();
+            let end_busy = end_busy.clone();
+            let refresh_controls = refresh_controls.clone();
             let cancel_flag2 = cancel_flag.clone();
             let ver2 = ver.clone();
             let dest_dir2 = dest_dir.clone();
 
             spawn_async(
                 async move {
-                    let debs = fetch_deb_list(&ver2).await?;
-                    let file_info: Vec<(String, bool)> = debs
-                        .iter()
-                        .map(|d| (d.filename.clone(), d.sha256.is_some()))
-                        .collect();
+                    let set = fetch_deb_list(&ver2).await?;
+                    let file_info: Vec<String> = set.debs.iter().map(|d| d.filename.clone()).collect();
                     let tx = prog_tx;
                     download_deb_set(
-                        debs,
+                        set,
                         dest_dir2,
                         move |p| { let _ = tx.send(p); },
                         cancel_flag2,
                     )
                     .await?;
-                    Ok::<Vec<(String, bool)>, anyhow::Error>(file_info)
+                    Ok::<Vec<String>, anyhow::Error>(file_info)
                 },
                 move |result| {
-                    btn.set_sensitive(true);
-                    cancel_dl_btn.set_visible(false);
                     state.borrow_mut().download_cancel = None;
+                    end_busy();
 
                     match result {
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("cancelled") {
+                            if is_cancelled(&e) {
                                 log_fn("Download cancelled.".to_string());
                                 progress.set_text(Some("Cancelled"));
                             } else {
@@ -1265,10 +1400,9 @@ pub fn build_ui(app: &Application) {
                             }
                         }
                         Ok(file_info) => {
-                            let verified = file_info.iter().filter(|(_, v)| *v).count();
                             log_fn(format!(
-                                "Downloaded {} packages ({} SHA256-verified) to {}",
-                                file_info.len(), verified, dest_dir.display()
+                                "Downloaded {} packages to {}, each verified against the CHECKSUMS signed by Ubuntu's kernel team",
+                                file_info.len(), dest_dir.display()
                             ));
                             progress.set_fraction(1.0);
                             progress.set_text(Some("Ready to install"));
@@ -1282,6 +1416,7 @@ pub fn build_ui(app: &Application) {
                             toast_overlay.add_toast(Toast::new("Download complete"));
                         }
                     }
+                    refresh_controls();
                 },
             );
         });
@@ -1309,13 +1444,15 @@ pub fn build_ui(app: &Application) {
         let load_sysinfo = load_sysinfo.clone();
         let window = window.clone();
         let preflight_state = state.clone();
+        let begin_busy = begin_busy.clone();
+        let end_busy = end_busy.clone();
 
-        let start_install: Rc<dyn Fn(&Button)> = Rc::new(move |btn: &Button| {
+        let start_install: Rc<dyn Fn()> = Rc::new(move || {
             let dir = { state.borrow().staged_dir.clone() };
             let Some(dir) = dir else { return };
+            if !begin_busy("kernel install") { return; }
             let dir_str = dir.display().to_string();
 
-            btn.set_sensitive(false);
             progress.set_visible(true);
             progress.set_text(Some("Installing… initramfs is generated and verified before success"));
             stack.set_visible_child_name("log");
@@ -1323,9 +1460,9 @@ pub fn build_ui(app: &Application) {
 
             {
                 let progress = progress.clone();
-                let btn = btn.clone();
+                let state = state.clone();
                 glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
-                    if btn.is_sensitive() {
+                    if state.borrow().busy.is_none() {
                         glib::ControlFlow::Break
                     } else {
                         progress.pulse();
@@ -1337,30 +1474,25 @@ pub fn build_ui(app: &Application) {
             let log_fn = log_fn.clone();
             let toast_overlay = toast_overlay.clone();
             let progress = progress.clone();
-            let btn = btn.clone();
             let load_sysinfo = load_sysinfo.clone();
+            let end_busy = end_busy.clone();
 
             spawn_async(
                 async move {
                     tokio::task::spawn_blocking(move || run_privileged_install(&dir_str)).await
                 },
                 move |result| {
-                    btn.set_sensitive(true);
+                    end_busy();
                     progress.set_visible(false);
                     match result {
                         Ok(Ok(out)) => {
-                            log_output(&log_fn, &out);
-                            log_fn("Install completed — initramfs verified in /boot.".to_string());
                             // DKMS and signing failures never fail the
-                            // install, but they must not go unnoticed before
-                            // a reboot.
-                            match warnings_toast(&log_fn, &out) {
-                                None => {
-                                    log_fn("Reboot to switch to the new kernel.".to_string());
-                                    toast_overlay.add_toast(Toast::new("Kernel installed — reboot to activate"));
-                                }
-                                Some(msg) => toast_overlay.add_toast(Toast::new(msg)),
-                            }
+                            // install, and neither does a kernel that will
+                            // not boot under Secure Boot, but none of them
+                            // may go unnoticed before a reboot.
+                            let msg = report_run(&log_fn, &out, Done::Install);
+                            log_fn("Install completed — initramfs verified in /boot.".to_string());
+                            toast_overlay.add_toast(Toast::new(&msg));
                             load_sysinfo();
                         }
                         Ok(Err(e)) => {
@@ -1375,10 +1507,10 @@ pub fn build_ui(app: &Application) {
 
         // Preflight: Secure Boot and /boot space need an explicit "install
         // anyway" before the install starts.
-        install_btn.connect_clicked(move |btn| {
+        install_btn.connect_clicked(move |_| {
             let warnings = install_warnings(&preflight_state.borrow().sysinfo);
             if warnings.is_empty() {
-                start_install(btn);
+                start_install();
                 return;
             }
             let dialog = AlertDialog::builder()
@@ -1390,10 +1522,9 @@ pub fn build_ui(app: &Application) {
             dialog.set_default_response(Some("cancel"));
             dialog.set_close_response("cancel");
             let start_install = start_install.clone();
-            let btn = btn.clone();
             dialog.connect_response(None, move |_, resp| {
                 if resp == "install" {
-                    start_install(&btn);
+                    start_install();
                 }
             });
             dialog.present(Some(&window));

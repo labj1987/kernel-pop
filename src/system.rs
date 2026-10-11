@@ -4,8 +4,9 @@
 //! /boot is checked for a matching initrd.img and /lib/modules directory,
 //! so a kernel that would VFS-panic on boot is visible BEFORE the reboot.
 
+use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug, Clone, Default)]
@@ -73,10 +74,25 @@ pub struct InstalledKernel {
     /// entry under the ESP, since nothing else guarantees one exists.
     pub has_boot_entry: bool,
     pub running: bool,
-    /// Signed with Kernel Pop's key, from the marker the privileged script
-    /// writes after signing. None when signing is not set up. Not part of
-    /// `healthy()`: an unsigned kernel boots fine with Secure Boot off.
-    pub signed: Option<bool>,
+    /// Who signed the image, shown once signing is set up (None before
+    /// that). Not part of `healthy()`: an unsigned kernel boots fine with
+    /// Secure Boot off.
+    pub signed: Option<KernelSignature>,
+}
+
+/// Whose signature a kernel image carries, as far as the unprivileged app
+/// can tell (the image itself is root-only).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KernelSignature {
+    /// Signed with Kernel Pop's key: the marker the privileged script writes
+    /// after signing still matches the image.
+    KernelPop,
+    /// An Ubuntu kernel from the archive, signed by Canonical: its package
+    /// is the signed linux-image-<version> built by a linux-signed source.
+    /// Boots under Secure Boot through shim without Kernel Pop's key.
+    Distro,
+    /// Neither: a mainline kernel not (or no longer) signed by Kernel Pop.
+    Unsigned,
 }
 
 impl InstalledKernel {
@@ -130,20 +146,50 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// kernelstub keeps only Pop_OS-current / Pop_OS-oldkern rather than a
-/// per-version entry, so the best available check is that its kernel image
-/// exists on the ESP (EFI/Pop_OS-*/vmlinuz.efi).
-fn kernelstub_has_image() -> bool {
-    ["/boot/efi/EFI", "/boot/EFI"].iter().any(|dir| {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries.flatten().any(|e| {
-                    e.file_name().to_str().is_some_and(|n| n.starts_with("Pop_OS-"))
-                        && e.path().join("vmlinuz.efi").exists()
-                })
-            })
+/// Which ESP file kernelstub keeps for `version`: it copies only the kernel
+/// the `vmlinuz` symlink points at (as vmlinuz.efi) and the one `vmlinuz.old`
+/// points at (as vmlinuz-previous.efi). The symlinks are in `/` or in
+/// `/boot`, depending on /etc/kernel-img.conf; `/` wins when it has them,
+/// like in the privileged script. None when kernelstub keeps no copy of it.
+pub fn kernelstub_slot(version: &str, root: &Path, boot: &Path) -> Option<&'static str> {
+    let base = if root.join("vmlinuz").is_symlink() { root } else { boot };
+    let points_at = |link: &str| {
+        std::fs::read_link(base.join(link))
+            .ok()
+            .and_then(|t| t.file_name().map(|n| n.to_string_lossy() == format!("vmlinuz-{version}")))
             .unwrap_or(false)
+    };
+    if points_at("vmlinuz") {
+        Some("vmlinuz.efi")
+    } else if points_at("vmlinuz.old") {
+        Some("vmlinuz-previous.efi")
+    } else {
+        None
+    }
+}
+
+/// Whether kernelstub put `version` on the ESP: it must have a slot and that
+/// slot's file must exist under some EFI/Pop_OS-* directory. An ESP the user
+/// may not read gets the benefit of the doubt, like an unreadable grub.cfg.
+fn kernelstub_has_image(version: &str, root: &Path, boot: &Path, efi_dirs: &[&Path]) -> bool {
+    let Some(slot) = kernelstub_slot(version, root, boot) else { return false };
+    efi_dirs.iter().any(|dir| match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().any(|e| {
+            e.file_name().to_str().is_some_and(|n| n.starts_with("Pop_OS-")) && e.path().join(slot).exists()
+        }),
+        Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
     })
+}
+
+/// A systemd-boot entry file for exactly `version`: "<token>-<version>.conf",
+/// or "<token>-<version>+<tries>.conf" with boot counting.
+fn sdboot_entry_name_matches(name: &str, version: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".conf") else { return false };
+    let stem = match stem.rfind('+') {
+        Some(i) if stem[i + 1..].chars().all(|c| c.is_ascii_digit() || c == '-') => &stem[..i],
+        _ => stem,
+    };
+    stem.strip_suffix(version).is_some_and(|head| head.ends_with('-'))
 }
 
 /// Whether grub.cfg has an entry for vmlinuz-<version>. An unreadable
@@ -161,20 +207,22 @@ fn grub_cfg_mentions(version: &str) -> bool {
 fn has_boot_entry(version: &str, bootloader: &Bootloader) -> bool {
     match bootloader {
         Bootloader::Unknown => true,
-        Bootloader::Kernelstub => kernelstub_has_image(),
+        Bootloader::Kernelstub => kernelstub_has_image(
+            version,
+            Path::new("/"),
+            Path::new("/boot"),
+            &[Path::new("/boot/efi/EFI"), Path::new("/boot/EFI")],
+        ),
         Bootloader::Grub => grub_cfg_mentions(version),
         Bootloader::SystemdBoot { esp } => {
             let entries_dir = format!("{esp}/loader/entries");
-            std::fs::read_dir(&entries_dir)
-                .map(|entries| {
-                    entries.flatten().any(|e| {
-                        e.file_name()
-                            .to_str()
-                            .map(|n| n.ends_with(&format!("-{version}.conf")))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
+            match std::fs::read_dir(&entries_dir) {
+                Ok(entries) => entries.flatten().any(|e| {
+                    e.file_name().to_str().is_some_and(|n| sdboot_entry_name_matches(n, version))
+                }),
+                // The ESP is often mounted readable by root only.
+                Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
+            }
         }
     }
 }
@@ -196,26 +244,30 @@ pub fn query_system() -> SystemInfo {
 
 // ── Kernel signing ───────────────────────────────────────────────────────
 
-fn mok_dir() -> PathBuf {
-    std::env::var_os("KERNEL_POP_MOK_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/kernel-pop/mok"))
+const MOK_DIR: &str = "/var/lib/kernel-pop/mok";
+const SIGNED_DIR: &str = "/var/lib/kernel-pop/signed";
+
+/// What `mokutil --test-key <der>` says about a key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TestKey {
+    /// "<file> is already enrolled"
+    Enrolled,
+    /// "<file> is already in the enrollment request": queued, confirmed at
+    /// MOK Manager on the next boot.
+    Pending,
+    /// "<file> is not enrolled"
+    NotEnrolled,
 }
 
-fn signed_dir() -> PathBuf {
-    std::env::var_os("KERNEL_POP_SIGNED_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/kernel-pop/signed"))
-}
-
-/// Parse `mokutil --test-key <der>`: "<file> is already enrolled" (also
-/// printed for a key already in the enrollment request) or "<file> is not
-/// enrolled". None when the output says neither.
-pub fn parse_mokutil_test_key(text: &str) -> Option<bool> {
+/// Parse `mokutil --test-key <der>`. None when the output says none of the
+/// three (mokutil missing, no EFI variables, …).
+pub fn parse_mokutil_test_key(text: &str) -> Option<TestKey> {
     if text.contains("is not enrolled") {
-        Some(false)
-    } else if text.contains("is already") {
-        Some(true)
+        Some(TestKey::NotEnrolled)
+    } else if text.contains("is already in the enrollment request") {
+        Some(TestKey::Pending)
+    } else if text.contains("is already enrolled") {
+        Some(TestKey::Enrolled)
     } else {
         None
     }
@@ -248,18 +300,25 @@ pub fn list_new_contains(text: &str, fingerprint: &str) -> bool {
             .any(|fp| normalize_fingerprint(fp) == fingerprint)
 }
 
+/// `pending` is whether `mokutil --list-new` lists the key; it backs up
+/// --test-key, which already reports a queued key as pending by itself.
 pub fn combine_kernel_signing(
     key_present: bool,
-    test_key: Option<bool>,
+    test_key: Option<TestKey>,
     pending: bool,
 ) -> KernelSigning {
     match (key_present, pending, test_key) {
         (false, _, _) => KernelSigning::NoKey,
-        (true, true, _) => KernelSigning::EnrollmentPending,
-        (true, false, Some(true)) => KernelSigning::Enrolled,
-        (true, false, Some(false)) => KernelSigning::KeyNotEnrolled,
+        (true, true, _) | (true, false, Some(TestKey::Pending)) => KernelSigning::EnrollmentPending,
+        (true, false, Some(TestKey::Enrolled)) => KernelSigning::Enrolled,
+        (true, false, Some(TestKey::NotEnrolled)) => KernelSigning::KeyNotEnrolled,
         (true, false, None) => KernelSigning::Unknown,
     }
+}
+
+/// All three key files the privileged script creates are in `dir`.
+fn key_files_present(dir: &Path) -> bool {
+    ["signing.key", "signing.pem", "signing.der"].iter().all(|f| dir.join(f).exists())
 }
 
 fn stdout_of(cmd: &mut Command) -> Option<String> {
@@ -269,12 +328,9 @@ fn stdout_of(cmd: &mut Command) -> Option<String> {
 }
 
 fn detect_kernel_signing() -> KernelSigning {
-    let dir = mok_dir();
+    let dir = Path::new(MOK_DIR);
     let der = dir.join("signing.der");
-    let key_present = ["signing.key", "signing.pem", "signing.der"]
-        .iter()
-        .all(|f| dir.join(f).exists());
-    if !key_present {
+    if !key_files_present(dir) {
         return KernelSigning::NoKey;
     }
     let test_key = stdout_of(Command::new("mokutil").arg("--test-key").arg(&der))
@@ -305,11 +361,50 @@ pub fn marker_matches(marker: &str, size: u64, mtime: i64) -> bool {
     )
 }
 
-/// The image itself is root-only (0600), but it can be stat'ed.
-fn kernel_signed(version: &str) -> bool {
-    let Ok(marker) = std::fs::read_to_string(signed_dir().join(version)) else { return false };
-    let Ok(meta) = std::fs::metadata(format!("/boot/vmlinuz-{version}")) else { return false };
+/// Whether `boot`/vmlinuz-<version> is signed with Kernel Pop's key, from
+/// its marker in `signed_dir`. The image itself is root-only (0600), but it
+/// can be stat'ed.
+fn signed_by_kernel_pop(signed_dir: &Path, boot: &Path, version: &str) -> bool {
+    let Ok(marker) = std::fs::read_to_string(signed_dir.join(version)) else { return false };
+    let Ok(meta) = std::fs::metadata(boot.join(format!("vmlinuz-{version}"))) else { return false };
     marker_matches(&marker, meta.len(), meta.mtime())
+}
+
+/// Kernel versions whose image comes from Ubuntu's signed kernel package,
+/// from `dpkg-query -W -f '${db:Status-Abbrev}\t${Package}\t${source:Package}\n'
+/// 'linux-image-*'`: an installed linux-image-<version> (not -unsigned-)
+/// whose source package is linux-signed or linux-signed-<flavour>.
+pub fn parse_distro_signed(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split('\t');
+            let (status, pkg, source) = (f.next()?.trim(), f.next()?, f.next()?.trim());
+            let version = pkg.strip_prefix("linux-image-")?;
+            let signed_source = source == "linux-signed" || source.starts_with("linux-signed-");
+            (status == "ii" && signed_source && !version.starts_with("unsigned-")).then(|| version.to_string())
+        })
+        .collect()
+}
+
+fn distro_signed_kernels() -> HashSet<String> {
+    stdout_of(Command::new("dpkg-query").args([
+        "-W",
+        "-f",
+        "${db:Status-Abbrev}\t${Package}\t${source:Package}\n",
+        "linux-image-*",
+    ]))
+    .map(|t| parse_distro_signed(&t))
+    .unwrap_or_default()
+}
+
+/// Kernel Pop's own signature wins (it is what the Sign button is about);
+/// otherwise an Ubuntu-signed kernel is reported as such.
+pub fn classify_signature(ours: bool, distro: bool) -> KernelSignature {
+    match (ours, distro) {
+        (true, _) => KernelSignature::KernelPop,
+        (false, true) => KernelSignature::Distro,
+        (false, false) => KernelSignature::Unsigned,
+    }
 }
 
 // ── Secure Boot ──────────────────────────────────────────────────────────
@@ -489,6 +584,7 @@ fn get_installed_kernels(
     signing_key_present: bool,
 ) -> Vec<InstalledKernel> {
     let mut kernels = vec![];
+    let distro_signed = if signing_key_present { distro_signed_kernels() } else { HashSet::new() };
 
     let Ok(entries) = std::fs::read_dir("/boot") else { return kernels };
     for entry in entries.flatten() {
@@ -505,7 +601,12 @@ fn get_installed_kernels(
             has_modules,
             has_boot_entry: has_boot_entry(version, bootloader),
             running: version == running,
-            signed: signing_key_present.then(|| kernel_signed(version)),
+            signed: signing_key_present.then(|| {
+                classify_signature(
+                    signed_by_kernel_pop(Path::new(SIGNED_DIR), Path::new("/boot"), version),
+                    distro_signed.contains(version),
+                )
+            }),
         });
     }
 
@@ -614,15 +715,15 @@ mod tests {
                 "Failed to access kernel trusted keyring: Required key not available\n\
                  /var/lib/kernel-pop/mok/signing.der is not enrolled\n"
             ),
-            Some(false)
+            Some(TestKey::NotEnrolled)
         );
         assert_eq!(
             parse_mokutil_test_key("/var/lib/kernel-pop/mok/signing.der is already enrolled\n"),
-            Some(true)
+            Some(TestKey::Enrolled)
         );
         assert_eq!(
             parse_mokutil_test_key("signing.der is already in the enrollment request\n"),
-            Some(true)
+            Some(TestKey::Pending)
         );
         assert_eq!(parse_mokutil_test_key("EFI variables are not supported on this system\n"), None);
         assert_eq!(parse_mokutil_test_key(""), None);
@@ -658,14 +759,99 @@ mod tests {
     #[test]
     fn kernel_signing_combination() {
         use KernelSigning::*;
-        assert_eq!(combine_kernel_signing(false, Some(true), true), NoKey);
-        assert_eq!(combine_kernel_signing(true, Some(true), true), EnrollmentPending);
-        assert_eq!(combine_kernel_signing(true, Some(false), true), EnrollmentPending);
-        assert_eq!(combine_kernel_signing(true, Some(true), false), Enrolled);
-        assert_eq!(combine_kernel_signing(true, Some(false), false), KeyNotEnrolled);
+        use TestKey as T;
+        assert_eq!(combine_kernel_signing(false, Some(T::Enrolled), true), NoKey);
+        assert_eq!(combine_kernel_signing(true, Some(T::Enrolled), true), EnrollmentPending);
+        assert_eq!(combine_kernel_signing(true, Some(T::NotEnrolled), true), EnrollmentPending);
+        assert_eq!(combine_kernel_signing(true, Some(T::Enrolled), false), Enrolled);
+        assert_eq!(combine_kernel_signing(true, Some(T::NotEnrolled), false), KeyNotEnrolled);
         assert_eq!(combine_kernel_signing(true, None, false), Unknown);
+        // --test-key alone is enough to see a queued key: with openssl or
+        // --list-new failing, a pending key must never read as Enrolled.
+        assert_eq!(combine_kernel_signing(true, Some(T::Pending), false), EnrollmentPending);
         assert!(!NoKey.key_present());
         assert!(Unknown.key_present());
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kernel-pop-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn kernelstub_slots_follow_the_symlinks() {
+        use std::os::unix::fs::symlink;
+        let d = scratch("ks");
+        let (root, boot, efi) = (d.join("root"), d.join("boot"), d.join("efi/EFI"));
+        for p in [&root, &boot, &efi.join("Pop_OS-1234")] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        symlink("vmlinuz-7.1.3-070103-generic", boot.join("vmlinuz")).unwrap();
+        symlink("vmlinuz-6.8.0-45-generic", boot.join("vmlinuz.old")).unwrap();
+        assert_eq!(kernelstub_slot("7.1.3-070103-generic", &root, &boot), Some("vmlinuz.efi"));
+        assert_eq!(kernelstub_slot("6.8.0-45-generic", &root, &boot), Some("vmlinuz-previous.efi"));
+        assert_eq!(kernelstub_slot("6.5.0-1-generic", &root, &boot), None);
+        assert_eq!(kernelstub_slot("1.3-070103-generic", &root, &boot), None);
+
+        let dirs = [efi.as_path()];
+        std::fs::write(efi.join("Pop_OS-1234/vmlinuz.efi"), b"x").unwrap();
+        assert!(kernelstub_has_image("7.1.3-070103-generic", &root, &boot, &dirs));
+        // Its slot file is missing on the ESP
+        assert!(!kernelstub_has_image("6.8.0-45-generic", &root, &boot, &dirs));
+        // No slot at all: not in the boot menu, whatever the ESP holds
+        assert!(!kernelstub_has_image("6.5.0-1-generic", &root, &boot, &dirs));
+
+        // Links in / win over /boot
+        symlink("boot/vmlinuz-6.5.0-1-generic", root.join("vmlinuz")).unwrap();
+        assert_eq!(kernelstub_slot("6.5.0-1-generic", &root, &boot), Some("vmlinuz.efi"));
+        assert_eq!(kernelstub_slot("7.1.3-070103-generic", &root, &boot), None);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn systemd_boot_entry_names_match_exactly() {
+        assert!(sdboot_entry_name_matches("abc-7.1.3-070103-generic.conf", "7.1.3-070103-generic"));
+        assert!(sdboot_entry_name_matches("abc-7.1.3-070103-generic+3.conf", "7.1.3-070103-generic"));
+        assert!(sdboot_entry_name_matches("abc-7.1.3-070103-generic+2-1.conf", "7.1.3-070103-generic"));
+        assert!(!sdboot_entry_name_matches("abc-17.1.3-070103-generic.conf", "7.1.3-070103-generic"));
+        assert!(!sdboot_entry_name_matches("abc-7.1.3-070103-generic-64k.conf", "7.1.3-070103-generic"));
+        assert!(!sdboot_entry_name_matches("abc-7.1.3-070103-generic.conf.bak", "7.1.3-070103-generic"));
+    }
+
+    #[test]
+    fn signature_sources() {
+        let d = scratch("sig");
+        let (signed, boot) = (d.join("signed"), d.join("boot"));
+        std::fs::create_dir_all(&signed).unwrap();
+        std::fs::create_dir_all(&boot).unwrap();
+        let img = boot.join("vmlinuz-7.1.3-070103-generic");
+        std::fs::write(&img, b"image").unwrap();
+        assert!(!signed_by_kernel_pop(&signed, &boot, "7.1.3-070103-generic"));
+        let meta = std::fs::metadata(&img).unwrap();
+        std::fs::write(signed.join("7.1.3-070103-generic"), format!("{} {}\n", meta.len(), meta.mtime())).unwrap();
+        assert!(signed_by_kernel_pop(&signed, &boot, "7.1.3-070103-generic"));
+        assert!(!signed_by_kernel_pop(&signed, &boot, "6.8.0-45-generic"));
+        assert!(!key_files_present(&d));
+        for f in ["signing.key", "signing.pem", "signing.der"] {
+            std::fs::write(d.join(f), b"").unwrap();
+        }
+        assert!(key_files_present(&d));
+        std::fs::remove_dir_all(&d).unwrap();
+
+        let dpkg = "ii \tlinux-image-6.8.0-45-generic\tlinux-signed\n\
+                    ii \tlinux-image-6.11.0-19-generic\tlinux-signed-hwe-6.11\n\
+                    ii \tlinux-image-unsigned-6.8.0-45-generic\tlinux\n\
+                    ii \tlinux-image-unsigned-7.1.3-070103-generic\tlinux-upstream\n\
+                    rc \tlinux-image-6.5.0-1-generic\tlinux-signed\n\
+                    ii \tlinux-image-generic\tlinux-meta\n";
+        let set = parse_distro_signed(dpkg);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("6.8.0-45-generic") && set.contains("6.11.0-19-generic"));
+        assert_eq!(classify_signature(true, true), KernelSignature::KernelPop);
+        assert_eq!(classify_signature(false, true), KernelSignature::Distro);
+        assert_eq!(classify_signature(false, false), KernelSignature::Unsigned);
     }
 
     #[test]
@@ -786,7 +972,7 @@ mod tests {
             has_modules: true,
             has_boot_entry: true,
             running: false,
-            signed: Some(false),
+            signed: Some(KernelSignature::Unsigned),
         };
         // An unsigned kernel is still healthy: signing is not a boot check.
         assert!(k.healthy());
