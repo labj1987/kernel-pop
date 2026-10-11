@@ -2,7 +2,7 @@
 # build-appimage.sh — build the Kernel Pop AppImage.
 # Run from the repo root on Ubuntu (CI uses ubuntu-24.04) as an ordinary user: it
 # writes only inside the checkout. Only its from-scratch dependency install below
-# needs root.
+# needs root, and it uses sudo for that when not already root.
 set -euo pipefail
 
 APP="kernel-pop"
@@ -22,8 +22,10 @@ echo "==> Building $APP $VERSION AppImage"
 # only a failed install is fatal.
 if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null; then
     echo "==> Installing build dependencies"
-    apt-get update -qq || true
-    apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
+    AS_ROOT=()
+    if [[ $EUID -ne 0 ]]; then AS_ROOT=(sudo); fi
+    "${AS_ROOT[@]}" apt-get update -qq || true
+    "${AS_ROOT[@]}" apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
         pkg-config zsync wget file desktop-file-utils
 fi
 
@@ -44,9 +46,12 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/polkit-1/actions" \
          "$APPDIR/usr/share/metainfo"
 
-cp "target/release/$APP"                           "$APPDIR/usr/bin/"
+cp "${CARGO_TARGET_DIR:-target}/release/$APP"     "$APPDIR/usr/bin/"
 cp scripts/privileged-install.sh                   "$APPDIR/usr/lib/$APP/"
 chmod 755 "$APPDIR/usr/lib/$APP/privileged-install.sh"
+# Ubuntu's kernel PPA key: the privileged script checks the CHECKSUMS signature with it.
+cp data/kernel-ppa.gpg                             "$APPDIR/usr/lib/$APP/"
+chmod 644 "$APPDIR/usr/lib/$APP/kernel-ppa.gpg"
 cp data/$APP.desktop                                "$APPDIR/usr/share/applications/"
 cp data/$APP-256.png                                "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APP.png"
 cp data/io.github.labj1987.KernelPop.policy         "$APPDIR/usr/share/polkit-1/actions/"
@@ -62,26 +67,30 @@ cp data/$APP-256.png "$APPDIR/$APP.png"
 desktop-file-validate "$APPDIR/$APP.desktop"
 
 # ── AppRun ────────────────────────────────────────────────────────────
-# On first launch the privileged script and polkit policy must exist at
-# fixed system paths (polkit refuses relative/user paths), so AppRun
-# installs them via pkexec when missing or outdated, then execs the app.
+# On first launch the privileged script, its keyring and the polkit policy
+# must exist at fixed system paths (polkit refuses relative/user paths), so
+# AppRun installs them via pkexec when missing or outdated, then execs the
+# app. When that install is cancelled or fails, the app is still started, but
+# it sees the mismatch itself (KERNEL_POP_BUNDLE points it at the bundled
+# copies), shows why, and refuses to run a helper from another version.
 cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
 APP="kernel-pop"
 
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
+SRC_KEYRING="$HERE/usr/lib/$APP/kernel-ppa.gpg"
 SRC_POLICY="$HERE/usr/share/polkit-1/actions/io.github.labj1987.KernelPop.policy"
 DST_SCRIPT="/usr/lib/$APP/privileged-install.sh"
+DST_KEYRING="/usr/lib/$APP/kernel-ppa.gpg"
 DST_POLICY="/usr/share/polkit-1/actions/io.github.labj1987.KernelPop.policy"
 
 needs_install=0
-if [[ ! -f "$DST_SCRIPT" ]] || ! cmp -s "$SRC_SCRIPT" "$DST_SCRIPT"; then
-    needs_install=1
-fi
-if [[ ! -f "$DST_POLICY" ]] || ! cmp -s "$SRC_POLICY" "$DST_POLICY"; then
-    needs_install=1
-fi
+for pair in "$SRC_SCRIPT:$DST_SCRIPT" "$SRC_KEYRING:$DST_KEYRING" "$SRC_POLICY:$DST_POLICY"; do
+    if [[ ! -f "${pair#*:}" ]] || ! cmp -s "${pair%%:*}" "${pair#*:}"; then
+        needs_install=1
+    fi
+done
 
 if [[ $needs_install -eq 1 ]]; then
     # The AppImage's FUSE mount is normally not readable by root, so the
@@ -91,23 +100,39 @@ if [[ $needs_install -eq 1 ]]; then
     # to install anything that doesn't match those hashes.
     STAGE="$(mktemp -d)"
     cp "$SRC_SCRIPT" "$STAGE/privileged-install.sh"
+    cp "$SRC_KEYRING" "$STAGE/keyring"
     cp "$SRC_POLICY" "$STAGE/policy"
     H_SCRIPT="$(sha256sum "$SRC_SCRIPT" | cut -d' ' -f1)"
+    H_KEYRING="$(sha256sum "$SRC_KEYRING" | cut -d' ' -f1)"
     H_POLICY="$(sha256sum "$SRC_POLICY" | cut -d' ' -f1)"
     pkexec bash -c '
         set -euo pipefail
-        stage="$1"; hs="$2"; hp="$3"; dst_s="$4"; dst_p="$5"
+        stage="$1"; hs="$2"; hk="$3"; hp="$4"; dst_s="$5"; dst_k="$6"; dst_p="$7"
         safe="$(mktemp -d)"; trap "rm -rf \"$safe\"" EXIT
         cp "$stage/privileged-install.sh" "$safe/s"
+        cp "$stage/keyring" "$safe/k"
         cp "$stage/policy" "$safe/p"
         [[ "$(sha256sum "$safe/s" | cut -d" " -f1)" == "$hs" ]] || { echo "script hash mismatch" >&2; exit 1; }
+        [[ "$(sha256sum "$safe/k" | cut -d" " -f1)" == "$hk" ]] || { echo "keyring hash mismatch" >&2; exit 1; }
         [[ "$(sha256sum "$safe/p" | cut -d" " -f1)" == "$hp" ]] || { echo "policy hash mismatch" >&2; exit 1; }
+        install -D -m 644 "$safe/k" "$dst_k"
         install -D -m 755 "$safe/s" "$dst_s"
         install -D -m 644 "$safe/p" "$dst_p"
-    ' _ "$STAGE" "$H_SCRIPT" "$H_POLICY" "$DST_SCRIPT" "$DST_POLICY"
+    ' _ "$STAGE" "$H_SCRIPT" "$H_KEYRING" "$H_POLICY" "$DST_SCRIPT" "$DST_KEYRING" "$DST_POLICY"
+    rc=$?
     rm -rf "$STAGE"
+    if [[ $rc -ne 0 ]]; then
+        case $rc in
+            126) why="authentication was cancelled" ;;
+            127) why="authorization failed" ;;
+            *)   why="the install failed (exit code $rc)" ;;
+        esac
+        echo "kernel-pop: the privileged helper was not installed or updated: $why." \
+             "Installing, removing and signing kernels stay off; restart Kernel Pop to try again." >&2
+    fi
 fi
 
+export KERNEL_POP_BUNDLE="$HERE"
 export PATH="$HERE/usr/bin:$PATH"
 exec "$HERE/usr/bin/$APP" "$@"
 APPRUN
