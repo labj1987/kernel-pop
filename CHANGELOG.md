@@ -4,6 +4,51 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 1.6.0 — 2026-10-11
+
+**Downloads are now really verified.** Earlier versions checked the packages against the
+wrong checksum file, so in practice no package was ever verified. Now:
+
+- Every package must match the checksum file published next to it, and that file must
+  carry a valid signature from Ubuntu's kernel team. A version without signed checksums
+  is refused instead of being installed unverified.
+- The install step checks everything again, with administrator rights, on a private copy
+  of the packages, so nothing in your Downloads folder can be swapped in after the check.
+
+**Secure Boot**
+
+- A new kernel that cannot boot with Secure Boot on (unsigned, or signed with a key that
+  is not enrolled yet) is no longer made the default boot entry, and the next restart
+  starts the kernel you are running now. The install says plainly that the new kernel
+  will not boot, and why.
+- If the signing key is still waiting for enrollment, the install reminds you to confirm
+  it at the blue MOK Manager screen on the next reboot.
+- A key waiting for enrollment is no longer sometimes shown as enrolled.
+- Ubuntu's own kernels show "Signed by Ubuntu" instead of a misleading "Unsigned".
+- On Pop!_OS, signing a kernel checks the boot loader copy of that kernel, not whichever
+  kernel happens to be the default, and only kernels that really have a boot menu entry
+  show one.
+- On systemd-boot, re-signing a kernel no longer drops its initramfs from the boot entry.
+
+**Boot menu**
+
+- With the GRUB submenu turned off, new kernels are made the default again and Boot Next
+  Time works.
+- Kernel versions are matched exactly, so removing or selecting one kernel can no longer
+  pick up another whose version merely contains it.
+
+**Other fixes**
+
+- Only one download or administrator action runs at a time; the buttons for the others
+  wait until it has finished.
+- A cancelled download says "Cancelled" instead of "Download failed".
+- Cancelling the password prompt, being refused, and a real error are now told apart, and
+  the error details are shown.
+- DKMS and signing problems are no longer counted twice.
+- If updating Kernel Pop's system helper is cancelled when the app starts, the app says so
+  and keeps installing, removing and signing kernels off until you restart it and
+  authenticate, instead of running the old helper.
+
 ## 1.5.0 — 2026-10-08
 
 **Kernel signing for Secure Boot.** Kernel Pop can sign the mainline kernels it installs,
