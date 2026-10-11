@@ -16,12 +16,21 @@
 # an unbootable kernel behind.
 #
 # Usage:
-#   privileged-install.sh --install <dir-of-debs>
+#   privileged-install.sh --install <download-dir>   (the .debs plus the CHECKSUMS
+#                                                     and CHECKSUMS.gpg they came with)
 #   privileged-install.sh --remove  <kernel-version-string>
 #   privileged-install.sh --remove-many <kernel-version-string>...
 #   privileged-install.sh --boot-once <kernel-version-string>
 #   privileged-install.sh --setup-signing        (enrollment password on stdin)
 #   privileged-install.sh --sign <kernel-version-string>
+#
+# Output protocol: every line starts with "[kernel-pop] ". The app counts and
+# reacts to these markers at the start of a line's text, so each one is used
+# once per problem and never in a summary line:
+#   DKMS WARNING:  one DKMS problem        SIGN WARNING:  one signing problem
+#   BOOT BLOCKED:  the kernel will not boot while Secure Boot is enforcing
+#   BOOT PENDING:  it boots once the signing key's enrollment is confirmed
+# Summaries use "DKMS SUMMARY:" / "SIGN SUMMARY:", which are not counted.
 
 set -euo pipefail
 
@@ -35,6 +44,14 @@ die() { log "ERROR: $*"; exit 1; }
 
 MODE="${1:-}"
 ARG="${2:-}"
+
+# Test overrides (pkexec clears the environment, so they never reach a real
+# run): KERNEL_POP_BOOT, KERNEL_POP_MODULES, KERNEL_POP_ROOTFS,
+# KERNEL_POP_MOK_DIR, KERNEL_POP_SIGNED_DIR, KERNEL_POP_KEYRING,
+# KERNEL_POP_SIGNER_FPR, KERNEL_POP_STAGING, KERNEL_POP_GRUB_CFG,
+# KERNEL_POP_GRUB_DEFAULTS, KERNEL_POP_DKMS_TREE.
+boot_dir()    { echo "${KERNEL_POP_BOOT:-/boot}"; }
+modules_dir() { echo "${KERNEL_POP_MODULES:-/lib/modules}"; }
 
 # ── Boot loader detection ───────────────────────────────────────────────
 # GRUB and systemd-boot binaries/config can both be present on a machine
@@ -73,22 +90,141 @@ detect_bootloader() {
 # ── Find a kernel's GRUB menu entry path from the generated grub.cfg ────
 # Entry IDs (menuentry_id_option) are per-machine random UUIDs baked in by
 # grub-mkconfig — never /etc/machine-id, and never guessable — so they must
-# be read out of the actual config, not constructed. Prints
-# "<submenu-id>><entry-id>" for use with grub-set-default, or nothing if no
-# match was found.
+# be read out of the actual config, not constructed. Prints the path for
+# grub-set-default / grub-reboot: "<submenu-id>><entry-id>" for an entry in
+# the "Advanced options" submenu, or just "<entry-id>" for a top-level entry
+# (GRUB_DISABLE_SUBMENU=y puts every kernel at the top level). Returns 1 when
+# there is no entry for <kver>.
+#
+# An entry matches when its title ends in exactly "Linux <kver>", compared as
+# a plain string: recovery entries ("... (recovery mode)") and other systems'
+# entries from os-prober ("... (on /dev/sda2)") never match, and neither does
+# a kernel whose version merely contains <kver>. grub-mkconfig writes
+# top-level menuentry/submenu lines and their closing braces at column 0 and
+# everything inside a submenu indented, which is what tells the two apart.
 grub_entry_path_for_kver() {
     local kver="$1" cfg="${KERNEL_POP_GRUB_CFG:-/boot/grub/grub.cfg}"
     [[ -f "$cfg" ]] || return 1
 
-    local submenu_id entry_id
-    submenu_id="$(grep -oP "submenu '[^']*' \\\$menuentry_id_option '\\K[^']+" "$cfg" | head -1)" || true
-    # Excludes recovery-mode entries, which also contain $kver in their
-    # title — the default must never land on one of those.
-    entry_id="$(grep "menuentry '[^']*${kver}[^']*'" "$cfg" 2>/dev/null \
-        | grep -v 'recovery mode' \
-        | grep -oP "\\\$menuentry_id_option '\\K[^']+" | head -1)" || true
-    [[ -n "$submenu_id" && -n "$entry_id" ]] || return 1
-    echo "${submenu_id}>${entry_id}"
+    local line sub="" in_top_entry=0 title id
+    local re_sub="^submenu '[^']*'.*[\$]menuentry_id_option '([^']+)'"
+    local re_entry="^[[:space:]]*menuentry '([^']*)'.*[\$]menuentry_id_option '([^']+)'"
+    while IFS= read -r line; do
+        if [[ "$line" =~ $re_sub ]]; then
+            sub="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ $re_entry ]]; then
+            title="${BASH_REMATCH[1]}"
+            id="${BASH_REMATCH[2]}"
+            [[ "$line" == menuentry* ]] && in_top_entry=1
+            if [[ "$title" == *"Linux $kver" ]]; then
+                if [[ "$line" == menuentry* || -z "$sub" ]]; then
+                    echo "$id"
+                else
+                    echo "${sub}>${id}"
+                fi
+                return 0
+            fi
+        elif [[ "$line" == "}"* ]]; then
+            if (( in_top_entry )); then in_top_entry=0; else sub=""; fi
+        fi
+    done < "$cfg"
+    return 1
+}
+
+# The systemd-boot loader entry file for <kver> under <esp>, or nothing.
+# kernel-install writes "version <kver>" into each entry; the file name
+# (<entry-token>-<kver>.conf, "+N-M" when boot counting is on) is the fallback
+# for entries without that line.
+sdboot_entry_for_kver() {
+    local esp="$1" kver="$2" f line
+    for f in "$esp"/loader/entries/*.conf; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            line="${line%$'\r'}"
+            if [[ "$line" =~ ^version[[:space:]]+(.*[^[:space:]])[[:space:]]*$ && "${BASH_REMATCH[1]}" == "$kver" ]]; then
+                echo "$f"
+                return 0
+            fi
+        done < "$f"
+    done
+    for f in "$esp"/loader/entries/*.conf; do
+        [[ -f "$f" ]] || continue
+        case "${f##*/}" in
+            *"-$kver.conf"|*"-$kver+"*".conf") echo "$f"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
+# kernelstub (Pop!_OS) copies exactly two kernels to the ESP: the one the
+# vmlinuz symlink points at as vmlinuz.efi, and the one vmlinuz.old points at
+# as vmlinuz-previous.efi. Prints which of those two files is <kver>'s, or
+# nothing when kernelstub keeps no copy of it. The symlinks live in / or in
+# /boot depending on /etc/kernel-img.conf; / wins when it has them.
+kernelstub_slot_for_kver() {
+    local kver="$1" base
+    base="${KERNEL_POP_ROOTFS:-}"
+    [[ -L "$base/vmlinuz" ]] || base="$(boot_dir)"
+    if [[ -L "$base/vmlinuz" && "$(basename "$(readlink "$base/vmlinuz")")" == "vmlinuz-$kver" ]]; then
+        echo "vmlinuz.efi"
+    elif [[ -L "$base/vmlinuz.old" && "$(basename "$(readlink "$base/vmlinuz.old")")" == "vmlinuz-$kver" ]]; then
+        echo "vmlinuz-previous.efi"
+    fi
+    return 0
+}
+
+# The kernel image file the boot loader loads for <kver> from the ESP, or
+# nothing when it has no ESP copy of it (GRUB reads /boot itself).
+# Usage: esp_image_for_kver <bootloader> <esp> <kver>
+esp_image_for_kver() {
+    local bl="$1" esp="$2" kver="$3" entry rel slot
+    case "$bl" in
+        systemd-boot)
+            entry="$(sdboot_entry_for_kver "$esp" "$kver")"
+            if [[ -n "$entry" ]]; then
+                rel="$(sed -n 's/^linux[[:space:]]\{1,\}//p' "$entry" | head -1)"
+                if [[ -n "$rel" ]]; then echo "$esp/${rel#/}"; fi
+            fi
+            ;;
+        kernelstub)
+            slot="$(kernelstub_slot_for_kver "$kver")"
+            if [[ -n "$slot" ]]; then
+                compgen -G "$esp/EFI/Pop_OS-*/$slot" | head -1 || true
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# Boot <kver> on the next boot only, leaving the saved default alone.
+# Returns non-zero (with a log line) when that is not possible.
+set_boot_once() {
+    local bl="$1" esp="$2" kver="$3" entry_path entry id
+    case "$bl" in
+        grub)
+            entry_path="$(grub_entry_path_for_kver "$kver")" \
+                || { log "Could not find a GRUB menu entry for $kver in grub.cfg"; return 1; }
+            grub-reboot "$entry_path" >>"$LOGFILE" 2>&1 \
+                || { log "grub-reboot failed for $entry_path"; return 1; }
+            log "GRUB will boot $kver on the next boot only ($entry_path)"
+            ;;
+        systemd-boot)
+            entry="$(sdboot_entry_for_kver "$esp" "$kver")"
+            [[ -n "$entry" ]] || { log "No systemd-boot entry found for $kver in $esp/loader/entries"; return 1; }
+            id="$(basename "$entry")"
+            bootctl set-oneshot "$id" >>"$LOGFILE" 2>&1 \
+                || { log "bootctl set-oneshot failed for $id"; return 1; }
+            log "systemd-boot will boot $kver on the next boot only ($id)"
+            ;;
+        kernelstub)
+            log "One-time boot selection is not supported with kernelstub (Pop!_OS); use the boot menu"
+            return 1
+            ;;
+        *)
+            log "Could not detect a supported boot loader — use your boot menu to pick $kver"
+            return 1
+            ;;
+    esac
 }
 
 # Put the previously saved GRUB default back after a default change that
@@ -150,11 +286,12 @@ initramfs_tool() {
 # Generate /boot/initrd.img-<kver> with whichever tool is installed. The
 # caller verifies the file exists afterwards, whatever the tool was.
 generate_initramfs() {
-    local kver="$1" tool
+    local kver="$1" tool boot
     tool="$(initramfs_tool)"
+    boot="$(boot_dir)"
     case "$tool" in
         update-initramfs)
-            if [[ -f "/boot/initrd.img-$kver" ]]; then
+            if [[ -f "$boot/initrd.img-$kver" ]]; then
                 update-initramfs -u -k "$kver" >>"$LOGFILE" 2>&1
             else
                 update-initramfs -c -k "$kver" >>"$LOGFILE" 2>&1
@@ -163,7 +300,7 @@ generate_initramfs() {
         dracut)
             # Write to the same initrd.img-<kver> name the rest of this
             # script and the app's health check look for.
-            dracut --force "/boot/initrd.img-$kver" "$kver" >>"$LOGFILE" 2>&1
+            dracut --force "$boot/initrd.img-$kver" "$kver" >>"$LOGFILE" 2>&1
             ;;
         *)
             log "No initramfs tool found (update-initramfs or dracut)"
@@ -215,15 +352,17 @@ dkms_postcheck() {
         log "No DKMS modules registered — nothing to build for $kver"
         return 0
     fi
-    if [[ ! -e "${KERNEL_POP_MODULES:-/lib/modules}/$kver/build" ]]; then
+    if [[ ! -e "$(modules_dir)/$kver/build" ]]; then
         DKMS_FAILED=$((DKMS_FAILED + 1))
         log "DKMS WARNING: DKMS modules are registered but /lib/modules/$kver/build is missing (headers not installed?) — they cannot be built for $kver"
         return 0
     fi
 
     log "DKMS modules registered — building for $kver (this can take a few minutes)…"
+    # Not a counted warning by itself: the per-module states below are what
+    # decides whether anything is missing.
     dkms autoinstall -k "$kver" >>"$LOGFILE" 2>&1 \
-        || log "DKMS WARNING: dkms autoinstall reported errors for $kver"
+        || log "dkms autoinstall reported errors for $kver — per-module results follow"
 
     local line tl state mod total=0 logf
     while IFS= read -r line; do
@@ -261,7 +400,6 @@ dkms_postcheck() {
 # original signature as well.
 # With no key, nothing here runs except one "not set up" log line per install.
 SIGN_FAILED=0
-SIGN_OID_MODULE_ONLY="1.3.6.1.4.1.2312.16.1.2"
 SIGN_KEY_CN="Kernel Pop kernel signing key"
 
 mok_dir()    { echo "${KERNEL_POP_MOK_DIR:-/var/lib/kernel-pop/mok}"; }
@@ -276,9 +414,14 @@ signing_key_present() {
 
 # Create the signing key and certificate. Idempotent: an existing key is
 # never overwritten. Fails (non-zero) without touching anything already there.
+# The whole set is built in a sibling temp directory and published with one
+# rename(2) of that directory onto the key directory, so the key directory
+# either does not exist (or is empty) or holds all three files: a failure or
+# a crash part way can never leave an incomplete set behind.
 generate_signing_key() {
-    local d tmpd
+    local d parent tmpd
     d="$(mok_dir)"
+    parent="$(dirname "$d")"
     if signing_key_present; then
         log "Signing key already exists in $d — keeping it"
         return 0
@@ -287,9 +430,9 @@ generate_signing_key() {
         log "SIGN WARNING: $d holds an incomplete key set — refusing to overwrite it. Move it aside and run the setup again."
         return 1
     fi
-    mkdir -p "$d" || return 1
-    chmod 0755 "$d" "$(dirname "$d")" 2>/dev/null || true
-    tmpd="$(mktemp -d "$d/.new.XXXXXX")" || return 1
+    mkdir -p "$parent" || return 1
+    chmod 0755 "$parent" 2>/dev/null || true
+    tmpd="$(mktemp -d "$parent/.mok.new.XXXXXX")" || return 1
     cat > "$tmpd/req.cnf" <<EOF
 [ req ]
 distinguished_name = dn
@@ -310,35 +453,39 @@ EOF
         log "SIGN WARNING: openssl could not generate the signing key"
         return 1
     fi
-    # A module-only EKU would make shim refuse every kernel signed with it.
-    if openssl x509 -in "$tmpd/signing.pem" -noout -text 2>/dev/null | grep -qF "$SIGN_OID_MODULE_ONLY"; then
-        rm -rf "$tmpd"
-        die "The generated certificate carries the module-only EKU $SIGN_OID_MODULE_ONLY — refusing to use it"
-    fi
     if ! openssl x509 -in "$tmpd/signing.pem" -outform DER -out "$tmpd/signing.der" >>"$LOGFILE" 2>&1; then
         rm -rf "$tmpd"
         log "SIGN WARNING: openssl could not convert the certificate to DER"
         return 1
     fi
-    chmod 0600 "$tmpd/signing.key"
-    chmod 0644 "$tmpd/signing.pem" "$tmpd/signing.der"
-    # Key last, so signing_key_present is never true for a half-moved set.
-    mv "$tmpd/signing.der" "$d/signing.der" && mv "$tmpd/signing.pem" "$d/signing.pem" \
-        && mv "$tmpd/signing.key" "$d/signing.key" || { rm -rf "$tmpd"; return 1; }
-    rm -rf "$tmpd"
+    rm -f "$tmpd/req.cnf"
+    if ! { chmod 0600 "$tmpd/signing.key" && chmod 0644 "$tmpd/signing.pem" "$tmpd/signing.der" \
+            && chmod 0755 "$tmpd"; }; then
+        rm -rf "$tmpd"
+        log "SIGN WARNING: could not set the key file modes"
+        return 1
+    fi
+    # rename(2) replaces the key directory only when it is missing or empty.
+    if ! mv -T "$tmpd" "$d" >>"$LOGFILE" 2>&1; then
+        rm -rf "$tmpd"
+        log "SIGN WARNING: could not move the new key set into $d (is it a non-empty directory?)"
+        return 1
+    fi
     log "Created signing key in $d (CN=$SIGN_KEY_CN)"
 }
 
 # Whether /boot/vmlinuz-<kver> carries a signature from our key. Quiet.
 kernel_signed() {
-    local img="${KERNEL_POP_BOOT:-/boot}/vmlinuz-$1"
+    local img
+    img="$(boot_dir)/vmlinuz-$1"
     [[ -f "$img" ]] && sbverify --cert "$(mok_dir)/signing.pem" "$img" >/dev/null 2>&1
 }
 
 # Record that vmlinuz-<kver> is signed, as "<size> <mtime>": the unprivileged
 # app cannot read a 0600 kernel image, but it can stat it and compare.
 write_signed_marker() {
-    local kver="$1" img="${KERNEL_POP_BOOT:-/boot}/vmlinuz-$1" d
+    local kver="$1" img d
+    img="$(boot_dir)/vmlinuz-$kver"
     d="$(signed_dir)"
     mkdir -p "$d" && chmod 0755 "$d" || return 1
     stat -c '%s %Y' "$img" > "$d/$kver" && chmod 0644 "$d/$kver"
@@ -356,7 +503,7 @@ remove_signed_marker() {
 sign_kernel() {
     local kver="$1" d img tmp
     d="$(mok_dir)"
-    img="${KERNEL_POP_BOOT:-/boot}/vmlinuz-$kver"
+    img="$(boot_dir)/vmlinuz-$kver"
     if [[ ! -f "$img" ]]; then
         log "SIGN WARNING: $img not found — nothing to sign"
         return 1
@@ -397,8 +544,13 @@ sign_kernel() {
 # loads. GRUB reads /boot directly. systemd-boot and kernelstub got the
 # unsigned image copied to the ESP by the dpkg postinst hook, so re-run the
 # sync and check the ESP copy. Best effort: problems are SIGN WARNINGs only.
+#
+# kernelstub only keeps the current and the previous kernel on the ESP, so a
+# kernel that is neither has no ESP copy: nothing to refresh or check. Bare
+# `kernelstub` re-copies both of those from their symlinks.
 sync_signed_to_esp() {
-    local kver="$1" bl esp img="" entry rel
+    local kver="$1" bl esp img="" boot slot
+    boot="$(boot_dir)"
     read -r bl esp <<< "$(detect_bootloader)"
     case "$bl" in
         systemd-boot)
@@ -406,27 +558,32 @@ sync_signed_to_esp() {
                 log "SIGN WARNING: kernel-install not found — the ESP copy of $kver was not refreshed and is still unsigned"
                 return 0
             fi
-            if ! kernel-install add "$kver" "/boot/vmlinuz-$kver" >>"$LOGFILE" 2>&1; then
+            # The initrd is passed explicitly: on initramfs-tools systems
+            # kernel-install does not find it itself, and the refreshed entry
+            # would lose its initrd line.
+            local initrd=()
+            [[ -f "$boot/initrd.img-$kver" ]] && initrd=("$boot/initrd.img-$kver")
+            if ! kernel-install add "$kver" "$boot/vmlinuz-$kver" "${initrd[@]}" >>"$LOGFILE" 2>&1; then
                 log "SIGN WARNING: kernel-install add failed for $kver — the ESP copy may still be unsigned"
                 return 0
             fi
-            entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)" || true
-            if [[ -n "$entry" ]]; then
-                rel="$(sed -n 's/^linux[[:space:]]\{1,\}//p' "$entry" | head -1)"
-                [[ -n "$rel" ]] && img="$esp/${rel#/}"
-            fi
             ;;
         kernelstub)
-            if ! kernelstub >>"$LOGFILE" 2>&1; then
-                log "SIGN WARNING: kernelstub failed — the ESP kernel image may still be unsigned"
+            slot="$(kernelstub_slot_for_kver "$kver")"
+            if [[ -z "$slot" ]]; then
+                log "kernelstub keeps only the current and previous kernel on the ESP; $kver is neither, so it has no ESP copy to refresh"
                 return 0
             fi
-            img="$(compgen -G "$esp/EFI/Pop_OS-*/vmlinuz.efi" | head -1 || true)"
+            if ! kernelstub >>"$LOGFILE" 2>&1; then
+                log "SIGN WARNING: kernelstub failed — the ESP copy of $kver ($slot) may still be unsigned"
+                return 0
+            fi
             ;;
         *)
             return 0
             ;;
     esac
+    img="$(esp_image_for_kver "$bl" "$esp" "$kver")"
     if [[ -z "$img" || ! -f "$img" ]]; then
         log "SIGN WARNING: could not find the ESP kernel image for $kver to check its signature"
     elif sbverify --cert "$(mok_dir)/signing.pem" "$img" >/dev/null 2>&1; then
@@ -452,6 +609,39 @@ secure_boot_enforcing() {
     [[ "$(od -An -t u1 -j4 -N1 "$v" 2>/dev/null | tr -d ' ')" == "1" ]]
 }
 
+# Enrollment state of Kernel Pop's certificate, from `mokutil --test-key`:
+# enrolled | pending (queued, confirmed at MOK Manager on the next boot) |
+# not-enrolled | unknown (mokutil missing or said something else).
+key_enrollment_state() {
+    local out
+    out="$(mokutil --test-key "$(mok_dir)/signing.der" 2>/dev/null)" || true
+    case "$out" in
+        *"is already in the enrollment request"*) echo pending ;;
+        *"is already enrolled"*)                  echo enrolled ;;
+        *"is not enrolled"*)                      echo not-enrolled ;;
+        *)                                        echo unknown ;;
+    esac
+}
+
+# Whether a just-installed kernel will boot, given whether it carries the
+# Kernel Pop signature (1/0). Prints one of:
+#   ok                     Secure Boot is not enforcing, or signed with an enrolled key
+#   pending                signed, key queued: boots once the enrollment is confirmed
+#   blocked unsigned       enforcing, and the kernel is not signed
+#   blocked not-enrolled   enforcing, signed, but the key is neither enrolled nor queued
+#   blocked unknown        enforcing, signed, but the key's state could not be read
+boot_outlook() {
+    local signed="$1" state
+    if ! secure_boot_enforcing; then echo ok; return 0; fi
+    if (( ! signed )); then echo "blocked unsigned"; return 0; fi
+    state="$(key_enrollment_state)"
+    case "$state" in
+        enrolled) echo ok ;;
+        pending)  echo pending ;;
+        *)        echo "blocked $state" ;;
+    esac
+}
+
 # MOK Manager takes 8-16 characters, typed on a US keyboard layout at boot.
 valid_mok_password() {
     local LC_ALL=C
@@ -467,7 +657,8 @@ mok_hash_from_output() {
 # ── Installed kernels ───────────────────────────────────────────────────
 # One kernel version per line, from the vmlinuz-* files in /boot.
 installed_kvers() {
-    local boot="${KERNEL_POP_BOOT:-/boot}" f
+    local boot f
+    boot="$(boot_dir)"
     for f in "$boot"/vmlinuz-*; do
         [[ -e "$f" ]] || continue
         echo "${f#"$boot"/vmlinuz-}"
@@ -489,37 +680,141 @@ deb_allowed() {
     esac
 }
 
-do_install() {
-    local dir="$1"
-    [[ -d "$dir" ]] || die "Not a directory: $dir"
+# ── Verifying a download before it is installed ─────────────────────────
+# The .debs, CHECKSUMS and CHECKSUMS.gpg come from a directory the user owns.
+# Nothing in it is trusted: the set is copied into a root-only directory and
+# verified there (signature, then every package's SHA256), and dpkg installs
+# only those private copies, so nothing that can still be changed after the
+# check is what gets installed.
 
-    # Reject staging directories other users could modify while we run as root
-    local mode owner
-    mode="$(stat -c '%a' "$dir")"
-    owner="$(stat -c '%u' "$dir")"
-    if (( (8#$mode & 8#002) != 0 )); then
-        die "Refusing world-writable package directory: $dir"
+# Ubuntu's kernel PPA key ("Kernel PPA <kernel-ppa@canonical.com>"), which
+# signs every mainline CHECKSUMS file. The keyring is installed next to this
+# script; the fingerprint pins the primary key.
+keyring_path() { echo "${KERNEL_POP_KEYRING:-/usr/lib/kernel-pop/kernel-ppa.gpg}"; }
+signer_fpr()   { echo "${KERNEL_POP_SIGNER_FPR:-60AA7B6F30434AE68E569963E50C6A0917C622B0}"; }
+
+# The uid the app runs as: pkexec says who asked.
+caller_uid() { echo "${PKEXEC_UID:-${SUDO_UID:-0}}"; }
+
+# A download path is used only when it is not a symlink, is owned by the
+# caller (or root) and is not writable by group or others.
+path_trusted() {
+    local p="$1" uid owner mode
+    uid="$(caller_uid)"
+    if [[ -L "$p" ]]; then log "Refusing $p: it is a symlink"; return 1; fi
+    [[ -e "$p" ]] || { log "Refusing $p: it does not exist"; return 1; }
+    owner="$(stat -c '%u' "$p")"
+    mode="$(stat -c '%a' "$p")"
+    if [[ "$owner" != "$uid" && "$owner" != 0 ]]; then
+        log "Refusing $p: owned by uid $owner, not by uid $uid"
+        return 1
     fi
-    log "Package directory owner uid=$owner mode=$mode"
+    if (( (8#$mode & 8#022) != 0 )); then
+        log "Refusing $p: writable by group or others (mode $mode)"
+        return 1
+    fi
+}
 
-    local all_debs=("$dir"/*.deb) debs=() d
-    [[ -f "${all_debs[0]}" ]] || die "No .deb files found in $dir"
-    for d in "${all_debs[@]}"; do
-        deb_allowed "$d" || die "Refusing to install $d: Package field is not linux-image/linux-modules/linux-headers"
-        debs+=("$d")
+# The SHA256 a CHECKSUMS file lists for package file <name>, or nothing.
+# Mainline CHECKSUMS hold sha1sum and sha256sum lines; only 64-hex-digit
+# hashes count.
+checksum_for() {
+    local file="$1" name="$2" h f
+    while read -r h f; do
+        f="${f#\*}"
+        if [[ "$h" =~ ^[0-9a-fA-F]{64}$ && "${f##*/}" == "$name" ]]; then
+            echo "${h,,}"
+            return 0
+        fi
+    done < "$file"
+    return 0
+}
+
+# gpgv's verdict on <dir>/CHECKSUMS.gpg over <dir>/CHECKSUMS, against the
+# installed keyring only (empty private home), requiring a valid signature
+# whose primary key is the pinned fingerprint.
+checksums_signature_ok() {
+    local dir="$1" ring home status line f
+    ring="$(keyring_path)"
+    if [[ ! -f "$ring" ]]; then log "The signing keyring $ring is missing"; return 1; fi
+    if ! command -v gpgv >/dev/null 2>&1; then log "gpgv is not installed"; return 1; fi
+    home="$(mktemp -d "$dir/.gnupg.XXXXXX")" || return 1
+    status="$(gpgv --homedir "$home" --status-fd 1 --keyring "$ring" \
+        "$dir/CHECKSUMS.gpg" "$dir/CHECKSUMS" 2>>"$LOGFILE")" || { rm -rf "$home"; return 1; }
+    rm -rf "$home"
+    while IFS= read -r line; do
+        read -ra f <<< "$line"
+        if [[ "${f[0]:-}" == "[GNUPG:]" && "${f[1]:-}" == "VALIDSIG" && "${f[-1]}" == "$(signer_fpr)" ]]; then
+            return 0
+        fi
+    done <<< "$status"
+    log "The CHECKSUMS signature is not from key $(signer_fpr)"
+    return 1
+}
+
+# Copy <src>'s CHECKSUMS, CHECKSUMS.gpg and .debs into the root-only <dst>,
+# then verify the signature and every package there. Dies on any problem; a
+# package missing from the signed CHECKSUMS is an error, never "unverified".
+stage_verified_debs() {
+    local src="$1" dst="$2" f name want got n=0
+    path_trusted "$src" || die "Refusing the package directory $src"
+    for name in CHECKSUMS CHECKSUMS.gpg; do
+        [[ -f "$src/$name" ]] || die "$name is missing from $src — Kernel Pop installs only packages it can verify"
+        path_trusted "$src/$name" || die "Refusing $src/$name"
+        cat "$src/$name" > "$dst/$name" || die "Could not copy $name"
     done
+    checksums_signature_ok "$dst" \
+        || die "The CHECKSUMS file is not signed by Ubuntu's kernel PPA key — refusing to install"
+    log "Verified: CHECKSUMS is signed by Ubuntu's kernel PPA key"
+    for f in "$src"/*.deb; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        name="${f##*/}"
+        [[ -f "$f" ]] || die "Refusing $f: not a regular file"
+        path_trusted "$f" || die "Refusing $f"
+        want="$(checksum_for "$dst/CHECKSUMS" "$name")"
+        [[ -n "$want" ]] || die "$name is not listed in the signed CHECKSUMS — refusing to install it"
+        cat "$f" > "$dst/$name" || die "Could not copy $name"
+        got="$(sha256sum "$dst/$name" | cut -d' ' -f1)"
+        [[ "$got" == "$want" ]] || die "SHA256 mismatch for $name (expected $want, got $got) — refusing to install"
+        n=$((n + 1))
+    done
+    (( n > 0 )) || die "No .deb files found in $src"
+    log "Verified: $n package(s) match the signed CHECKSUMS"
+}
+
+STAGE_DIR=""
+
+do_install() {
+    local src="$1" boot mods
+    boot="$(boot_dir)"
+    mods="$(modules_dir)"
+    [[ -d "$src" ]] || die "Not a directory: $src"
 
     log "==== Kernel install started ===="
-    log "Package directory: $dir"
+    log "Package directory: $src"
+
+    # Everything below works on the private, verified copy only.
+    STAGE_DIR="$(umask 077 && mktemp -d "${KERNEL_POP_STAGING:-/var/tmp}/kernel-pop-install.XXXXXX")" \
+        || die "Could not create a private staging directory"
+    trap 'rm -rf "$STAGE_DIR"' EXIT
+    stage_verified_debs "$src" "$STAGE_DIR"
+    local dir="$STAGE_DIR"
+
+    local all_debs=("$dir"/*.deb) debs=() d
+    for d in "${all_debs[@]}"; do
+        deb_allowed "$d" || die "Refusing to install ${d##*/}: Package field is not linux-image/linux-modules/linux-headers"
+        debs+=("$d")
+    done
 
     # Version from package metadata, before anything is installed
     local kver
     kver="$(kver_from_debs "$dir")" || die "Could not read a kernel version from the package metadata"
+    valid_kver "$kver" || die "The package metadata gives an invalid kernel version: '$kver'"
     log "Kernel version (from package metadata): $kver"
 
-    # Snapshot /lib/modules so the post-install cross-check is honest
+    # Snapshot the modules directory so the post-install cross-check is honest
     local before_modules
-    before_modules="$(ls -1 /lib/modules 2>/dev/null || true)"
+    before_modules="$(ls -1 "$mods" 2>/dev/null || true)"
 
     log "Installing ${#debs[@]} packages…"
     if ! dpkg -i "${debs[@]}" >>"$LOGFILE" 2>&1; then
@@ -529,11 +824,11 @@ do_install() {
     log "Packages installed"
 
     # Cross-check: the modules directory for $kver must now exist
-    if [[ ! -d "/lib/modules/$kver" ]]; then
-        log "WARNING: /lib/modules/$kver not found after install."
+    if [[ ! -d "$mods/$kver" ]]; then
+        log "WARNING: $mods/$kver not found after install."
         local new_dir
-        new_dir="$(comm -13 <(echo "$before_modules") <(ls -1 /lib/modules) | head -1 || true)"
-        if [[ -n "$new_dir" ]]; then
+        new_dir="$(comm -13 <(echo "$before_modules") <(ls -1 "$mods") | head -1 || true)"
+        if [[ -n "$new_dir" ]] && valid_kver "$new_dir"; then
             log "Using newly appeared modules directory instead: $new_dir"
             kver="$new_dir"
         else
@@ -543,28 +838,37 @@ do_install() {
 
     # dpkg can fail while apt-get -f finds nothing to fix and still exit 0;
     # never declare success unless the kernel image itself is on disk.
-    [[ -f "/boot/vmlinuz-$kver" ]] || die "/boot/vmlinuz-$kver did NOT appear after install — the kernel package did not install correctly"
-    log "Verified: /boot/vmlinuz-$kver exists"
+    [[ -f "$boot/vmlinuz-$kver" ]] || die "$boot/vmlinuz-$kver did NOT appear after install — the kernel package did not install correctly"
+    log "Verified: $boot/vmlinuz-$kver exists"
 
     # ── Signing: only when the signing setup has been done ─────────────
     # A failure is a warning, never an install error (same as DKMS below).
-    local signed_now=0
+    local signed_now=0 key=0
     if signing_key_present; then
+        key=1
         if sign_kernel "$kver"; then
             signed_now=1
         else
             SIGN_FAILED=$((SIGN_FAILED + 1))
-            log "SIGN WARNING: $kver was installed but could NOT be signed"
+            log "$kver was installed but could not be signed (see the SIGN WARNING above)"
         fi
     else
         log "Kernel signing not set up — $kver left unsigned"
     fi
 
+    # Will it boot? Decided now so the boot loader step never makes a kernel
+    # that shim will refuse the default.
+    local outlook why
+    outlook="$(boot_outlook "$signed_now")"
+
     # ── DKMS: build out-of-tree modules before the initramfs ───────────
     # The headers are installed by now. Running this before the initramfs
     # step means modules that belong in the initramfs are included. A failure
     # here is a warning, never an install error.
-    dkms_postcheck "$kver" || log "DKMS WARNING: the DKMS check itself failed"
+    if ! dkms_postcheck "$kver"; then
+        DKMS_FAILED=$((DKMS_FAILED + 1))
+        log "DKMS WARNING: the DKMS check itself failed"
+    fi
 
     # ── Initramfs: generate AND verify ─────────────────────────────────
     local irtool
@@ -572,8 +876,8 @@ do_install() {
     log "Generating initramfs for $kver with $irtool…"
     generate_initramfs "$kver" || die "initramfs generation ($irtool) failed for $kver"
 
-    [[ -f "/boot/initrd.img-$kver" ]] || die "initrd.img-$kver did NOT appear in /boot — DO NOT reboot into this kernel"
-    log "Verified: /boot/initrd.img-$kver exists"
+    [[ -f "$boot/initrd.img-$kver" ]] || die "initrd.img-$kver did NOT appear in $boot — DO NOT reboot into this kernel"
+    log "Verified: $boot/initrd.img-$kver exists"
 
     # ── Boot loader: verify (systemd-boot) or update (GRUB) ─────────────
     local bl esp
@@ -581,14 +885,19 @@ do_install() {
     case "$bl" in
         kernelstub)
             # kernelstub's postinst hook (/etc/kernel/postinst.d/zz-kernelstub)
-            # ran during dpkg. Entries are Pop_OS-current/oldkern, not
-            # per-version, so verify the kernel image it copies to the ESP.
+            # ran during dpkg. It copies only the current and previous kernels
+            # to the ESP, so verify the copy that belongs to $kver, if any.
             log "kernelstub (Pop!_OS) detected (ESP: $esp) — verifying ESP kernel image…"
-            local efi_img
-            efi_img="$(compgen -G "$esp/EFI/Pop_OS-*/vmlinuz.efi" | head -1 || true)"
-            [[ -n "$efi_img" ]] || die "No EFI/Pop_OS-*/vmlinuz.efi under $esp after install — kernelstub did not sync. Try 'kernelstub -p' — DO NOT reboot expecting the new kernel"
-            log "Verified: kernelstub image $efi_img exists"
-            if (( signed_now )); then sync_signed_to_esp "$kver"; fi
+            local slot efi_img
+            slot="$(kernelstub_slot_for_kver "$kver")"
+            if [[ -z "$slot" ]]; then
+                log "WARNING: kernelstub keeps only the current and previous kernel on the ESP, and $kver is neither: it is installed but will not be in the boot menu"
+            else
+                efi_img="$(esp_image_for_kver kernelstub "$esp" "$kver")"
+                [[ -n "$efi_img" ]] || die "No EFI/Pop_OS-*/$slot under $esp after install — kernelstub did not sync. Try 'kernelstub -p' — DO NOT reboot expecting the new kernel"
+                log "Verified: kernelstub image $efi_img exists"
+                if (( signed_now )); then sync_signed_to_esp "$kver"; fi
+            fi
             ;;
         systemd-boot)
             # kernel-install already ran automatically via the dpkg postinst
@@ -597,7 +906,7 @@ do_install() {
             # same philosophy as the initramfs check above.
             log "systemd-boot detected (ESP: $esp) — verifying boot menu entry…"
             local entry
-            entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)" || true
+            entry="$(sdboot_entry_for_kver "$esp" "$kver")"
             [[ -n "$entry" ]] || die "No systemd-boot entry appeared for $kver in $esp/loader/entries — DO NOT reboot expecting it in the menu"
             log "Verified: boot menu entry $entry exists"
             if (( signed_now )); then sync_signed_to_esp "$kver"; fi
@@ -614,31 +923,35 @@ do_install() {
             # correctly, and the machine still reboots into the OLD kernel,
             # silently — doubly so with GRUB_TIMEOUT_STYLE=hidden, where
             # there's no visible menu to notice the stale selection from.
-            if grep -qE '^GRUB_DEFAULT=saved' /etc/default/grub 2>/dev/null; then
-                # Remember the previous default so it can be put back if the
-                # new one does not verify.
+            if grep -qE '^GRUB_DEFAULT=saved' "${KERNEL_POP_GRUB_DEFAULTS:-/etc/default/grub}" 2>/dev/null; then
                 local prev_saved
                 prev_saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || prev_saved=""
                 log "Previous GRUB default: ${prev_saved:-<none>}"
-                log "GRUB_DEFAULT=saved detected — pointing the saved default at $kver…"
-                local entry_path
-                entry_path="$(grub_entry_path_for_kver "$kver")" || entry_path=""
-                if [[ -n "$entry_path" ]]; then
-                    if grub-set-default "$entry_path" >>"$LOGFILE" 2>&1; then
-                        local saved
-                        saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || saved=""
-                        if [[ "$saved" == "$entry_path" ]]; then
-                            log "Verified: saved_entry now points to $kver"
+                if [[ "$outlook" == blocked* ]]; then
+                    log "GRUB_DEFAULT=saved detected — the saved default stays as it is, because $kver will not boot while Secure Boot is enforcing"
+                else
+                    # Remember the previous default so it can be put back if
+                    # the new one does not verify.
+                    log "GRUB_DEFAULT=saved detected — pointing the saved default at $kver…"
+                    local entry_path
+                    entry_path="$(grub_entry_path_for_kver "$kver")" || entry_path=""
+                    if [[ -n "$entry_path" ]]; then
+                        if grub-set-default "$entry_path" >>"$LOGFILE" 2>&1; then
+                            local saved
+                            saved="$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')" || saved=""
+                            if [[ "$saved" == "$entry_path" ]]; then
+                                log "Verified: saved_entry now points to $kver"
+                            else
+                                log "WARNING: saved_entry is '$saved' after grub-set-default, expected '$entry_path' — verify manually before rebooting"
+                                restore_grub_default "$prev_saved"
+                            fi
                         else
-                            log "WARNING: saved_entry is '$saved' after grub-set-default, expected '$entry_path' — verify manually before rebooting"
+                            log "WARNING: grub-set-default failed for $entry_path — $kver is installed but may not be the default boot entry"
                             restore_grub_default "$prev_saved"
                         fi
                     else
-                        log "WARNING: grub-set-default failed for $entry_path — $kver is installed but may not be the default boot entry"
-                        restore_grub_default "$prev_saved"
+                        log "WARNING: could not find a GRUB menu entry for $kver in grub.cfg — saved default left unchanged, verify manually before rebooting"
                     fi
-                else
-                    log "WARNING: could not find a GRUB menu entry for $kver in grub.cfg — saved default left unchanged, verify manually before rebooting"
                 fi
             fi
             ;;
@@ -648,59 +961,98 @@ do_install() {
     esac
 
     if (( DKMS_FAILED > 0 )); then
-        log "DKMS WARNING: $DKMS_FAILED DKMS problem(s) for $kver — the kernel is installed, but out-of-tree modules (such as the NVIDIA driver) may be missing after reboot. See the DKMS lines above."
+        log "DKMS SUMMARY: $DKMS_FAILED DKMS problem(s) for $kver — the kernel is installed, but out-of-tree modules (such as the NVIDIA driver) may be missing after reboot. See the DKMS lines above."
     fi
-    if (( SIGN_FAILED > 0 )); then
-        if secure_boot_enforcing; then
-            log "==== Done. Kernel $kver installed with initramfs verified, but it is NOT signed and Secure Boot is enforcing: it will not boot until it is signed. ===="
-            return 0
-        fi
-        log "SIGN WARNING: $kver is installed but unsigned. Secure Boot is not enforcing now, so it boots; sign it before turning Secure Boot on."
-    fi
-    log "==== Done. Kernel $kver installed with initramfs verified. Reboot when ready. ===="
+
+    case "$outlook" in
+        ok)
+            if (( SIGN_FAILED > 0 )); then
+                log "SIGN SUMMARY: $kver is installed but unsigned. Secure Boot is not enforcing now, so it boots; sign it before turning Secure Boot on."
+            fi
+            log "==== Done. Kernel $kver installed with initramfs verified. Reboot when ready. ===="
+            ;;
+        pending)
+            log "BOOT PENDING: $kver is signed, but the signing key is still waiting for enrollment. On the next reboot the blue MOK Manager screen appears: choose Enroll MOK, Continue, Yes, then type your password. Skip it and $kver will not boot while Secure Boot is enforcing."
+            log "==== Done. Kernel $kver installed with initramfs verified. Confirm the key enrollment at the next reboot. ===="
+            ;;
+        *)
+            case "$outlook" in
+                "blocked unsigned")
+                    if (( key )); then
+                        why="it could not be signed (see the SIGN WARNING above); try Sign on the System tab"
+                    else
+                        why="it is unsigned and kernel signing is not set up; use Set Up Signing on the System tab, or turn Secure Boot off"
+                    fi ;;
+                "blocked not-enrolled")
+                    why="it is signed, but the signing key is not enrolled; use Set Up Signing on the System tab again and confirm the enrollment at the next reboot" ;;
+                *)
+                    why="it is signed, but Kernel Pop could not confirm that the signing key is enrolled (mokutil gave no answer)" ;;
+            esac
+            log "BOOT BLOCKED: $kver will not boot while Secure Boot is enforcing: $why."
+            keep_next_boot_safe "$bl" "$esp" "$kver"
+            log "==== Done. Kernel $kver installed with initramfs verified, but it will NOT boot while Secure Boot is enforcing. ===="
+            ;;
+    esac
+}
+
+# After installing a kernel that will not boot, make sure the next restart
+# does not try it: GRUB and systemd-boot put the newest kernel first, so the
+# running kernel (which evidently boots) is selected for the next boot only.
+keep_next_boot_safe() {
+    local bl="$1" esp="$2" kver="$3" running
+    running="$(uname -r)"
+    if [[ "$running" == "$kver" ]]; then return 0; fi
+    case "$bl" in
+        grub|systemd-boot)
+            if set_boot_once "$bl" "$esp" "$running"; then
+                log "The next restart starts the running kernel $running once, so it stays safe. After that the boot menu may pick $kver again: pick $running there until $kver can boot."
+            else
+                log "WARNING: could not select the running kernel $running for the next boot — pick it in the boot menu, not $kver"
+            fi
+            ;;
+        *)
+            log "Pick the running kernel $running in the boot menu, not $kver, until $kver can boot."
+            ;;
+    esac
 }
 
 # Boot a different installed kernel on the NEXT boot only; the saved default
 # is left alone. Does not reboot.
 do_boot_once() {
-    local kver="$1"
+    local kver="$1" boot
+    boot="$(boot_dir)"
     [[ -n "$kver" ]] || die "No kernel version specified"
     valid_kver "$kver" || die "Invalid kernel version string: '$kver'"
-    [[ -e "/boot/vmlinuz-$kver" ]] || die "Kernel $kver is not installed (no /boot/vmlinuz-$kver)"
+    [[ -e "$boot/vmlinuz-$kver" ]] || die "Kernel $kver is not installed (no $boot/vmlinuz-$kver)"
 
     local bl esp
     read -r bl esp <<< "$(detect_bootloader)"
-    case "$bl" in
-        grub)
-            local entry_path
-            entry_path="$(grub_entry_path_for_kver "$kver")" \
-                || die "Could not find a GRUB menu entry for $kver in grub.cfg"
-            grub-reboot "$entry_path" >>"$LOGFILE" 2>&1 || die "grub-reboot failed for $entry_path"
-            log "GRUB will boot $kver on the next boot only ($entry_path)"
-            ;;
-        systemd-boot)
-            local entry id
-            entry="$(find "$esp/loader/entries" -name "*-${kver}.conf" 2>/dev/null | head -1)" || true
-            [[ -n "$entry" ]] || die "No systemd-boot entry found for $kver in $esp/loader/entries"
-            id="$(basename "$entry")"
-            bootctl set-oneshot "$id" >>"$LOGFILE" 2>&1 || die "bootctl set-oneshot failed for $id"
-            log "systemd-boot will boot $kver on the next boot only ($id)"
-            ;;
-        kernelstub)
-            die "One-time boot selection is not supported with kernelstub (Pop!_OS); use the boot menu"
-            ;;
-        *)
-            die "Could not detect a supported boot loader — use your boot menu to pick $kver"
-            ;;
-    esac
+    set_boot_once "$bl" "$esp" "$kver" || die "Could not select $kver for the next boot"
+}
+
+# Installed (or config-files) packages that belong to exactly kernel <kver>,
+# one per line: every linux-* package whose name ends in "-<kver>", plus the
+# versioned headers base package (linux-headers-<kver without -generic>).
+# Compared as plain strings, so neither another kernel whose version merely
+# contains <kver> (17.1.3-… for 7.1.3-…) nor a glob in it can match.
+packages_for_kver() {
+    local kver="$1" base="${1%-generic}" st pkg
+    while read -r st pkg; do
+        [[ -n "$pkg" && "${st:1:1}" != "n" ]] || continue
+        if [[ "$pkg" == linux-*"-$kver" || "$pkg" == "linux-headers-$base" ]]; then
+            echo "$pkg"
+        fi
+    done < <(dpkg-query -W -f '${db:Status-Abbrev} ${Package}\n' 'linux-*' 2>/dev/null || true)
 }
 
 do_remove() {
-    local kver="$1"
+    local kver="$1" boot mods
+    boot="$(boot_dir)"
+    mods="$(modules_dir)"
     [[ -n "$kver" ]] || die "No kernel version specified"
     valid_kver "$kver" || die "Invalid kernel version string: '$kver'"
-    [[ -e "/boot/vmlinuz-$kver" || -d "/lib/modules/$kver" ]] \
-        || die "Kernel $kver is not installed (no /boot/vmlinuz-$kver or /lib/modules/$kver)"
+    [[ -e "$boot/vmlinuz-$kver" || -d "$mods/$kver" ]] \
+        || die "Kernel $kver is not installed (no $boot/vmlinuz-$kver or $mods/$kver)"
 
     local running
     running="$(uname -r)"
@@ -708,14 +1060,8 @@ do_remove() {
 
     log "==== Kernel removal started: $kver ===="
 
-    # Every package whose name embeds this exact version string
     local pkgs
-    pkgs="$(dpkg-query -W -f '${Package}\n' "linux-*${kver}*" 2>/dev/null | sort -u || true)"
-    # Also catch the versioned headers base package (no -generic suffix)
-    local base="${kver%-generic}"
-    local base_pkgs
-    base_pkgs="$(dpkg-query -W -f '${Package}\n' "linux-headers-${base}" 2>/dev/null || true)"
-    pkgs="$(printf '%s\n%s\n' "$pkgs" "$base_pkgs" | sort -u | sed '/^$/d')"
+    pkgs="$(packages_for_kver "$kver" | sort -u)"
 
     if [[ -n "$pkgs" ]]; then
         # Purging a stock kernel can drag out the linux-generic /
@@ -737,9 +1083,9 @@ do_remove() {
         apt-get purge -y $pkgs >>"$LOGFILE" 2>&1 || die "apt-get purge failed"
     else
         log "No packages own this kernel — removing files directly"
-        rm -f "/boot/vmlinuz-$kver" "/boot/initrd.img-$kver" \
-              "/boot/System.map-$kver" "/boot/config-$kver"
-        rm -rf "/lib/modules/$kver"
+        rm -f "$boot/vmlinuz-$kver" "$boot/initrd.img-$kver" \
+              "$boot/System.map-$kver" "$boot/config-$kver"
+        rm -rf "${mods:?}/${kver:?}"
     fi
 
     # ── Boot loader: clean up (systemd-boot) or update (GRUB) ───────────
@@ -850,7 +1196,7 @@ do_setup_signing() {
             sync_signed_to_esp "$v"
             signed=$((signed + 1))
         else
-            log "SIGN WARNING: $v could not be signed — continuing with the rest"
+            log "$v could not be signed (see the SIGN WARNING above) — continuing with the rest"
             failed=$((failed + 1))
         fi
     done < <(installed_kvers)
@@ -861,10 +1207,11 @@ do_setup_signing() {
 }
 
 do_sign() {
-    local kver="$1"
+    local kver="$1" boot
+    boot="$(boot_dir)"
     [[ -n "$kver" ]] || die "No kernel version specified"
     valid_kver "$kver" || die "Invalid kernel version string: '$kver'"
-    [[ -f "/boot/vmlinuz-$kver" ]] || die "Kernel $kver is not installed (no /boot/vmlinuz-$kver)"
+    [[ -f "$boot/vmlinuz-$kver" ]] || die "Kernel $kver is not installed (no $boot/vmlinuz-$kver)"
     signing_key_present || die "Kernel signing is not set up — run the signing setup first"
     sign_kernel "$kver" || die "Signing $kver failed — the kernel image was left unchanged"
     sync_signed_to_esp "$kver"
