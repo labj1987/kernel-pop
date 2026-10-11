@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+# One release run per tag at a time; a run in progress is never cancelled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 defaults:
   run:
     shell: bash
@@ -21,6 +26,7 @@ defaults:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -60,14 +66,29 @@ jobs:
 
       # The GTK headers the build needs and the packaging tools build-appimage.sh uses. This is
       # the only privileged step: the AppImage build below runs as the runner user.
+      # Also the tools the checks below need, so none of their tests is skipped.
       - name: Install build dependencies
         run: |
-          sudo apt-get update -qq || true
+          sudo apt-get update -qq
           sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config \
-            zsync wget file desktop-file-utils
+            zsync wget file desktop-file-utils \
+            shellcheck sbsigntool openssl systemd-boot-efi gnupg gpgv
+
+      # The same checks as CI, so a tag on a commit CI never passed cannot release.
+      - name: Script syntax and ShellCheck
+        run: |
+          bash -n scripts/privileged-install.sh
+          bash -n build-appimage.sh
+          shellcheck -S warning scripts/privileged-install.sh scripts/tests/test-privileged.sh build-appimage.sh
+
+      - name: Privileged-script helper tests
+        run: KERNEL_POP_REQUIRE_ALL_TESTS=1 bash scripts/tests/test-privileged.sh
 
       - name: cargo test
         run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Release notes script self-test
         run: python3 scripts/release_notes.py --self-test
@@ -99,6 +120,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

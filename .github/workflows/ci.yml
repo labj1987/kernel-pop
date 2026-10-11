@@ -8,9 +8,15 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or PR supersedes a run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       # Every action is pinned to a full commit SHA: a tag such as `v3` can be moved to other
       # code, a SHA cannot. The trailing comment names the release the SHA is; Dependabot
@@ -24,10 +30,13 @@ jobs:
           components: clippy
       - name: Toolchain matches rust-toolchain.toml
         run: grep -q '^channel = "1.96.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.96\.0 '
+      # A failed index refresh fails the job: a stale index could install other versions, or
+      # leave a test tool out so its tests are skipped.
       - name: Install GTK4 / libadwaita headers
         run: |
-          sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config
+          sudo apt-get update -qq
+          # gpgv: the CHECKSUMS signature tests run it.
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config gpgv
       - name: Build
         run: cargo build --locked
       - name: Test
@@ -37,6 +46,7 @@ jobs:
 
   scripts:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,12 +57,13 @@ jobs:
           bash -n build-appimage.sh
       - name: ShellCheck
         run: |
-          sudo apt-get update -qq || true
+          sudo apt-get update -qq
           # sbsigntool/openssl and an EFI binary (systemd-boot-efi) let the
-          # signing tests run instead of being skipped.
-          sudo apt-get install -y -qq shellcheck sbsigntool openssl systemd-boot-efi
+          # signing tests run, gnupg/gpgv the download verification tests.
+          sudo apt-get install -y -qq shellcheck sbsigntool openssl systemd-boot-efi gnupg gpgv
           shellcheck -S warning scripts/privileged-install.sh scripts/tests/test-privileged.sh build-appimage.sh
+      # KERNEL_POP_REQUIRE_ALL_TESTS turns every skipped test group into a failure.
       - name: Privileged-script helper tests
-        run: bash scripts/tests/test-privileged.sh
+        run: KERNEL_POP_REQUIRE_ALL_TESTS=1 bash scripts/tests/test-privileged.sh
       - name: AppStream releases match the changelog
         run: python3 scripts/sync_appdata_releases.py --check && python3 scripts/release_notes.py --self-test && python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d\" -f2)" > /dev/null
