@@ -14,7 +14,7 @@ use crate::kernelorg::{fetch_releases, fetch_signature, url_file_name, Moniker, 
 use crate::source::{inspect, private_copy, Tarball};
 use crate::system::{
     compare_to_running, format_bytes, health_summary, install_blocker, install_warnings,
-    prune_candidates, query_system, BootEntry, KernelSignature, KernelSigning, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
+    prune_candidates, query_system, BootEntry, KernelSignature, KernelSigning, KeyEnrollment, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
 use crate::verify::{verify_tarball, Signer};
 
@@ -916,11 +916,16 @@ pub fn build_ui(app: &Application) {
 
                     // Boot safety rows
                     secure_boot_row.set_subtitle(secure_boot_subtitle(info.secure_boot, info.kernel_signing));
-                    signing_row.set_subtitle(signing_subtitle(info.kernel_signing));
-                    setup_signing_btn.set_visible(matches!(
-                        info.kernel_signing,
-                        KernelSigning::NoKey | KernelSigning::KeyNotEnrolled
-                    ));
+                    let dkms_note = match info.dkms_key {
+                        Some(KeyEnrollment::NotEnrolled) => " The DKMS key (NVIDIA driver and other out-of-tree modules) is not enrolled; Set Up Signing enrolls it too.",
+                        Some(KeyEnrollment::Pending) => " The DKMS key (NVIDIA driver) is waiting for enrollment too.",
+                        _ => "",
+                    };
+                    signing_row.set_subtitle(&format!("{}{dkms_note}", signing_subtitle(info.kernel_signing)));
+                    setup_signing_btn.set_visible(
+                        matches!(info.kernel_signing, KernelSigning::NoKey | KernelSigning::KeyNotEnrolled)
+                            || info.dkms_key == Some(KeyEnrollment::NotEnrolled),
+                    );
 
                     // Disk rows
                     match info.free_boot_bytes {
@@ -1319,7 +1324,7 @@ pub fn build_ui(app: &Application) {
 
             let dialog = AlertDialog::builder()
                 .heading("Set up kernel signing")
-                .body("Choose a one-time password for enrolling Kernel Pop's signing key. On the next reboot a blue MOK Manager screen appears: choose Enroll MOK and type this same password once to finish.")
+                .body("Choose a one-time password for enrolling Kernel Pop's signing key, together with the DKMS key that the NVIDIA driver and other out-of-tree modules are signed with. Any key another app has already queued is kept in the same request. On the next reboot a blue MOK Manager screen appears: choose Enroll MOK and type this password once; it enrolls all of them. A password chosen earlier, here or in another app, no longer works. Turn Secure Boot on only after this screen shows the keys as enrolled.")
                 .build();
             dialog.set_extra_child(Some(&fields));
             dialog.add_responses(&[("cancel", "Cancel"), ("setup", "Set Up")]);

@@ -49,6 +49,7 @@ ARG="${2:-}"
 # Test overrides (pkexec clears the environment, so they never reach a real
 # run): KERNEL_POP_BOOT, KERNEL_POP_MODULES, KERNEL_POP_ROOTFS,
 # KERNEL_POP_MOK_DIR, KERNEL_POP_SIGNED_DIR, KERNEL_POP_STAGING,
+# KERNEL_POP_EFIVARS, KERNEL_POP_DKMS_MOK,
 # KERNEL_POP_GRUB_CFG, KERNEL_POP_GRUB_DEFAULTS, KERNEL_POP_DKMS_TREE.
 boot_dir()    { echo "${KERNEL_POP_BOOT:-/boot}"; }
 modules_dir() { echo "${KERNEL_POP_MODULES:-/lib/modules}"; }
@@ -1153,30 +1154,140 @@ missing_signing_packages() {
     echo "${pkgs[*]}"
 }
 
-MOK_HASH_FILE=""
+# ── Key enrollment ──────────────────────────────────────────────────────
+# shim keeps ONE pending enrollment request (MokNew) with ONE password
+# (MokAuth). `mokutil --import` adds to a waiting request but replaces its
+# password, and skips a key that is already waiting without touching the
+# password. So when another tool (Green Light, for the DKMS key) has
+# queued a key with its own password, and this setup then queues ours, only
+# the second password works at MOK Manager, and a mistyped first password
+# enrolls nothing. Instead, every setup rebuilds the whole request: the
+# certificates already waiting (read from MokNew), Kernel Pop's key and the
+# DKMS module-signing key, under the password chosen now, and says so.
+MOK_GUID="605dab50-e046-4300-abb6-3dd810dd8b23"
+efivars_dir()  { echo "${KERNEL_POP_EFIVARS:-/sys/firmware/efi/efivars}"; }
+dkms_mok_der() { echo "${KERNEL_POP_DKMS_MOK:-/var/lib/shim-signed/mok/MOK.der}"; }
+# Fingerprints (SHA1, lowercase hex) of the keys the last setup queued, for
+# the app: MokNew itself is readable by root only.
+mok_pending_file() { echo "$(dirname "$(mok_dir)")/mok-pending"; }
 
-# Queue signing.der for enrollment at the next boot. The password goes from
-# a variable through bash builtins into mokutil's stdin and the hash into a
-# root-only temp file; it never appears in argv or the log.
+# Write the X.509 certificates of the waiting request (MokNew) to
+# <dir>/pending-N.der. Returns 0 (nothing waiting, or all written), 3 when
+# the request holds entries that are not certificates (hashes), which this
+# cannot carry over, 2 when the variable cannot be read.
+pending_mok_certs() {
+    local dir="$1" var
+    var="$(efivars_dir)/MokNew-$MOK_GUID"
+    [[ -e "$var" ]] || return 0
+    perl -e '
+        use strict; use warnings;
+        my ($file, $dir) = @ARGV;
+        open(my $fh, "<:raw", $file) or exit 2;
+        local $/; my $raw = <$fh>; close $fh;
+        my $data = substr($raw, 4);   # efivarfs: 4 attribute bytes first
+        my $x509 = pack("H*", "a159c0a5e494a74a87b5ab155c2bf072");
+        my ($off, $n, $other) = (0, 0, 0);
+        while ($off < length $data) {
+            exit 2 if length($data) - $off < 28;
+            my $type = substr($data, $off, 16);
+            my ($lsize, $hsize, $ssize) = unpack("V3", substr($data, $off + 16, 12));
+            exit 2 if $lsize < 28 || $off + $lsize > length $data || $ssize < 16;
+            my $e = $off + 28 + $hsize;
+            while ($e + $ssize <= $off + $lsize) {
+                if ($type eq $x509) {
+                    $n++;
+                    open(my $out, ">:raw", "$dir/pending-$n.der") or exit 2;
+                    print {$out} substr($data, $e + 16, $ssize - 16);
+                    close $out or exit 2;
+                } else { $other++ }
+                $e += $ssize;
+            }
+            $off += $lsize;
+        }
+        exit($other ? 3 : 0);
+    ' "$var" "$dir"
+}
+
+# SHA1 fingerprint of a DER certificate, lowercase hex without colons.
+cert_sha1() {
+    openssl x509 -inform DER -in "$1" -noout -fingerprint -sha1 2>/dev/null \
+        | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f'
+}
+
+cert_cn() {
+    openssl x509 -inform DER -in "$1" -noout -subject -nameopt multiline 2>/dev/null \
+        | sed -n 's/^ *commonName *= *//p' | head -1
+}
+
+# Already trusted without enrollment: in the MOK list, db, or built in.
+cert_trusted() {
+    mokutil --test-key "$1" 2>/dev/null | grep -qiE 'already enrolled|already in db|built-in'
+}
+
+# Queue every key that still needs enrolling as one request under <password>.
 queue_key_enrollment() {
-    local pw="$1" d test hash
-    d="$(mok_dir)"
-    test="$(mokutil --test-key "$d/signing.der" 2>/dev/null)" || true
-    if [[ "$test" == *"is already"* ]]; then
-        log "The signing key is already enrolled or waiting for enrollment — nothing to queue"
+    local pw="$1" work hash f fp cn n=0 rc=0
+    local -a ders=() names=() fps=()
+    work="$(umask 077 && mktemp -d)" || die "Could not create a private temp directory"
+    MOK_WORK_DIR="$work"
+    trap 'rm -rf "$MOK_WORK_DIR"' EXIT
+    mkdir "$work/pending"
+    pending_mok_certs "$work/pending" || rc=$?
+    case $rc in
+        0) ;;
+        3) die "Another enrollment request is waiting that holds more than certificates, which Kernel Pop cannot carry over. Finish it at the next reboot (or cancel it with 'mokutil --revoke-import'), then set up signing again." ;;
+        *) die "The waiting enrollment request could not be read, so Kernel Pop will not replace it. Reboot to finish it first, then set up signing again." ;;
+    esac
+    add_cert() {   # <der> <why>
+        local der="$1" why="$2" fp c
+        fp="$(cert_sha1 "$der")"
+        [[ -n "$fp" ]] || { log "Skipping $der: not a readable certificate"; return 0; }
+        for c in "${fps[@]}"; do [[ "$c" == "$fp" ]] && return 0; done
+        cn="$(cert_cn "$der")"
+        if cert_trusted "$der"; then
+            log "Already enrolled: ${cn:-$der}"
+            return 0
+        fi
+        n=$((n + 1))
+        cp "$der" "$work/key-$n.der"
+        ders+=("$work/key-$n.der"); fps+=("$fp"); names+=("${cn:-$der}")
+        log "To enroll: ${cn:-$der} ($why)"
+    }
+    for f in "$work"/pending/*.der; do
+        [[ -e "$f" ]] || continue
+        add_cert "$f" "already waiting for enrollment"
+    done
+    add_cert "$(mok_dir)/signing.der" "Kernel Pop's kernel-signing key"
+    if [[ -f "$(dkms_mok_der)" ]]; then
+        add_cert "$(dkms_mok_der)" "the DKMS module-signing key, so modules such as the NVIDIA driver load with Secure Boot on"
+    fi
+
+    if (( n == 0 )); then
+        if [[ -e "$(efivars_dir)/MokNew-$MOK_GUID" ]]; then
+            mokutil --revoke-import >>"$LOGFILE" 2>&1 || true
+        fi
+        rm -f "$(mok_pending_file)"
+        log "Every key is already enrolled — nothing to queue"
         return 0
     fi
+
     hash="$(printf '%s\n%s\n' "$pw" "$pw" | mokutil --generate-hash 2>/dev/null | mok_hash_from_output)"
     [[ -n "$hash" ]] || die "mokutil --generate-hash did not produce a password hash"
-    MOK_HASH_FILE="$(umask 077 && mktemp)" || die "Could not create a temp file for the password hash"
-    trap 'rm -f "$MOK_HASH_FILE"' EXIT
-    printf '%s\n' "$hash" > "$MOK_HASH_FILE"
-    if ! mokutil --import "$d/signing.der" --hash-file "$MOK_HASH_FILE" >>"$LOGFILE" 2>&1; then
-        rm -f "$MOK_HASH_FILE"
-        die "mokutil --import failed — the key was not queued for enrollment"
+    (umask 077 && printf '%s\n' "$hash" > "$work/hash")
+    hash=""
+    # Replace the waiting request (its certificates are in the list above).
+    if [[ -e "$(efivars_dir)/MokNew-$MOK_GUID" ]]; then
+        mokutil --revoke-import >>"$LOGFILE" 2>&1 \
+            || die "Could not replace the waiting enrollment request (mokutil --revoke-import failed)"
     fi
-    rm -f "$MOK_HASH_FILE"
-    log "Enrollment queued. On the next reboot a blue MOK Manager screen appears: choose Enroll MOK, Continue, Yes, then type the password you chose."
+    if ! mokutil --import "${ders[@]}" --hash-file "$work/hash" >>"$LOGFILE" 2>&1; then
+        die "mokutil --import failed — the keys were not queued for enrollment"
+    fi
+    printf '%s\n' "${fps[@]}" > "$work/fps"
+    chmod 0644 "$work/fps"
+    mv -f "$work/fps" "$(mok_pending_file)" || log "SIGN WARNING: could not record the queued keys for the app"
+    log "Enrollment queued for ${#ders[@]} key(s): $(IFS=';'; echo "${names[*]}" | sed 's/;/, /g')."
+    log "On the next reboot a blue MOK Manager screen appears: choose Enroll MOK, Continue, Yes, then type the password you chose here. That one password enrolls all of these keys; a password chosen earlier, here or in another app, no longer works."
 }
 
 # One-time setup: tools, key, sign every installed kernel, queue enrollment.

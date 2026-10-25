@@ -4,6 +4,27 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.1.1 — 2026-10-25
+
+**Fixed: Secure Boot keys not enrolling.** When another app had also queued a key for
+enrollment (for example the key the NVIDIA driver's modules are signed with), the two
+requests ended up needing different passwords, the blue MOK Manager screen accepted
+neither key, and with Secure Boot on the kernel refused to start ("you need to load the
+kernel first").
+
+- Set Up Signing now puts every key that needs enrolling into one request with one
+  password: Kernel Pop's key, the key DKMS signs the NVIDIA driver and other out-of-tree
+  modules with, and any key another app already queued. At the next reboot, type the
+  password you chose last; it enrolls all of them.
+- Setting up again replaces the password instead of quietly keeping the old one.
+- The System tab now shows a key that is waiting for enrollment as waiting (it showed "not
+  enrolled" before, which invited setting up again with a new password), and shows whether
+  the DKMS key is enrolled.
+- With Secure Boot on, installing warns when the DKMS key is not enrolled, since the
+  NVIDIA driver would not load.
+
+Turn Secure Boot on only after the System tab shows the keys as enrolled.
+
 ## 2.1.0 — 2026-10-24
 
 **New configuration: Tuned for this machine.** It builds only the drivers this computer

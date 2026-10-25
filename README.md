@@ -144,9 +144,14 @@ refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
    one-time password (8-16 characters). Kernel Pop installs `sbsigntool`,
    `openssl` and `mokutil` if they are missing, creates a key in
    `/var/lib/kernel-pop/mok/`, signs every installed kernel and queues the
-   key for enrollment with `mokutil --import`.
+   key for enrollment, together with the DKMS module-signing key (what the
+   NVIDIA driver is signed with) and any key another app already queued:
+   shim keeps one request with one password, so they all go in one request
+   under the password you chose here.
 2. Reboot. A blue MOK Manager screen appears: choose Enroll MOK, Continue,
-   Yes, and type the password once.
+   Yes, and type the password once. It enrolls all the keys.
+3. Back in Linux, check that the System tab shows the keys as enrolled,
+   and only then turn Secure Boot on.
 
 From then on every kernel Kernel Pop installs is signed (`sbsign`, then
 `sbverify` before the image in `/boot` is replaced), whether Secure Boot is

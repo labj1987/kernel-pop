@@ -465,7 +465,10 @@ else
         (
             calls="$tmp/mokutil-calls"
             : > "$calls"
-            mokutil() {
+            export KERNEL_POP_EFIVARS="$tmp/efivars-empty" KERNEL_POP_DKMS_MOK="$tmp/no-dkms-key.der"
+            mkdir -p "$KERNEL_POP_EFIVARS"
+            mokutil() { mokutil_stub "$@"; }
+            mokutil_stub() {
                 echo "ARGS: $*" >> "$calls"
                 case "$1" in
                     --test-key) echo "$2 is not enrolled" ;;
@@ -474,8 +477,9 @@ else
                         [[ "$a" == "$b" ]] || return 1
                         echo "input password:"; echo '$6$teststalt$fakehash' ;;
                     --import)
-                        [[ "$3" == "--hash-file" && "$(stat -c '%a' "$4")" == "600" ]] || return 1
-                        cat "$4" >> "$calls"; echo "$4" > "$tmp/hashfile-path" ;;
+                        local hf="${*: -1}"
+                        [[ "${*: -2:1}" == "--hash-file" && "$(stat -c '%a' "$hf")" == "600" ]] || return 1
+                        cat "$hf" >> "$calls"; echo "$hf" > "$tmp/hashfile-path" ;;
                 esac
             }
             apt-get() { echo "apt-get should not run: tools are installed" >> "$calls"; return 1; }
@@ -489,7 +493,8 @@ else
             grep -q "Enrollment queued" <<< "$out" || { echo "FAIL: setup should queue the enrollment"; r=1; }
             grep -q "Secret-pw1" "$calls" && { echo "FAIL: the password reached mokutil's argv"; r=1; }
             grep -q "Secret-pw1" <<< "$out" && { echo "FAIL: the password was printed"; r=1; }
-            grep -q -- "--import $KERNEL_POP_MOK_DIR/signing.der --hash-file" "$calls" || { echo "FAIL: mokutil --import call"; r=1; }
+            grep -qE -- "--import [^ ]*/key-1.der --hash-file" "$calls" || { echo "FAIL: mokutil --import call: $(cat "$calls")"; r=1; }
+            [[ "$(cat "$(dirname "$KERNEL_POP_MOK_DIR")/mok-pending")" == "$(cert_sha1 "$KERNEL_POP_MOK_DIR/signing.der")" ]] || { echo "FAIL: the queued key was not recorded for the app"; r=1; }
             grep -qF '$6$teststalt$fakehash' "$calls" || { echo "FAIL: the hash file did not hold the hash"; r=1; }
             [[ -e "$(cat "$tmp/hashfile-path")" ]] && { echo "FAIL: the hash file was left behind"; r=1; }
             grep -q "apt-get should not run" "$calls" && { echo "FAIL: apt-get ran with every tool installed"; r=1; }
@@ -502,6 +507,93 @@ else
             [[ -s "$calls" ]] && { echo "FAIL: setup ran mokutil despite a bad password"; r=1; }
             exit "$r"
         ) || bad "do_setup_signing end-to-end checks"
+
+        # One request, one password: keys another tool already queued are
+        # carried over, the DKMS key is added, enrolled keys are left out.
+        (
+            r=0
+            fail() { echo "FAIL: $*"; r=1; }
+            calls="$tmp/enroll-calls"
+            mkcert() {   # <dir> <CN>
+                mkdir -p "$1"
+                openssl req -new -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$2" \
+                    -keyout "$1/k.pem" -out "$1/c.pem" >/dev/null 2>&1
+                openssl x509 -in "$1/c.pem" -outform DER -out "$1/c.der"
+            }
+            mkcert "$tmp/other" "Other app key"
+            mkcert "$tmp/dkms" "Test DKMS key"
+            export KERNEL_POP_DKMS_MOK="$tmp/dkms/c.der" KERNEL_POP_EFIVARS="$tmp/efivars"
+            moknew="$KERNEL_POP_EFIVARS/MokNew-$MOK_GUID"
+            write_moknew() {   # <x509|sha256> <file>...: an efivarfs MokNew holding one list per file
+                local kind="$1"; shift
+                mkdir -p "$KERNEL_POP_EFIVARS"
+                perl -e '
+                    my $kind = shift;
+                    my %g = (x509 => "a159c0a5e494a74a87b5ab155c2bf072", sha256 => "2616c4c14c509240aca941f936934328");
+                    my $out = pack("V", 7);
+                    for my $f (@ARGV) {
+                        open(my $h, "<:raw", $f) or die; local $/; my $d = <$h>;
+                        my $entry = ("\x11" x 16) . $d;
+                        $out .= pack("H*", $g{$kind}) . pack("V3", 28 + length $entry, 0, length $entry) . $entry;
+                    }
+                    binmode STDOUT; print $out;
+                ' "$kind" "$@" > "$moknew"
+            }
+            ENROLLED_CN=""
+            mokutil() {
+                echo "ARGS: $*" >> "$calls"
+                case "$1" in
+                    --test-key)
+                        if [[ -n "$ENROLLED_CN" && "$(cert_cn "$2")" == "$ENROLLED_CN" ]]; then echo "$2 is already enrolled"; else echo "$2 is not enrolled"; fi ;;
+                    --generate-hash) local a b; IFS= read -r a; IFS= read -r b; echo '$6$salt$hash' ;;
+                    --revoke-import) echo "REVOKE" >> "$calls"; rm -f "$moknew" ;;
+                    --import)
+                        local f; shift
+                        while [[ "$1" != "--hash-file" ]]; do echo "IMPORT $(cert_cn "$1")" >> "$calls"; shift; done ;;
+                esac
+            }
+            queued() { grep '^IMPORT' "$calls" | sed 's/^IMPORT //' | sort | tr '\n' '|'; }
+
+            # Another app's key is waiting: it stays, ours and the DKMS key join it, one password.
+            : > "$calls"; write_moknew x509 "$tmp/other/c.der"
+            out="$(queue_key_enrollment Secret-pw2 2>&1)" || fail "queue with a waiting request: $out"
+            [[ "$(queued)" == "Kernel Pop kernel signing key|Other app key|Test DKMS key|" ]] || fail "queued [$(queued)]"
+            grep -n "REVOKE\|IMPORT" "$calls" | head -1 | grep -q REVOKE || fail "the waiting request must be replaced before the import"
+            grep -q "already waiting for enrollment" <<< "$out" || fail "the carried-over key should be named: $out"
+            grep -q "That one password enrolls all of these keys" <<< "$out" || fail "the user should learn one password covers all: $out"
+            [[ "$(wc -l < "$(mok_pending_file)")" == 3 ]] || fail "the app's list should hold three fingerprints"
+            grep -q "Secret-pw2" "$calls" && fail "the password reached mokutil's argv"
+
+            # The DKMS key was already waiting (queued by another tool): listed once.
+            : > "$calls"; write_moknew x509 "$tmp/dkms/c.der"
+            queue_key_enrollment Secret-pw3 >/dev/null 2>&1 || fail "queue with the DKMS key waiting"
+            [[ "$(queued)" == "Kernel Pop kernel signing key|Test DKMS key|" ]] || fail "dedupe: queued [$(queued)]"
+
+            # Kernel Pop's key is already enrolled: only the DKMS key is queued; no request to replace.
+            : > "$calls"; rm -f "$moknew"; ENROLLED_CN="Kernel Pop kernel signing key"
+            queue_key_enrollment Secret-pw4 >/dev/null 2>&1 || fail "queue with our key enrolled"
+            [[ "$(queued)" == "Test DKMS key|" ]] || fail "enrolled key skipped: queued [$(queued)]"
+            grep -q REVOKE "$calls" && fail "nothing was waiting, so nothing should be revoked"
+
+            # Everything enrolled: nothing queued, the app's list is removed.
+            : > "$calls"; ENROLLED_CN=""
+            mokutil_all_enrolled() { :; }
+            mokutil() { echo "ARGS: $*" >> "$calls"; [[ "$1" == "--test-key" ]] && echo "$2 is already enrolled"; return 0; }
+            out="$(queue_key_enrollment Secret-pw5 2>&1)" || fail "queue with everything enrolled"
+            grep -q "nothing to queue" <<< "$out" || fail "should say there is nothing to queue: $out"
+            grep -q -- "--import" "$calls" && fail "nothing should be imported when every key is enrolled"
+            [[ -e "$(mok_pending_file)" ]] && fail "the app's list should be removed"
+
+            # A waiting request with a hash entry cannot be carried over: refused, untouched.
+            : > "$calls"; write_moknew sha256 "$tmp/other/c.der"
+            (queue_key_enrollment Secret-pw6 >/dev/null 2>&1) && fail "a request holding hashes must not be replaced"
+            grep -q -- "--revoke-import\|--import" "$calls" && fail "nothing may be revoked or imported then"
+            [[ -e "$moknew" ]] || fail "the waiting request must be left alone"
+            # A damaged variable: refused as well.
+            printf 'xxxxshort' > "$moknew"
+            (queue_key_enrollment Secret-pw7 >/dev/null 2>&1) && fail "a damaged request must not be replaced"
+            exit "$r"
+        ) || bad "enrollment request merging"
     fi
 fi
 unset KERNEL_POP_MOK_DIR KERNEL_POP_SIGNED_DIR KERNEL_POP_BOOT

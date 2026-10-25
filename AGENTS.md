@@ -136,6 +136,18 @@ boots once MOK Manager enrolls it.
 - `sbsign` takes the PEM cert, `mokutil` the DER. sbsign appends a
   signature; an already-signed image keeps its existing ones.
 - With no key, `--install` only adds one "signing not set up" log line.
+- Enrollment (`queue_key_enrollment`): shim keeps ONE pending request
+  (MokNew) with ONE password (MokAuth); `mokutil --import` appends to it but
+  replaces the password, and skips an already-queued key without updating
+  it. So the script rebuilds the whole request every time: the certificates
+  already waiting (parsed out of the MokNew EFI variable), Kernel Pop's key
+  and the DKMS key (`/var/lib/shim-signed/mok/MOK.der`), minus anything
+  already enrolled, under the password just chosen (`--revoke-import`, then
+  one `--import`). A request holding non-certificate entries is left alone.
+  MokNew is root-only, so the app cannot see it with `mokutil --list-new`:
+  the script writes the queued fingerprints to `/var/lib/kernel-pop/mok-pending`
+  (0644) and the app counts a key as pending when MokNew exists and the key
+  is listed there.
 - The script's test overrides (`KERNEL_POP_*`, listed at its top) exist
   only in the script; pkexec clears the environment, so they never reach a
   real run. The script tests sign a copied EFI binary with a throwaway key

@@ -17,6 +17,11 @@ pub struct SystemInfo {
     pub free_root_bytes: Option<u64>,
     pub secure_boot: SecureBoot,
     pub kernel_signing: KernelSigning,
+    /// The DKMS module-signing key (/var/lib/shim-signed/mok/MOK.der), which
+    /// out-of-tree modules such as the NVIDIA driver are signed with; None
+    /// when there is none. Not enrolled means they do not load with Secure
+    /// Boot on.
+    pub dkms_key: Option<KeyEnrollment>,
     /// Roughly what one more kernel needs in /boot: the largest existing
     /// kernel image plus twice the largest existing initramfs (the margin
     /// covers update-initramfs briefly needing more than the final size).
@@ -290,6 +295,7 @@ pub fn query_system() -> SystemInfo {
         free_root_bytes: get_free_disk("/"),
         secure_boot: detect_secure_boot(),
         kernel_signing,
+        dkms_key: detect_dkms_key(),
         boot_needed_bytes: boot_needed_bytes(),
     }
 }
@@ -325,6 +331,16 @@ pub fn parse_mokutil_test_key(text: &str) -> Option<TestKey> {
     }
 }
 
+/// Whether a MOK key is trusted at boot yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeyEnrollment {
+    Enrolled,
+    /// Queued; MOK Manager enrolls it at the next boot.
+    Pending,
+    NotEnrolled,
+    Unknown,
+}
+
 /// Lowercase hex digits only: "AB:cd:01" -> "abcd01".
 fn normalize_fingerprint(s: &str) -> String {
     s.chars()
@@ -341,19 +357,16 @@ pub fn parse_openssl_fingerprint(text: &str) -> Option<String> {
     (fp.len() == 40).then_some(fp)
 }
 
-/// Whether `mokutil --list-new` output (one "SHA1 Fingerprint: ab:cd:…"
-/// line per pending key; empty when nothing is pending) includes the key
-/// with this normalized SHA1 fingerprint.
-pub fn list_new_contains(text: &str, fingerprint: &str) -> bool {
-    !fingerprint.is_empty()
-        && text
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("SHA1 Fingerprint:"))
-            .any(|fp| normalize_fingerprint(fp) == fingerprint)
+/// Whether the list of keys the last signing setup queued (one SHA1
+/// fingerprint per line, written by the privileged script) includes this
+/// normalized fingerprint. (`mokutil --list-new` cannot tell: the waiting
+/// request, MokNew, is readable by root only.)
+pub fn pending_list_contains(text: &str, fingerprint: &str) -> bool {
+    !fingerprint.is_empty() && text.lines().any(|l| normalize_fingerprint(l) == fingerprint)
 }
 
-/// `pending` is whether `mokutil --list-new` lists the key; it backs up
-/// --test-key, which already reports a queued key as pending by itself.
+/// `pending` is whether the key is waiting in an enrollment request (see
+/// `key_pending`); `--test-key` reports that too, but only when run as root.
 pub fn combine_kernel_signing(
     key_present: bool,
     test_key: Option<TestKey>,
@@ -379,25 +392,58 @@ fn stdout_of(cmd: &mut Command) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
 }
 
+/// The enrollment request shim reads at boot, and the list of what the last
+/// signing setup put in it.
+const MOK_NEW: &str = "/sys/firmware/efi/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23";
+const MOK_PENDING_LIST: &str = "/var/lib/kernel-pop/mok-pending";
+const DKMS_MOK_DER: &str = "/var/lib/shim-signed/mok/MOK.der";
+
+fn cert_fingerprint(der: &Path) -> Option<String> {
+    stdout_of(
+        Command::new("openssl")
+            .args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"])
+            .arg(der),
+    )
+    .and_then(|t| parse_openssl_fingerprint(&t))
+}
+
+/// Whether the certificate is waiting in the enrollment request: a request
+/// exists and the last setup listed it.
+fn key_pending(der: &Path) -> bool {
+    if !Path::new(MOK_NEW).exists() {
+        return false;
+    }
+    match (cert_fingerprint(der), std::fs::read_to_string(MOK_PENDING_LIST)) {
+        (Some(fp), Ok(list)) => pending_list_contains(&list, &fp),
+        _ => false,
+    }
+}
+
+fn test_key(der: &Path) -> Option<TestKey> {
+    stdout_of(Command::new("mokutil").arg("--test-key").arg(der)).and_then(|t| parse_mokutil_test_key(&t))
+}
+
 fn detect_kernel_signing() -> KernelSigning {
     let dir = Path::new(MOK_DIR);
     let der = dir.join("signing.der");
     if !key_files_present(dir) {
         return KernelSigning::NoKey;
     }
-    let test_key = stdout_of(Command::new("mokutil").arg("--test-key").arg(&der))
-        .and_then(|t| parse_mokutil_test_key(&t));
-    let fingerprint = stdout_of(
-        Command::new("openssl")
-            .args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"])
-            .arg(&der),
-    )
-    .and_then(|t| parse_openssl_fingerprint(&t));
-    let pending = match (fingerprint, stdout_of(Command::new("mokutil").arg("--list-new"))) {
-        (Some(fp), Some(list)) => list_new_contains(&list, &fp),
-        _ => false,
-    };
-    combine_kernel_signing(true, test_key, pending)
+    combine_kernel_signing(true, test_key(&der), key_pending(&der))
+}
+
+pub fn combine_key_enrollment(test_key: Option<TestKey>, pending: bool) -> KeyEnrollment {
+    match (test_key, pending) {
+        (Some(TestKey::Enrolled), _) => KeyEnrollment::Enrolled,
+        (_, true) | (Some(TestKey::Pending), _) => KeyEnrollment::Pending,
+        (Some(TestKey::NotEnrolled), false) => KeyEnrollment::NotEnrolled,
+        (None, false) => KeyEnrollment::Unknown,
+    }
+}
+
+fn detect_dkms_key() -> Option<KeyEnrollment> {
+    let der = Path::new(DKMS_MOK_DER);
+    der.exists().then(|| combine_key_enrollment(test_key(der), key_pending(der)))
 }
 
 /// Whether a signed marker ("<size> <mtime>", written by the privileged
@@ -583,6 +629,14 @@ pub fn install_warnings(info: &SystemInfo) -> Vec<String> {
              waiting to be enrolled: confirm the enrollment at the blue MOK Manager screen on \
              the next reboot, or the new kernel will not boot. The kernel you are running now \
              keeps working."
+                .to_string(),
+        );
+    }
+    if info.secure_boot == SecureBoot::Enabled && info.dkms_key == Some(KeyEnrollment::NotEnrolled) {
+        out.push(
+            "Secure Boot is on, but the key DKMS signs out-of-tree modules with (such as the \
+             NVIDIA driver) is not enrolled, so those modules will not load. Set Up Signing on \
+             the System tab queues it for enrollment together with Kernel Pop's key."
                 .to_string(),
         );
     }
@@ -785,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_and_list_new_parsing() {
+    fn fingerprint_and_pending_list_parsing() {
         let fp = parse_openssl_fingerprint(
             "SHA1 Fingerprint=76:A0:9A:00:72:12:89:2F:0F:A8:D2:C5:1E:B6:D0:C8:F4:2A:C6:4D\n",
         )
@@ -798,17 +852,24 @@ mod tests {
         assert_eq!(parse_openssl_fingerprint("Could not open file\n"), None);
         assert_eq!(parse_openssl_fingerprint("SHA1 Fingerprint=AB:CD\n"), None);
 
-        let list = "[key 1]\n\
-                    SHA1 Fingerprint: 11:22:33:44:55:66:77:88:99:00:aa:bb:cc:dd:ee:ff:11:22:33:44\n\
-                    Certificate:\n    Data:\n\
-                    [key 2]\n\
-                    SHA1 Fingerprint: 76:a0:9a:00:72:12:89:2f:0f:a8:d2:c5:1e:b6:d0:c8:f4:2a:c6:4d\n\
-                    Certificate:\n";
-        assert!(list_new_contains(list, &fp));
-        assert!(!list_new_contains(list, "ffffffffffffffffffffffffffffffffffffffff"));
-        // Nothing pending: mokutil prints nothing.
-        assert!(!list_new_contains("", &fp));
-        assert!(!list_new_contains(list, ""));
+        let list = "76a09a007212892f0fa8d2c51eb6d0c8f42ac64d\n43e4f8245b73f134bf13c1dbe63001527c7b0905\n";
+        assert!(pending_list_contains(list, &fp));
+        assert!(pending_list_contains("76:A0:9A:00:72:12:89:2F:0F:A8:D2:C5:1E:B6:D0:C8:F4:2A:C6:4D\n", &fp));
+        assert!(!pending_list_contains(list, "ffffffffffffffffffffffffffffffffffffffff"));
+        assert!(!pending_list_contains("", &fp));
+        assert!(!pending_list_contains(list, ""));
+    }
+
+    #[test]
+    fn key_enrollment_combination() {
+        use KeyEnrollment::*;
+        use TestKey as T;
+        assert_eq!(combine_key_enrollment(Some(T::Enrolled), true), Enrolled);
+        assert_eq!(combine_key_enrollment(Some(T::NotEnrolled), true), Pending);
+        assert_eq!(combine_key_enrollment(Some(T::Pending), false), Pending);
+        assert_eq!(combine_key_enrollment(Some(T::NotEnrolled), false), NotEnrolled);
+        assert_eq!(combine_key_enrollment(None, false), Unknown);
+        assert_eq!(combine_key_enrollment(None, true), Pending);
     }
 
     #[test]
@@ -960,6 +1021,14 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("next reboot"));
         info.secure_boot = SecureBoot::Disabled;
+        assert!(install_warnings(&info).is_empty());
+        // The DKMS key matters only with Secure Boot on, and only when not enrolled or queued.
+        info.dkms_key = Some(KeyEnrollment::NotEnrolled);
+        assert!(install_warnings(&info).is_empty());
+        info.secure_boot = SecureBoot::Enabled;
+        info.kernel_signing = KernelSigning::Enrolled;
+        assert!(install_warnings(&info)[0].contains("NVIDIA"));
+        info.dkms_key = Some(KeyEnrollment::Pending);
         assert!(install_warnings(&info).is_empty());
     }
 
