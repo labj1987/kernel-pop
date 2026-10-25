@@ -44,9 +44,7 @@ pub const BUILD_DEPS: &[&str] = &[
 /// 6.7 GB of tree and 0.13 GB of packages for Ubuntu's config with debug
 /// info off) plus a margin for ccache and a bigger config.
 pub const BUILD_NEED_BYTES: u64 = 12 * 1024 * 1024 * 1024;
-/// The same for "Trim to this machine", which builds far fewer modules.
-pub const TRIM_BUILD_NEED_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-/// The same for "Tuned for this machine".
+/// The same for "Tuned for this machine", which builds far fewer modules.
 pub const TUNED_BUILD_NEED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Drivers "Tuned for this machine" always keeps, for hardware that is often
@@ -161,8 +159,6 @@ pub fn downloads_root() -> PathBuf {
 pub enum ConfigMode {
     /// /boot/config-$(uname -r), with the fixes.
     MatchSystem,
-    /// The same, then localmodconfig against the loaded modules.
-    TrimToMachine,
     /// The same, then localmodconfig against the loaded modules, the
     /// drivers for every device present, and `TUNED_EXTRA_MODULES`.
     TunedForMachine,
@@ -174,7 +170,6 @@ impl ConfigMode {
     pub fn label(&self) -> &'static str {
         match self {
             ConfigMode::MatchSystem => "Match this system",
-            ConfigMode::TrimToMachine => "Trim to this machine",
             ConfigMode::TunedForMachine => "Tuned for this machine",
             ConfigMode::OwnConfig(_) => "Use my own .config",
         }
@@ -182,7 +177,6 @@ impl ConfigMode {
 
     pub fn disk_need(&self) -> u64 {
         match self {
-            ConfigMode::TrimToMachine => TRIM_BUILD_NEED_BYTES,
             ConfigMode::TunedForMachine => TUNED_BUILD_NEED_BYTES,
             _ => BUILD_NEED_BYTES,
         }
@@ -642,23 +636,19 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     };
     olddefconfig()?;
 
-    if matches!(req.mode, ConfigMode::TrimToMachine | ConfigMode::TunedForMachine) {
+    if req.mode == ConfigMode::TunedForMachine {
         let loaded = loaded_modules().context("Could not read the loaded modules")?;
-        let mut keep: Vec<String> = loaded.clone();
-        let mut what = format!("the {} modules loaded right now", loaded.len());
-        if req.mode == ConfigMode::TunedForMachine {
-            let present = present_device_modules();
-            let extra: Vec<String> = TUNED_EXTRA_MODULES.iter().map(|m| m.to_string()).collect();
-            let new_present = present.iter().filter(|m| !loaded.contains(m)).count();
-            keep.extend(present);
-            keep.extend(extra);
-            what = format!(
-                "the {} modules loaded right now, {} more for devices present but not in use, and {} common plug-in, VPN, container and VM drivers",
-                loaded.len(),
-                new_present,
-                TUNED_EXTRA_MODULES.len()
-            );
-        }
+        let present = present_device_modules();
+        let new_present = present.iter().filter(|m| !loaded.contains(m)).count();
+        let what = format!(
+            "the {} modules loaded right now, {} more for devices present but not in use, and {} common plug-in, VPN, container and VM drivers",
+            loaded.len(),
+            new_present,
+            TUNED_EXTRA_MODULES.len()
+        );
+        let mut keep: Vec<String> = loaded;
+        keep.extend(present);
+        keep.extend(TUNED_EXTRA_MODULES.iter().map(|m| m.to_string()));
         keep.sort();
         keep.dedup();
         let list = tree.join(".kernel-pop-lsmod");
@@ -669,11 +659,9 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         apply_fixes()?;
         olddefconfig()?;
         fixes.push(format!("localmodconfig: only drivers for {what}"));
-        notes.push(if req.mode == ConfigMode::TrimToMachine {
-            "Trimmed: hardware that is not plugged in or in use right now (USB devices, docks, external drives) may have no driver in this kernel.".into()
-        } else {
-            "Tuned: hardware that is not present now and not a common plug-in kind (an unusual USB gadget, a different Wi-Fi card) may have no driver in this kernel; Match this system includes everything.".into()
-        });
+        notes.push(
+            "Tuned: hardware that is not present now and not a common plug-in kind (an unusual USB gadget, a different Wi-Fi card) may have no driver in this kernel; Match this system includes everything.".into(),
+        );
     }
 
     let config = std::fs::read_to_string(tree.join(".config"))?;
@@ -1179,7 +1167,7 @@ mod tests {
         let gb = 1024 * 1024 * 1024u64;
         assert!(space_problem(&ConfigMode::MatchSystem, Some(100 * gb), Some(gb), 200 << 20).is_none());
         assert!(space_problem(&ConfigMode::MatchSystem, Some(8 * gb), Some(gb), 200 << 20).unwrap().contains("free in"));
-        assert!(space_problem(&ConfigMode::TrimToMachine, Some(8 * gb), Some(gb), 200 << 20).is_none());
+        assert!(space_problem(&ConfigMode::TunedForMachine, Some(10 * gb), Some(gb), 200 << 20).is_none());
         assert!(space_problem(&ConfigMode::MatchSystem, Some(100 * gb), Some(100 << 20), 200 << 20).unwrap().contains("/boot"));
         // Unknown free space does not block (df failed): the build itself reports a full disk.
         assert!(space_problem(&ConfigMode::MatchSystem, None, None, 200 << 20).is_none());
@@ -1353,7 +1341,7 @@ mod tests {
     }
 
     /// A real build of a real kernel.org tarball, like the Build page does
-    /// it: KERNEL_POP_LIVE_TARBALL=<tarball> KERNEL_POP_LIVE_MODE=match|trim,
+    /// it: KERNEL_POP_LIVE_TARBALL=<tarball> KERNEL_POP_LIVE_MODE=match|tuned,
     /// optionally KERNEL_POP_LIVE_UNVERIFIED=1 to skip the signature check.
     /// Takes the better part of an hour. Run with --ignored --nocapture.
     #[test]
@@ -1361,7 +1349,6 @@ mod tests {
     fn live_build() {
         let path = PathBuf::from(std::env::var("KERNEL_POP_LIVE_TARBALL").expect("set KERNEL_POP_LIVE_TARBALL"));
         let mode = match std::env::var("KERNEL_POP_LIVE_MODE").as_deref() {
-            Ok("trim") => ConfigMode::TrimToMachine,
             Ok("tuned") => ConfigMode::TunedForMachine,
             _ => ConfigMode::MatchSystem,
         };

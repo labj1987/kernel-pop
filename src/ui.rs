@@ -71,7 +71,6 @@ enum ModeChoice {
     #[default]
     Match,
     Tuned,
-    Trim,
     Own,
 }
 
@@ -108,7 +107,6 @@ impl AppState {
         match self.mode {
             ModeChoice::Match => Some(ConfigMode::MatchSystem),
             ModeChoice::Tuned => Some(ConfigMode::TunedForMachine),
-            ModeChoice::Trim => Some(ConfigMode::TrimToMachine),
             ModeChoice::Own => self.own_config.clone().map(ConfigMode::OwnConfig),
         }
     }
@@ -448,8 +446,6 @@ pub fn build_ui(app: &Application) {
     match_check.set_active(true);
     let tuned_check = CheckButton::new();
     tuned_check.set_group(Some(&match_check));
-    let trim_check = CheckButton::new();
-    trim_check.set_group(Some(&match_check));
     let own_check = CheckButton::new();
     own_check.set_group(Some(&match_check));
     let match_row = ActionRow::builder()
@@ -464,12 +460,6 @@ pub fn build_ui(app: &Application) {
         .activatable_widget(&tuned_check)
         .build();
     tuned_row.add_prefix(&tuned_check);
-    let trim_row = ActionRow::builder()
-        .title("Trim to this machine")
-        .subtitle("Only drivers for the modules loaded right now. Hardware that is not plugged in now (USB devices, docks, external drives) may have no driver in this kernel.")
-        .activatable_widget(&trim_check)
-        .build();
-    trim_row.add_prefix(&trim_check);
     let own_row = ActionRow::builder()
         .title("Use my own .config")
         .subtitle("No file chosen")
@@ -481,7 +471,6 @@ pub fn build_ui(app: &Application) {
     own_row.add_suffix(&own_btn);
     config_group.add(&match_row);
     config_group.add(&tuned_row);
-    config_group.add(&trim_row);
     config_group.add(&own_row);
     build_page.append(&config_group);
 
@@ -1841,7 +1830,6 @@ pub fn build_ui(app: &Application) {
         for (check, m) in [
             (&match_check, ModeChoice::Match),
             (&tuned_check, ModeChoice::Tuned),
-            (&trim_check, ModeChoice::Trim),
             (&own_check, ModeChoice::Own),
         ] {
             let set_mode = set_mode.clone();

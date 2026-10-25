@@ -138,10 +138,6 @@ Base config:
   card) may have no driver. Kernel messages in the journal were also
   tried as a history of earlier boots; on the test machine they named no
   module that was not loaded already, so they are not used.
-- **Trim to this machine**: the same, then
-  `make LSMOD=<lsmod output> localmodconfig` with the modules loaded right
-  now only. Hardware that is not plugged in or in use (USB devices, docks,
-  external drives) may have no driver.
 - **Use my own .config**: the chosen file.
 
 Fixes applied in every mode with `scripts/config`, then `make olddefconfig`:
@@ -225,7 +221,11 @@ installed but empty (cold), debug info off:
 | --- | --- | --- | --- | --- | --- |
 | Match this system | 6703 | 26 min 5 s | 6.7 GB | 117 MB | 10.6 MB |
 | Tuned for this machine (196 loaded, 23 more for present devices, 110 extras) | 369 | 8 min 2 s | 3.5 GB | 34 MB | 10.3 MB |
-| Trim to this machine (201 modules loaded) | 226 | 6 min 41 s | 3.2 GB | 28.5 MB | 10.3 MB |
+
+Version 2.1.0 also had "Trim to this machine" (only the modules loaded
+right now): 226 modules, 6 min 41 s, 3.2 GB. It was removed in 2.1.2: Tuned
+covers the same hardware plus everything present and the common plug-in
+kinds for about a minute and a half more.
 
 The Match build took longer here than the 18 min 48 s in the container
 because of the cold ccache's overhead and the running desktop. A warm ccache
@@ -236,5 +236,5 @@ after the Match build, well inside its default 5 GB limit.
 
 The preflight refuses to start a build with less than the measured need
 plus a margin free in `~/.cache` (`build::BUILD_NEED_BYTES`,
-`TRIM_BUILD_NEED_BYTES`), or less than one more kernel needs in `/boot`
+`TUNED_BUILD_NEED_BYTES`), or less than one more kernel needs in `/boot`
 (the largest kernel image there plus twice the largest initramfs).

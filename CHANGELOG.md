@@ -4,6 +4,13 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.1.2 — 2026-10-25
+
+- The Build tab's configurations are now Match this system, Tuned for this machine and Use
+  my own .config. Trim to this machine is gone: Tuned covers the same hardware plus
+  everything else in the computer and the devices people plug in, for about a minute and a
+  half more build time.
+
 ## 2.1.1 — 2026-10-25
 
 **Fixed: Secure Boot keys not enrolling.** When another app had also queued a key for
