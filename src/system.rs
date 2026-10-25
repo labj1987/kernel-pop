@@ -30,8 +30,8 @@ impl SystemInfo {
     }
 }
 
-/// Secure Boot state. Mainline kernels are unsigned, so `Enabled` means a
-/// freshly installed one will be refused by shim at boot.
+/// Secure Boot state. Kernels built from source are unsigned, so `Enabled`
+/// means a freshly installed one is refused by shim unless it gets signed.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SecureBoot {
     Enabled,
@@ -91,7 +91,7 @@ pub enum KernelSignature {
     /// is the signed linux-image-<version> built by a linux-signed source.
     /// Boots under Secure Boot through shim without Kernel Pop's key.
     Distro,
-    /// Neither: a mainline kernel not (or no longer) signed by Kernel Pop.
+    /// Neither: a kernel not (or no longer) signed by Kernel Pop.
     Unsigned,
 }
 
@@ -547,7 +547,7 @@ fn boot_needed_bytes() -> u64 {
 }
 
 /// Why an install must not start at all, or None. With Secure Boot on, a
-/// mainline kernel boots only when signed with a key that is enrolled or
+/// kernel built from source boots only when signed with a key that is enrolled or
 /// queued for enrollment; anything else would leave a kernel shim refuses.
 /// The privileged script makes the same check itself before installing.
 pub fn install_blocker(info: &SystemInfo) -> Option<&'static str> {
@@ -557,8 +557,8 @@ pub fn install_blocker(info: &SystemInfo) -> Option<&'static str> {
     match info.kernel_signing {
         KernelSigning::Enrolled | KernelSigning::EnrollmentPending => None,
         KernelSigning::NoKey => Some(
-            "Secure Boot is on and kernel signing is not set up, so a mainline kernel could \
-             not boot on this machine. Use Set Up Signing on the System tab first, or turn \
+            "Secure Boot is on and kernel signing is not set up, so a kernel built from \
+             source could not boot on this machine. Use Set Up Signing on the System tab first, or turn \
              Secure Boot off.",
         ),
         KernelSigning::KeyNotEnrolled => Some(
@@ -685,7 +685,7 @@ fn get_free_disk(path: &str) -> Option<u64> {
         .and_then(|l| l.trim().parse::<u64>().ok())
 }
 
-/// Minimum free space to comfortably download + unpack a kernel set (bytes).
+/// Free space / should have for a kernel install (bytes).
 pub const MIN_ROOT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
 
 /// /boot fills up fast with kernels; warn below this.
@@ -701,7 +701,7 @@ pub fn format_bytes(b: u64) -> String {
     }
 }
 
-/// Compare the running kernel's numeric part against a mainline version
+/// Compare the running kernel's numeric part against a kernel.org version
 /// string like "7.1.3". Returns Newer/Same/Older from the candidate's
 /// point of view, for the version badge.
 #[derive(PartialEq)]

@@ -2,16 +2,19 @@
 <component type="desktop-application">
   <id>io.github.labj1987.KernelPop</id>
   <name>Kernel Pop</name>
-  <summary>Install Ubuntu mainline kernels with a verified initramfs</summary>
+  <summary>Build kernel.org kernels for this machine and install them safely</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>AGPL-3.0-or-later</project_license>
   <description>
     <p>
-      Browse, download, and install Ubuntu mainline kernels from
-      kernel.ubuntu.com. The kernel version is read from package metadata
-      rather than parsed from filenames, the initramfs is generated and
-      verified to exist before an install reports success, and every
-      installed kernel is health-checked for a missing initrd so an
+      Pick a mainline, stable or longterm release from kernel.org (or drop a
+      source tarball onto the window). Kernel Pop checks its signature
+      against the kernel.org developers' keys, configures it from the
+      running kernel's configuration, builds Debian packages as your own
+      user and installs them. The kernel version is read from the source
+      and the package metadata rather than parsed from filenames, the
+      initramfs is generated and verified to exist before an install
+      reports success, and every installed kernel is health-checked so an
       unbootable kernel is visible before a reboot instead of after.
     </p>
   </description>
@@ -27,6 +30,7 @@
     <category>System</category>
   </categories>
   <releases>
+    <release version="2.0.0" date="2026-10-24"/>
     <release version="1.6.0" date="2026-10-11"/>
     <release version="1.5.0" date="2026-10-08"/>
     <release version="1.4.1" date="2026-10-02"/>

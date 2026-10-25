@@ -72,7 +72,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config \
             zsync wget file desktop-file-utils \
-            shellcheck sbsigntool openssl systemd-boot-efi gnupg gpgv
+            shellcheck sbsigntool openssl systemd-boot-efi gnupg gpgv xz-utils gzip
 
       # The same checks as CI, so a tag on a commit CI never passed cannot release.
       - name: Script syntax and ShellCheck

@@ -3,10 +3,10 @@
 #
 # THE WHOLE POINT OF THIS SCRIPT
 # ------------------------------
-# ukuu and hand-rolled scripts have repeatedly installed mainline kernels
-# without generating the initramfs, because they parsed the kernel version
-# out of a FILENAME with a regex and the mainline naming convention
-# (7.1.3-070103-generic) broke the parse. One reboot later: VFS panic.
+# ukuu and hand-rolled scripts have repeatedly installed kernels without
+# generating the initramfs, because they parsed the kernel version out of a
+# FILENAME with a regex and an unexpected naming convention broke the parse.
+# One reboot later: VFS panic.
 #
 # This script never parses filenames. The kernel version is read from the
 # .deb package metadata (dpkg-deb -f Package), cross-checked against the
@@ -16,13 +16,15 @@
 # an unbootable kernel behind.
 #
 # Usage:
-#   privileged-install.sh --install <download-dir>   (the .debs plus the CHECKSUMS
-#                                                     and CHECKSUMS.gpg they came with)
+#   privileged-install.sh --install <build-dir>      (the .debs Kernel Pop built, plus
+#                                                     the SHA256SUMS manifest it wrote)
 #   privileged-install.sh --remove  <kernel-version-string>
 #   privileged-install.sh --remove-many <kernel-version-string>...
 #   privileged-install.sh --boot-once <kernel-version-string>
 #   privileged-install.sh --setup-signing        (enrollment password on stdin)
 #   privileged-install.sh --sign <kernel-version-string>
+#   privileged-install.sh --install-build-deps <package>...  (only names from
+#                                                     BUILD_DEPS_ALLOWED below)
 #
 # Output protocol: every line starts with "[kernel-pop] ". The app counts and
 # reacts to these markers at the start of a line's text, so each one is used
@@ -46,9 +48,8 @@ ARG="${2:-}"
 
 # Test overrides (pkexec clears the environment, so they never reach a real
 # run): KERNEL_POP_BOOT, KERNEL_POP_MODULES, KERNEL_POP_ROOTFS,
-# KERNEL_POP_MOK_DIR, KERNEL_POP_SIGNED_DIR, KERNEL_POP_KEYRING,
-# KERNEL_POP_SIGNER_FPR, KERNEL_POP_STAGING, KERNEL_POP_GRUB_CFG,
-# KERNEL_POP_GRUB_DEFAULTS, KERNEL_POP_DKMS_TREE.
+# KERNEL_POP_MOK_DIR, KERNEL_POP_SIGNED_DIR, KERNEL_POP_STAGING,
+# KERNEL_POP_GRUB_CFG, KERNEL_POP_GRUB_DEFAULTS, KERNEL_POP_DKMS_TREE.
 boot_dir()    { echo "${KERNEL_POP_BOOT:-/boot}"; }
 modules_dir() { echo "${KERNEL_POP_MODULES:-/lib/modules}"; }
 
@@ -259,21 +260,25 @@ restore_grub_default() {
 }
 
 # ── Derive kernel version strings from .deb metadata ──────────────────
-# The image/modules package NAME embeds the full version string:
-#   linux-image-unsigned-7.1.3-070103-generic  ->  7.1.3-070103-generic
+# The image package's NAME (its Package field, never the file name) embeds
+# the full version string, as make bindeb-pkg names it:
+#   linux-image-7.2.12-kernelpop  ->  7.2.12-kernelpop
+# Exactly one image package is expected.
 kver_from_debs() {
     local dir="$1"
-    local deb pkg
-    for deb in "$dir"/linux-image-*_amd64.deb "$dir"/linux-modules-*_amd64.deb; do
+    local deb pkg found=""
+    for deb in "$dir"/*.deb; do
         [[ -f "$deb" ]] || continue
         pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null)" || continue
         case "$pkg" in
-            linux-image-unsigned-*) echo "${pkg#linux-image-unsigned-}"; return 0 ;;
-            linux-image-*)          echo "${pkg#linux-image-}";          return 0 ;;
-            linux-modules-*)        echo "${pkg#linux-modules-}";        return 0 ;;
+            linux-image-*-dbg) ;;
+            linux-image-*)
+                [[ -z "$found" ]] || return 1
+                found="${pkg#linux-image-}" ;;
         esac
     done
-    return 1
+    [[ -n "$found" ]] || return 1
+    echo "$found"
 }
 
 # A kernel version string is spliced into globs and rm -rf paths, so it must
@@ -403,7 +408,7 @@ dkms_postcheck() {
 }
 
 # ── Kernel signing (Secure Boot) ────────────────────────────────────────
-# Mainline kernels are unsigned. Once --setup-signing has created a key and
+# Kernels built from source are unsigned. Once --setup-signing has created a key and
 # queued it for MOK enrollment, every kernel this script installs is signed
 # with it, whether or not Secure Boot is on right now. Kernel Pop has its own
 # kernel-signing key: Ubuntu's module-signing MOK (/var/lib/shim-signed/mok)
@@ -645,7 +650,7 @@ SB_PENDING=0
 secure_boot_preflight() {
     secure_boot_enforcing || return 0
     signing_key_present \
-        || die "Secure Boot is enforcing and kernel signing is not set up, so a mainline kernel could not boot. Nothing was installed. Use Set Up Signing on the System tab first, or turn Secure Boot off."
+        || die "Secure Boot is enforcing and kernel signing is not set up, so a kernel built from source could not boot. Nothing was installed. Use Set Up Signing on the System tab first, or turn Secure Boot off."
     if ! command -v sbsign >/dev/null 2>&1 || ! command -v sbverify >/dev/null 2>&1; then
         die "Secure Boot is enforcing and the signing tools (sbsigntool) are missing, so the kernel could not be signed. Nothing was installed. Run Set Up Signing on the System tab again."
     fi
@@ -700,28 +705,28 @@ newest_kver_in_list() {
     sort -V | tail -n 1
 }
 
-# Only kernel packages may be installed as root through this helper.
+# Only a kernel image and its headers may be installed as root through this
+# helper. bindeb-pkg also builds linux-libc-dev, which would replace Ubuntu's
+# own package, and can build a linux-image-*-dbg; both are refused here, not
+# just left out by the app.
 deb_allowed() {
     local pkg
     pkg="$(dpkg-deb -f "$1" Package 2>/dev/null)" || return 1
     case "$pkg" in
-        linux-image*|linux-modules*|linux-headers*) return 0 ;;
+        linux-libc-dev*|linux-image-*-dbg) return 1 ;;
+        linux-image-?*|linux-headers-?*) return 0 ;;
         *) return 1 ;;
     esac
 }
 
-# ── Verifying a download before it is installed ─────────────────────────
-# The .debs, CHECKSUMS and CHECKSUMS.gpg come from a directory the user owns.
-# Nothing in it is trusted: the set is copied into a root-only directory and
-# verified there (signature, then every package's SHA256), and dpkg installs
-# only those private copies, so nothing that can still be changed after the
-# check is what gets installed.
-
-# Ubuntu's kernel PPA key ("Kernel PPA <kernel-ppa@canonical.com>"), which
-# signs every mainline CHECKSUMS file. The keyring is installed next to this
-# script; the fingerprint pins the primary key.
-keyring_path() { echo "${KERNEL_POP_KEYRING:-/usr/lib/kernel-pop/kernel-ppa.gpg}"; }
-signer_fpr()   { echo "${KERNEL_POP_SIGNER_FPR:-60AA7B6F30434AE68E569963E50C6A0917C622B0}"; }
+# ── Verifying a build before it is installed ────────────────────────────
+# The .debs and the SHA256SUMS manifest come from a directory the user owns:
+# Kernel Pop built the packages as that user and wrote the manifest. The
+# trust anchor is that user, who authenticated through pkexec for this run.
+# Nothing in the directory is trusted beyond that: the set is copied into a
+# root-only directory and every package's SHA256 is checked against the
+# manifest there, and dpkg installs only those private copies, so nothing
+# that can still be changed after the check is what gets installed.
 
 # The uid the app runs as: pkexec says who asked.
 caller_uid() { echo "${PKEXEC_UID:-${SUDO_UID:-0}}"; }
@@ -776,14 +781,15 @@ copy_trusted_file() {
     ' "$1" "$2" "$(caller_uid)" 2>&1
 }
 
-# The SHA256 a CHECKSUMS file lists for package file <name>, or nothing.
-# Mainline CHECKSUMS hold sha1sum and sha256sum lines; only 64-hex-digit
-# hashes count.
-checksum_for() {
+MANIFEST="SHA256SUMS"
+
+# The SHA256 the manifest lists for package file <name>, or nothing. Lines
+# are "<64 hex digits>  <file name>", as sha256sum writes them; the name is
+# compared as a plain string.
+manifest_hash_for() {
     local file="$1" name="$2" h f
     while read -r h f; do
-        f="${f#\*}"
-        if [[ "$h" =~ ^[0-9a-fA-F]{64}$ && "${f##*/}" == "$name" ]]; then
+        if [[ "$h" =~ ^[0-9a-fA-F]{64}$ && "$f" == "$name" ]]; then
             echo "${h,,}"
             return 0
         fi
@@ -791,31 +797,9 @@ checksum_for() {
     return 0
 }
 
-# gpgv's verdict on <dir>/CHECKSUMS.gpg over <dir>/CHECKSUMS, against the
-# installed keyring only (empty private home), requiring a valid signature
-# whose primary key is the pinned fingerprint.
-checksums_signature_ok() {
-    local dir="$1" ring home status line f
-    ring="$(keyring_path)"
-    if [[ ! -f "$ring" ]]; then log "The signing keyring $ring is missing"; return 1; fi
-    if ! command -v gpgv >/dev/null 2>&1; then log "gpgv is not installed"; return 1; fi
-    home="$(mktemp -d "$dir/.gnupg.XXXXXX")" || return 1
-    status="$(gpgv --homedir "$home" --status-fd 1 --keyring "$ring" \
-        "$dir/CHECKSUMS.gpg" "$dir/CHECKSUMS" 2>>"$LOGFILE")" || { rm -rf "$home"; return 1; }
-    rm -rf "$home"
-    while IFS= read -r line; do
-        read -ra f <<< "$line"
-        if [[ "${f[0]:-}" == "[GNUPG:]" && "${f[1]:-}" == "VALIDSIG" && "${f[-1]}" == "$(signer_fpr)" ]]; then
-            return 0
-        fi
-    done <<< "$status"
-    log "The CHECKSUMS signature is not from key $(signer_fpr)"
-    return 1
-}
-
-# Copy <src>'s CHECKSUMS, CHECKSUMS.gpg and .debs into the root-only <dst>,
-# then verify the signature and every package there. Dies on any problem; a
-# package missing from the signed CHECKSUMS is an error, never "unverified".
+# Copy <src>'s manifest and .debs into the root-only <dst>, then verify every
+# package there. Dies on any problem: a package missing from the manifest,
+# or a manifest entry with no package, is an error, never "unverified".
 # The directory is entered once and checked as ".", so every file is opened
 # relative to that one directory even if <src> is swapped for a symlink.
 stage_verified_debs() {
@@ -824,26 +808,25 @@ stage_verified_debs() {
     (
         cd -P -- "$src" 2>/dev/null || die "Cannot enter the package directory $src"
         path_trusted . || die "Refusing the package directory $src"
-        local f name want got out n=0
-        for name in CHECKSUMS CHECKSUMS.gpg; do
-            [[ -e "$name" || -L "$name" ]] || die "$name is missing from $src — Kernel Pop installs only packages it can verify"
-            out="$(copy_trusted_file "$name" "$dst/$name")" || die "Refusing $src/$name: $out"
-        done
-        checksums_signature_ok "$dst" \
-            || die "The CHECKSUMS file is not signed by Ubuntu's kernel PPA key — refusing to install"
-        log "Verified: CHECKSUMS is signed by Ubuntu's kernel PPA key"
+        local f name want got out n=0 h
+        [[ -e "$MANIFEST" || -L "$MANIFEST" ]] || die "$MANIFEST is missing from $src — Kernel Pop installs only packages it built and listed"
+        out="$(copy_trusted_file "$MANIFEST" "$dst/$MANIFEST")" || die "Refusing $src/$MANIFEST: $out"
         for f in ./*.deb; do
             [[ -e "$f" || -L "$f" ]] || continue
             name="${f#./}"
-            want="$(checksum_for "$dst/CHECKSUMS" "$name")"
-            [[ -n "$want" ]] || die "$name is not listed in the signed CHECKSUMS — refusing to install it"
+            want="$(manifest_hash_for "$dst/$MANIFEST" "$name")"
+            [[ -n "$want" ]] || die "$name is not listed in $MANIFEST — refusing to install it"
             out="$(copy_trusted_file "$name" "$dst/$name")" || die "Refusing $src/$name: $out"
             got="$(sha256sum "$dst/$name" | cut -d' ' -f1)"
             [[ "$got" == "$want" ]] || die "SHA256 mismatch for $name (expected $want, got $got) — refusing to install"
             n=$((n + 1))
         done
         (( n > 0 )) || die "No .deb files found in $src"
-        log "Verified: $n package(s) match the signed CHECKSUMS"
+        while read -r h f; do
+            [[ -n "$h" ]] || continue
+            [[ -f "$dst/$f" ]] || die "$MANIFEST lists $f, which is not in $src — the set is incomplete"
+        done < "$dst/$MANIFEST"
+        log "Verified: $n package(s) match $MANIFEST"
     ) || exit 1
 }
 
@@ -867,15 +850,21 @@ do_install() {
 
     local all_debs=("$dir"/*.deb) debs=() d
     for d in "${all_debs[@]}"; do
-        deb_allowed "$d" || die "Refusing to install ${d##*/}: Package field is not linux-image/linux-modules/linux-headers"
+        deb_allowed "$d" || die "Refusing to install ${d##*/}: only a kernel image and its headers are installed (never linux-libc-dev or a -dbg package)"
         debs+=("$d")
     done
 
     # Version from package metadata, before anything is installed
     local kver
-    kver="$(kver_from_debs "$dir")" || die "Could not read a kernel version from the package metadata"
+    kver="$(kver_from_debs "$dir")" || die "Could not read one kernel version from the package metadata (exactly one linux-image package is expected)"
     valid_kver "$kver" || die "The package metadata gives an invalid kernel version: '$kver'"
     log "Kernel version (from package metadata): $kver"
+    local pkg
+    for d in "${debs[@]}"; do
+        pkg="$(dpkg-deb -f "$d" Package)"
+        [[ "$pkg" == "linux-image-$kver" || "$pkg" == "linux-headers-$kver" ]] \
+            || die "Refusing ${d##*/}: package $pkg does not belong to kernel $kver"
+    done
 
     # Refuse up front what could not boot under Secure Boot.
     secure_boot_preflight
@@ -1273,6 +1262,35 @@ do_remove_many() {
     (( failed == 0 )) || exit 1
 }
 
+# ── Build dependencies ──────────────────────────────────────────────────
+# The packages a kernel build needs (the app's BUILD_DEPS, kept equal by a
+# test). Only these names are ever installed through this mode.
+BUILD_DEPS_ALLOWED=(build-essential dpkg-dev bc bison flex debhelper kmod libdw-dev libelf-dev libssl-dev python3 rsync xz-utils pahole zstd cpio openssl gawk)
+
+build_dep_allowed() {
+    local p
+    for p in "${BUILD_DEPS_ALLOWED[@]}"; do
+        [[ "$1" == "$p" ]] && return 0
+    done
+    return 1
+}
+
+do_install_build_deps() {
+    (( $# > 0 )) || die "No packages specified"
+    local p
+    for p in "$@"; do
+        build_dep_allowed "$p" || die "Refusing to install '$p': not one of the kernel build tools"
+    done
+    log "==== Installing kernel build tools: $* ===="
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" </dev/null >>"$LOGFILE" 2>&1; then
+        log "apt-get install failed — refreshing the package index and trying once more…"
+        apt-get update </dev/null >>"$LOGFILE" 2>&1 || log "apt-get update reported errors"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" </dev/null >>"$LOGFILE" 2>&1 \
+            || die "apt-get could not install: $*"
+    fi
+    log "==== Done. Build tools installed: $* ===="
+}
+
 # Run only when executed, not when sourced (scripts/tests/ sources this file
 # to unit-test the helper functions).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
@@ -1283,7 +1301,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         --boot-once)   do_boot_once "$ARG" ;;
         --setup-signing) do_setup_signing ;;
         --sign)        do_sign "$ARG" ;;
-        *) die "Usage: $0 --install <dir-of-debs> | --remove <kernel-version> | --remove-many <kernel-version>... | --boot-once <kernel-version> | --setup-signing (password on stdin) | --sign <kernel-version>" ;;
+        --install-build-deps) shift; do_install_build_deps "$@" ;;
+        *) die "Usage: $0 --install <build-dir> | --remove <kernel-version> | --remove-many <kernel-version>... | --boot-once <kernel-version> | --setup-signing (password on stdin) | --sign <kernel-version> | --install-build-deps <package>..." ;;
     esac
     exit 0
 fi

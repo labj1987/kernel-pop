@@ -4,6 +4,42 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.0.0 — 2026-10-24
+
+**Kernel Pop now builds kernels from kernel.org source.** Ubuntu's mainline kernel archive
+has stopped getting new builds, so Kernel Pop no longer uses it. Instead it takes the
+source straight from kernel.org, builds it for your machine and installs it.
+
+- The Browse tab lists kernel.org's current mainline, stable and longterm releases.
+  Download Source fetches the tarball and its signature into `~/Downloads/kernel-pop/`.
+  You can also open a tarball you already have, or drop a `linux-*.tar.xz` or `.tar.gz`
+  onto the window. The version is read from the source itself, never from the file name.
+- Every tarball's signature is checked against the keys of the kernel.org developers who
+  sign releases, fetched fresh from kernel.org each time. If a dropped tarball has no
+  `.tar.sign` next to it, kernel.org's is downloaded. A missing or bad signature blocks
+  the build. For a tree you patched yourself, turn on "Build unverified source" for that
+  tarball; the build log and the Install tab then say the source was unverified.
+- The new Build tab has three configurations: **Match this system** (the default, built
+  from the configuration of the kernel you are running), **Trim to this machine** (only
+  drivers for what is loaded right now, much faster to build; hardware that is not
+  plugged in may have no driver) and **Use my own .config**. The settings an Ubuntu
+  configuration needs for a kernel.org tree are fixed automatically, and you see a
+  summary before the build starts. New kernels are named like `7.2.12-kernelpop`.
+- Builds run as your own user, never as root. Missing build tools are listed and
+  installed with one authentication. ccache is used when it is installed, so the next
+  point release builds much faster.
+- While building you see the stage and the elapsed time, and Cancel stops the whole
+  build and removes what it wrote. The finished packages, the final configuration and
+  the build log go to `~/Downloads/kernel-pop/linux-<version>-kernelpop/`, and the build
+  folder is deleted.
+- The Install tab lists your finished builds. Only the kernel and its headers are
+  installed, never the C library headers package a kernel build also makes, and the
+  install checks every package again against the list written when it was built.
+- Kernels you installed earlier, from Ubuntu's mainline archive or anywhere else, still
+  show up on the System tab and can be removed, signed and booted as before.
+
+You can delete `/usr/lib/kernel-pop/kernel-ppa.gpg`; Kernel Pop no longer uses it.
+
 ## 1.6.0 — 2026-10-11
 
 **Downloads are now really verified.** Earlier versions checked the packages against the

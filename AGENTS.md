@@ -1,10 +1,16 @@
 # Kernel Pop (formerly MKI / Mainline Kernel Installer)
 
-GTK4 + libadwaita GUI, written in Rust, for browsing and installing Ubuntu
-mainline kernels from kernel.ubuntu.com. Distributed as a single AppImage.
-The core safety feature: every kernel in `/boot` is checked for a matching
-`initrd.img` and `/lib/modules` directory, so a kernel that would fail to
-boot is flagged *before* the reboot, not after.
+GTK4 + libadwaita GUI, written in Rust, that builds kernel.org kernels for
+this machine and installs them. The user picks a release from kernel.org's
+releases.json (or drops a source tarball onto the window); Kernel Pop checks
+its signature against the kernel.org developers' keys (fetched over WKD),
+configures it from the running kernel's config, builds Debian packages with
+`make bindeb-pkg` as the user, and installs them through the privileged
+script. Distributed as a single AppImage. The core safety feature: every
+kernel in `/boot` is checked for a matching `initrd.img` and `/lib/modules`
+directory, so a kernel that would fail to boot is flagged *before* the
+reboot, not after. The flow, the verification procedure, the config fixes
+and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
 
 ## Naming convention
 
@@ -20,21 +26,39 @@ boot is flagged *before* the reboot, not after.
 
 - `main.rs` — entry point, sets up the shared Tokio runtime and wires up
   the GTK application.
-- `ui.rs` — the GTK4/libadwaita UI: browse/install/log/system tabs. One
-  global busy state (`AppState::busy`, `begin_busy`/`end_busy`,
-  `refresh_controls`) serialises downloads and every privileged action:
-  while one runs, nothing that starts another is sensitive, including the
-  per-kernel buttons (they live in `kernels_list`). Toasts for runs that
-  can report problems come from `report_run`/`outcome_message`.
-- `versions.rs` — talks to kernel.ubuntu.com/mainline: lists versions,
-  resolves the generic-flavour amd64 `.deb` set, and fetches the
-  `CHECKSUMS`/`CHECKSUMS.gpg` from the directory the debs are in (see
-  Download verification).
-- `verify.rs` — checks a CHECKSUMS signature with `gpgv` against the
-  Ubuntu kernel PPA key built into the binary (`data/kernel-ppa.gpg`).
-- `download.rs` — downloads the set with progress, cancel (the typed
-  `Cancelled` error) and retries, verifies every SHA256, and writes the
-  CHECKSUMS pair next to the debs with explicit 0755/0644 modes.
+- `ui.rs` — the GTK4/libadwaita UI: system/browse/build/install/log tabs,
+  plus a window-wide drop target for tarballs. One global busy state
+  (`AppState::busy`, `begin_busy`/`end_busy`, `refresh_controls`)
+  serialises downloads, signature checks, builds and every privileged
+  action: while one runs, nothing that starts another is sensitive,
+  including the per-kernel buttons (they live in `kernels_list`). Worker
+  threads report through the `UiMsg` channel, drained in batches so a
+  build's output cannot flood GTK; the Log tab keeps the last
+  `LOG_MAX_LINES` lines (the whole output is in build.log). Toasts for runs
+  that can report problems come from `report_run`/`outcome_message`.
+- `kernelorg.rs` — kernel.org's releases.json (mainline, stable, longterm;
+  linux-next is left out) and the cdn.kernel.org `.tar.sign` URL for a
+  version (`fetch_signature`, for a dropped tarball without one).
+- `source.rs` — a tarball's compression (from its magic bytes) and kernel
+  version (VERSION/PATCHLEVEL/SUBLEVEL/EXTRAVERSION from the top-level
+  Makefile, streamed through `xz`/`gzip` only that far). Never from the file
+  name. `SourceVersion` gives kernel.org's name (7.3), `make kernelversion`'s
+  (7.3.0) and the Debian version (7.3.0-1, `~rcN` for a pre-release).
+- `verify.rs` — the kernel.org signature check: WKD key fetch for
+  torvalds@ and gregkh@kernel.org (and an @kernel.org signer the signature
+  names) into a throwaway GNUPGHOME, export to a keyring, `gpgv` over the
+  decompressed tar on stdin. `parse_gpgv_status` needs GOODSIG and VALIDSIG;
+  expired/revoked keys are refused.
+- `build.rs` — `BUILD_DEPS` (equal to the script's allowlist, a test checks),
+  `prepare` (disk preflight, extract into `~/.cache/kernel-pop/build/`,
+  configure, `ConfigSummary`) and `build` (`make bindeb-pkg`, publish to
+  `~/Downloads/kernel-pop/linux-<release>/` with `SHA256SUMS`, the final
+  config, build-info.txt and build.log, then delete the tree). Each command
+  runs in its own process group so `BuildControl::cancel` kills all of it.
+  Refuses to run as root.
+- `download.rs` — downloads files with progress, cancel (the typed
+  `Cancelled` error) and retries, into `.part` files renamed when complete,
+  with explicit 0755/0644 modes; `sha256_file`.
 - `system.rs` — inventories installed kernels and their boot health (the
   initrd/modules/boot-entry check described above; for kernelstub, whether
   the kernel is the `vmlinuz` or `vmlinuz.old` one and its ESP copy
@@ -49,27 +73,32 @@ boot is flagged *before* the reboot, not after.
   returns its output; refuses to run when the installed helper differs from
   the bundled one (`helper_problem`); tells a cancelled authentication from
   a refused one and from a failed script; parses the output protocol into
-  a `ScriptReport`. The signing setup's MOK password goes to the script on
+  a `ScriptReport`. `--install-build-deps` takes only names from the
+  script's `BUILD_DEPS_ALLOWED`. The signing setup's MOK password goes to the script on
   stdin, never in argv.
 
-## Download verification
+## Source and build verification
 
-- Mainline publishes the debs' hashes in `<version>/amd64/CHECKSUMS` (the
-  version page's own CHECKSUMS covers a build bundle, not the debs),
-  signed in `CHECKSUMS.gpg` by "Kernel PPA <kernel-ppa@canonical.com>",
-  primary key `60AA7B6F30434AE68E569963E50C6A0917C622B0`. Always fetch the
-  pair from the debs' own directory. A deb missing from CHECKSUMS, or
-  CHECKSUMS without a valid signature, is an error: the version is not
-  installable.
-- The privileged script trusts nothing in the download directory: it
-  enters it once, checks owner (`PKEXEC_UID`) and modes on each file it
-  has opened (`copy_trusted_file`, perl: O_NOFOLLOW|O_NONBLOCK and fstat),
-  copies the set into a root-only dir under `/var/tmp`, verifies the signature (with the keyring AppRun
-  installs as `/usr/lib/kernel-pop/kernel-ppa.gpg`) and every hash on that
-  copy, and installs only the copy.
-- `src/testdata/` holds a real signed CHECKSUMS pair for the tests. To
-  refresh `data/kernel-ppa.gpg`, export that fingerprint as a binary
-  (not armored) keyring.
+- Source: kernel.org signs the uncompressed tar; the `.tar.sign` is a
+  detached signature. A missing or bad signature blocks the build; the only
+  way past it is the per-tarball "Build unverified source" switch, which is
+  reset whenever the source changes and is recorded in build.log,
+  build-info.txt and the Install tab. No key or toolchain ships with the
+  app (nothing that can go stale).
+- Build: the app writes `SHA256SUMS` for the debs it built. The privileged
+  script trusts nothing in the build directory: it enters it once, checks
+  owner (`PKEXEC_UID`) and modes on each file it has opened
+  (`copy_trusted_file`, perl: O_NOFOLLOW|O_NONBLOCK and fstat), copies the
+  manifest and debs into a root-only dir under `/var/tmp`, checks every
+  hash on that copy (a deb not in the manifest, or a manifest entry
+  without its deb, is an error), and installs only the copy. The trust
+  anchor is the user who built the packages and authenticated through
+  pkexec.
+- `deb_allowed` admits only `linux-image-*` (never `-dbg`) and
+  `linux-headers-*`; `linux-libc-dev` would replace Ubuntu's own package and
+  is refused in the script, not just left out by the app. Every package
+  must belong to the one kernel `kver_from_debs` reads from the image
+  package's Package field.
 
 ## Privileged script output
 
@@ -104,9 +133,9 @@ boots once MOK Manager enrolls it.
 - With no key, `--install` only adds one "signing not set up" log line.
 - The script's test overrides (`KERNEL_POP_*`, listed at its top) exist
   only in the script; pkexec clears the environment, so they never reach a
-  real run. The script tests sign a copied EFI binary with a throwaway key,
-  sign CHECKSUMS with a throwaway gpg key, and stub mokutil, dpkg and the
-  boot loader tools; never run the real modes on a dev machine. CI sets
+  real run. The script tests sign a copied EFI binary with a throwaway key
+  and stub mokutil, dpkg, apt-get and the boot loader tools; never run the
+  real modes on a dev machine. CI sets
   `KERNEL_POP_REQUIRE_ALL_TESTS=1`, which turns a skipped test group into
   a failure.
 
@@ -122,10 +151,10 @@ writes only inside the checkout:
    `desktop-file-validate` exist and fails clearly if one is missing.
 2. `cargo build --release --locked`, with the compiler pinned in
    `rust-toolchain.toml`.
-3. Assembles the AppDir (binary, privileged script, kernel PPA keyring,
-   polkit policy, desktop file, icon, appdata) and runs
-   `desktop-file-validate` on the desktop file. AppRun installs the script,
-   keyring and policy to system paths through pkexec when they differ,
+3. Assembles the AppDir (binary, privileged script, polkit policy, desktop
+   file, icon, appdata) and runs `desktop-file-validate` on the desktop
+   file. AppRun installs the script and policy to system paths through
+   pkexec when they differ,
    says so on stderr when that is cancelled or fails, and exports
    `KERNEL_POP_BUNDLE` so the app can detect the mismatch and refuse to
    run an old helper.

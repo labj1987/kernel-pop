@@ -1,42 +1,65 @@
 # Kernel Pop
 
-GTK4 + libadwaita desktop app for installing Ubuntu mainline kernels from
-kernel.ubuntu.com, written in Rust. Distributed as an AppImage.
+GTK4 + libadwaita desktop app, written in Rust, that builds kernel.org
+kernels for this machine and installs them. Distributed as an AppImage.
+
+Pick a mainline, stable or longterm release on the Browse tab (or drop a
+`linux-*.tar.xz` / `.tar.gz` onto the window). Kernel Pop checks the
+tarball's signature against the kernel.org developers' keys, configures it
+from the configuration of the kernel you are running, builds Debian
+packages with `make bindeb-pkg` as your own user, and installs them with
+the same safety checks as always. See [docs/SOURCE_BUILD.md](docs/SOURCE_BUILD.md)
+for the details.
 
 ## Why this exists
 
-Mainline kernel tools have a habit of installing a kernel without
-generating its initramfs, because they parse the kernel version out of a
-filename and the mainline naming convention (7.1.3-070103-generic vs
-7.1.3-generic) breaks the parse. The result is a kernel that VFS-panics
-on boot. This app is built around not letting that happen:
+Kernel tools have a habit of installing a kernel without generating its
+initramfs, because they parse the kernel version out of a filename and an
+unexpected naming convention breaks the parse. The result is a kernel that
+VFS-panics on boot. This app is built around not letting that happen:
 
-- The kernel version is read from the .deb package metadata, never from
-  filenames, and cross-checked against the /lib/modules directory that
-  actually appears after install.
+- The kernel version is read from the source's Makefile and the .deb
+  package metadata, never from filenames, and cross-checked against the
+  /lib/modules directory that actually appears after install.
 - The initramfs is generated and then VERIFIED to exist in /boot before
   the install reports success. A missing initrd fails the install loudly.
 - The System tab health-checks every installed kernel for a missing
   initrd, modules directory, or boot menu entry, so a broken kernel is
   visible before a reboot instead of after.
-- Works with both GRUB and systemd-boot, detecting whichever one is
+- Works with GRUB, systemd-boot and kernelstub, detecting whichever one is
   actually active on the machine.
 
 ## Features
 
-- Browse stable mainline versions with newer/same/older badges relative
-  to the running kernel
-- A banner on the System tab when a newer mainline kernel is available
-- Optional release-candidate visibility on the Browse tab (off by default)
-- Every package is verified before it is installed: the CHECKSUMS file
-  must carry a valid signature from Ubuntu's kernel team (the "Kernel PPA"
-  key, built into the app), and each package must match its SHA256 there.
-  A version without signed checksums is not offered for install. The
-  install step repeats the whole check as root on a private copy, so the
-  files in your Downloads folder are never what gets installed
-- Per-file download progress with retries and cancellation
+- Browse kernel.org's current mainline, stable and longterm releases with
+  newer/same/older badges relative to the running kernel, and a banner on
+  the System tab when a newer stable release is out
+- Download a release's tarball and signature from cdn.kernel.org with
+  progress, retries and cancellation, or open or drop a tarball you already
+  have
+- Every source is verified before it is built: the signature must be a good
+  one from a kernel.org developer (Linus Torvalds or Greg Kroah-Hartman),
+  whose key is fetched from kernel.org over WKD each time. A dropped tarball
+  without its `.tar.sign` gets kernel.org's fetched. A missing or bad
+  signature blocks the build; for your own patched tree there is one
+  explicit "Build unverified source" switch per tarball, and the build log
+  says the source was unverified
+- Three configurations: **Match this system** (the default: the running
+  kernel's `/boot/config-*`), **Trim to this machine** (only drivers for
+  the modules loaded right now) and **Use my own .config**. The fixes every
+  Ubuntu config needs for a kernel.org tree are applied automatically, and
+  a summary is shown before the build starts
+- Builds never run as root. Missing build tools are listed and installed
+  with one authentication; ccache is used when installed
+- Live build stage and elapsed time, the output in the Log tab and in
+  `build.log`, and a Cancel button that stops the whole build
+- Only the kernel image and headers packages are installed, never the
+  `linux-libc-dev` package bindeb-pkg also builds. The install step checks
+  every package again as root on a private copy, against the manifest the
+  build wrote
 - Remove old kernels (running kernel is never removable), singly or
-  "keep the newest N" in one step
+  "keep the newest N" in one step. Kernels from other sources, such as
+  Ubuntu's own, are shown and managed the same way
 - Boot a chosen installed kernel on the next restart only
 - With Secure Boot on, a kernel that could not boot is never installed:
   the install is refused until signing is set up, and a kernel whose
@@ -48,7 +71,7 @@ on boot. This app is built around not letting that happen:
   kernel
 - DKMS modules (such as NVIDIA) are built for the new kernel and reported
   per module; a failure is a warning, not an install error
-- Disk space checks for / and for /boot (sized from the kernels already there)
+- Disk space checks for the build, / and /boot
 - Install log in-app plus /var/log/kernel-pop.log
 
 ## Install
@@ -59,52 +82,59 @@ Download the AppImage from the Releases page:
     ./kernel-pop-*-x86_64.AppImage
 
 First launch asks for authentication once to install the privileged
-helper script, the Ubuntu kernel signing key it checks downloads with, and
-the polkit policy to system paths. A new version asks once more to update
-them. If that authentication is cancelled, the app still opens but shows a
-banner, and installing, removing and signing kernels stay off until you
-restart it and authenticate.
+helper script and the polkit policy to system paths. A new version asks
+once more to update them. If that authentication is cancelled, the app
+still opens but shows a banner, and installing, removing and signing
+kernels stay off until you restart it and authenticate.
 
 ## Using it
 
 1. The System tab shows the running kernel and the health of every
    installed kernel.
-2. Pick a version on the Browse tab and hit Download. Packages land in
-   ~/Downloads/mainline-kernel-vX.Y.Z/, next to the signed CHECKSUMS they
-   were verified against.
-3. Review the staged packages on the Install tab and hit Install Kernel.
-4. Reboot when ready. The new kernel only reports success after its
-   initramfs is verified on disk.
+2. Pick a release on the Browse tab and hit Download Source (it lands in
+   `~/Downloads/kernel-pop/`), or open or drop a tarball. The Build tab
+   shows its version and whether its signature checked out.
+3. On the Build tab, choose a configuration, install any missing build
+   tools, and hit Build Kernel. Check the summary, then confirm. A build
+   takes a while; the finished packages go to
+   `~/Downloads/kernel-pop/linux-<version>-kernelpop/` with the final
+   config and the build log, and the build tree is deleted.
+4. Review the build on the Install tab and hit Install Kernel.
+5. Reboot when ready, or use Boot Next Time on the System tab to try it
+   once while keeping your current default. The new kernel only reports
+   success after its initramfs is verified on disk.
 
 ## Screenshots
 
-**System** — every installed kernel with initrd/modules health checks, a running badge, disk space, and a banner when a newer mainline kernel is available (hidden here since the running kernel is already current)
+**System** — every installed kernel with initrd/modules/boot-menu health checks, a running badge, Secure Boot and signing state, disk space, and a banner when a newer stable release is out
 
 ![System tab](docs/screenshots/system-tab.png)
 
-**Browse** — mainline versions badged against the running kernel, with an off-by-default toggle to show release candidates
+**Browse** — kernel.org's mainline, stable and longterm releases, badged against the running kernel
 
 ![Browse tab](docs/screenshots/browse-tab.png)
 
-**Install** — staged packages, checksum status, and the install action
+**Build** — the source and its signature check, the configuration mode, and the build tools, ccache and disk space it needs
+
+![Build tab](docs/screenshots/build-tab.png)
+
+**Install** — finished builds, each package checked against its manifest, and the install action
 
 ![Install tab](docs/screenshots/install-tab.png)
 
-**Log** — full run log, from version fetch through initramfs verification
+**Log** — the full run log, from the release list through the signature check
 
 ![Log tab](docs/screenshots/log-tab.png)
 
 ## Notes
 
-Developed and tested on Ubuntu 26.04, GNOME on Wayland. Daily builds are
-intentionally not listed; release candidates are hidden unless "Show
-release candidates" is turned on in the Browse tab.
+Developed and tested on Ubuntu 26.04, GNOME on Wayland.
 
 ### Secure Boot and kernel signing
 
-Mainline kernels are unsigned. With Secure Boot enforcing, shim refuses to
-boot an unsigned kernel, so a mainline kernel needs Kernel Pop's signing
-setup (or Secure Boot turned off) before it can boot:
+Kernels built from source are unsigned. With Secure Boot enforcing, shim
+refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
+(or Secure Boot turned off) before they can boot:
 
 1. On the System tab, Kernel signing → **Set Up Signing**. Choose a
    one-time password (8-16 characters). Kernel Pop installs `sbsigntool`,
@@ -139,6 +169,13 @@ signed with a key that is enrolled or waiting for enrollment:
 With Secure Boot off, every kernel installs; one that could not be signed
 is reported with a `SIGN WARNING`, and boots until Secure Boot is turned
 on.
+
+DKMS modules (such as NVIDIA) are signed with Ubuntu's MOK key, as usual.
+The kernels Kernel Pop builds keep the options that let a kernel trust
+enrolled MOK keys for module signatures (the machine keyring), and the
+build summary warns if a configuration turns them off. Whether a DKMS module
+then loads under Secure Boot depends, as with any kernel, on that MOK key
+being enrolled.
 
 ## Building from source
 

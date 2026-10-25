@@ -1,9 +1,11 @@
+mod build;
 mod download;
 mod install;
+mod kernelorg;
+mod source;
 mod system;
 mod ui;
 mod verify;
-mod versions;
 
 use gtk4::prelude::*;
 use std::sync::OnceLock;

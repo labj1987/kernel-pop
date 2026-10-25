@@ -1,8 +1,8 @@
 [package]
 name = "kernel-pop"
-version = "1.6.0"
+version = "2.0.0"
 edition = "2021"
-description = "Kernel Pop — GTK4 GUI for installing Ubuntu mainline kernels"
+description = "Kernel Pop — GTK4 GUI that builds kernel.org kernels for this machine and installs them"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"
 
@@ -21,8 +21,10 @@ sha2 = "0.11"
 hex = "0.4"
 anyhow = "1"
 futures-util = "0.3"
-scraper = "0.27"
-regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

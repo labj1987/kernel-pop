@@ -21,8 +21,6 @@ skip() {
         echo "SKIP: $*"
     fi
 }
-FIXTURES="$HERE/../../src/testdata"
-REAL_KEYRING="$HERE/../../data/kernel-ppa.gpg"
 
 for v in 7.1.3-070103-generic 6.8.0-45-generic 6.10.0+rc1 a.b_c; do
     valid_kver "$v" || bad "valid_kver should accept [$v]"
@@ -35,17 +33,25 @@ done
 dpkg-deb() { local b; b="$(basename "$2")"; echo "${b%%_*}"; }
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
-deb_allowed "$tmp/linux-image-unsigned-1.2.3-generic_1_amd64.deb" || bad "deb_allowed image"
-deb_allowed "$tmp/linux-modules-1.2.3-generic_1_amd64.deb"        || bad "deb_allowed modules"
-deb_allowed "$tmp/linux-headers-1.2.3_1_all.deb"                  || bad "deb_allowed headers"
+deb_allowed "$tmp/linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb"   || bad "deb_allowed image"
+deb_allowed "$tmp/linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb" || bad "deb_allowed headers"
+deb_allowed "$tmp/linux-libc-dev_7.2.12-1_amd64.deb"      && bad "deb_allowed must refuse linux-libc-dev (it would replace Ubuntu's)"
+deb_allowed "$tmp/linux-image-7.2.12-kernelpop-dbg_7.2.12-1_amd64.deb" && bad "deb_allowed must refuse a -dbg package"
+deb_allowed "$tmp/linux-modules-7.2.12-generic_1_amd64.deb" && bad "deb_allowed should refuse linux-modules"
+deb_allowed "$tmp/linux-image-_1_amd64.deb" && bad "deb_allowed should refuse an empty kernel name"
 deb_allowed "$tmp/evil-pkg_1_amd64.deb"  && bad "deb_allowed should reject evil-pkg"
 deb_allowed "$tmp/bash_1_amd64.deb"      && bad "deb_allowed should reject bash"
 
-touch "$tmp/linux-headers-7.1.3-070103_1_all.deb" \
-      "$tmp/linux-image-unsigned-7.1.3-070103-generic_1_amd64.deb" \
-      "$tmp/linux-modules-7.1.3-070103-generic_1_amd64.deb"
-got="$(kver_from_debs "$tmp")"
-[[ "$got" == "7.1.3-070103-generic" ]] || bad "kver_from_debs got [$got]"
+mkdir -p "$tmp/kv"
+touch "$tmp/kv/linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb" \
+      "$tmp/kv/linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb" \
+      "$tmp/kv/linux-image-7.2.12-kernelpop-dbg_7.2.12-1_amd64.deb" \
+      "$tmp/kv/linux-libc-dev_7.2.12-1_amd64.deb"
+got="$(kver_from_debs "$tmp/kv")"
+[[ "$got" == "7.2.12-kernelpop" ]] || bad "kver_from_debs got [$got]"
+touch "$tmp/kv/linux-image-7.2.11-kernelpop_7.2.11-1_amd64.deb"
+kver_from_debs "$tmp/kv" >/dev/null && bad "kver_from_debs should fail with two kernel images"
+rm -rf "$tmp/kv"
 
 empty="$(mktemp -d)"
 kver_from_debs "$empty" >/dev/null && bad "kver_from_debs should fail on empty dir"
@@ -260,18 +266,16 @@ unset -f mokutil
     exit 0
 ) || bad "secure_boot_preflight case $?"
 
-# ── Download verification (root side) ───────────────────────────────────
-printf 'hash file\n' > "$tmp/ck"
-cat > "$tmp/CHECKSUMS" <<EOF2
-# Checksums-Sha1:
-$(printf '%040d' 1)  linux-a_1_amd64.deb
-# Checksums-Sha256:
+# ── Build verification (root side) ──────────────────────────────────────
+cat > "$tmp/SHA256SUMS" <<EOF2
 $(printf 'A%.0s' {1..64})  linux-a_1_amd64.deb
-$(printf 'b%.0s' {1..64}) *amd64/linux-b_1_all.deb
+$(printf 'b%.0s' {1..64})  linux-b_1_amd64.deb
+$(printf 'c%.0s' {1..64})  sub/linux-c_1_amd64.deb
 EOF2
-[[ "$(checksum_for "$tmp/CHECKSUMS" linux-a_1_amd64.deb)" == "$(printf 'a%.0s' {1..64})" ]] || bad "checksum_for sha256 (lowercased)"
-[[ "$(checksum_for "$tmp/CHECKSUMS" linux-b_1_all.deb)" == "$(printf 'b%.0s' {1..64})" ]] || bad "checksum_for with a path prefix"
-[[ -z "$(checksum_for "$tmp/CHECKSUMS" linux-c_1_amd64.deb)" ]] || bad "checksum_for an unlisted file"
+[[ "$(manifest_hash_for "$tmp/SHA256SUMS" linux-a_1_amd64.deb)" == "$(printf 'a%.0s' {1..64})" ]] || bad "manifest_hash_for (lowercased)"
+[[ "$(manifest_hash_for "$tmp/SHA256SUMS" linux-b_1_amd64.deb)" == "$(printf 'b%.0s' {1..64})" ]] || bad "manifest_hash_for second entry"
+[[ -z "$(manifest_hash_for "$tmp/SHA256SUMS" linux-c_1_amd64.deb)" ]] || bad "manifest_hash_for must compare the whole name, not a path suffix"
+[[ -z "$(manifest_hash_for "$tmp/SHA256SUMS" linux-x_1_amd64.deb)" ]] || bad "manifest_hash_for an unlisted file"
 
 PKEXEC_UID="$(id -u)"; export PKEXEC_UID
 mkdir -p "$tmp/trust"; chmod 0755 "$tmp/trust"
@@ -300,22 +304,6 @@ PKEXEC_UID=$(( $(id -u) + 1 )) path_trusted "$tmp/trust/f" >/dev/null && bad "pa
     rm -f fifo
     exit 0
 ) || bad "copy_trusted_file case $?"
-
-# The real Ubuntu kernel PPA signature over a real mainline CHECKSUMS
-if ! command -v gpgv >/dev/null 2>&1; then
-    skip "gpgv not installed — signature tests"
-else
-    mkdir -p "$tmp/real"
-    cp "$FIXTURES/v6.17-amd64-CHECKSUMS" "$tmp/real/CHECKSUMS"
-    cp "$FIXTURES/v6.17-amd64-CHECKSUMS.gpg" "$tmp/real/CHECKSUMS.gpg"
-    KERNEL_POP_KEYRING="$REAL_KEYRING" checksums_signature_ok "$tmp/real" >/dev/null || bad "the real CHECKSUMS signature should verify"
-    [[ -n "$(compgen -G "$tmp/real/.gnupg.*")" ]] && bad "checksums_signature_ok left its gpg home behind"
-    KERNEL_POP_KEYRING="$REAL_KEYRING" KERNEL_POP_SIGNER_FPR=0000000000000000000000000000000000000000 \
-        checksums_signature_ok "$tmp/real" >/dev/null && bad "a signature from another key than the pinned one should be refused"
-    echo "extra line" >> "$tmp/real/CHECKSUMS"
-    KERNEL_POP_KEYRING="$REAL_KEYRING" checksums_signature_ok "$tmp/real" >/dev/null && bad "a tampered CHECKSUMS should not verify"
-    KERNEL_POP_KEYRING="$tmp/no-such-keyring" checksums_signature_ok "$tmp/real" >/dev/null && bad "a missing keyring should fail"
-fi
 
 # ── Kernel signing ───────────────────────────────────────────────────────
 for p in 'abcdefgh' 'Abc123!@#$%^&*()' 'p4ssw0rd~'; do
@@ -518,65 +506,59 @@ else
 fi
 unset KERNEL_POP_MOK_DIR KERNEL_POP_SIGNED_DIR KERNEL_POP_BOOT
 
-# ── Staging and verifying a download, then do_install end to end ────────
-# A throwaway gpg key stands in for Ubuntu's kernel PPA key; every system
-# command do_install runs is stubbed, and every path points into $tmp.
-if ! command -v gpg >/dev/null 2>&1 || ! command -v gpgv >/dev/null 2>&1; then
-    skip "gpg/gpgv not installed — download verification and do_install tests"
-else
-    export GNUPGHOME="$tmp/gnupg"
-    mkdir -p "$GNUPGHOME"; chmod 0700 "$GNUPGHOME"
-    gpg --batch --pinentry-mode loopback --passphrase '' \
-        --quick-gen-key 'Kernel Pop test <test@invalid>' rsa2048 sign never >/dev/null 2>&1 \
-        || bad "could not create the throwaway gpg key"
-    test_fpr="$(gpg --with-colons --list-keys 2>/dev/null | grep -m1 '^fpr' | cut -d: -f10)"
-    gpg --export > "$tmp/test-ring.gpg" 2>/dev/null
-    export KERNEL_POP_KEYRING="$tmp/test-ring.gpg" KERNEL_POP_SIGNER_FPR="$test_fpr"
+# ── Staging and verifying a build, then do_install end to end ───────────
+# Every system command do_install runs is stubbed, and every path points
+# into $tmp.
+(
     PKEXEC_UID="$(id -u)"; export PKEXEC_UID
-    kv=7.7.7-070707-generic
-    make_download() {   # <dir>: a signed, consistent download of fake debs
-        local d="$1" f
+    kv=7.7.7-kernelpop
+    make_build() {   # <dir> [extra deb names...]: a consistent build of fake debs with its manifest
+        local d="$1" f; shift
         rm -rf "$d"; mkdir -p "$d"; chmod 0755 "$d"
-        for f in "linux-headers-7.7.7-070707_7.7.7-070707.1_all.deb" \
-                 "linux-image-unsigned-${kv}_7.7.7-070707.1_amd64.deb" \
-                 "linux-modules-${kv}_7.7.7-070707.1_amd64.deb"; do
+        for f in "linux-headers-${kv}_7.7.7-1_amd64.deb" "linux-image-${kv}_7.7.7-1_amd64.deb" "$@"; do
             echo "contents of $f" > "$d/$f"; chmod 0644 "$d/$f"
         done
-        (cd "$d" && { echo "# Checksums-Sha256:"; sha256sum ./*.deb | sed 's| \./| |'; } > CHECKSUMS)
-        gpg --batch --yes --detach-sign -o "$d/CHECKSUMS.gpg" "$d/CHECKSUMS" 2>/dev/null
-        chmod 0644 "$d/CHECKSUMS" "$d/CHECKSUMS.gpg"
+        (cd "$d" && sha256sum ./*.deb | sed 's| \./| |' > SHA256SUMS)
+        chmod 0644 "$d/SHA256SUMS"
+        echo "config" > "$d/config-$kv"; echo "log" > "$d/build.log"
     }
     stage_ok() { local s; s="$(mktemp -d)"; (stage_verified_debs "$1" "$s") >"$tmp/stage-out" 2>&1; local r=$?; rm -rf "$s"; return $r; }
+    fails=0
 
-    make_download "$tmp/dl"
-    stage_ok "$tmp/dl" || bad "stage_verified_debs should accept a good download: $(cat "$tmp/stage-out")"
+    make_build "$tmp/dl"
+    stage_ok "$tmp/dl" || bad "stage_verified_debs should accept a good build: $(cat "$tmp/stage-out")"
     s="$(mktemp -d)"; (stage_verified_debs "$tmp/dl" "$s") >/dev/null 2>&1
-    [[ "$(ls "$s" | sort | tr '\n' ' ')" == "CHECKSUMS CHECKSUMS.gpg linux-headers-7.7.7-070707_7.7.7-070707.1_all.deb linux-image-unsigned-${kv}_7.7.7-070707.1_amd64.deb linux-modules-${kv}_7.7.7-070707.1_amd64.deb " ]] \
+    [[ "$(ls "$s" | LC_ALL=C sort | tr '\n' ' ')" == "SHA256SUMS linux-headers-${kv}_7.7.7-1_amd64.deb linux-image-${kv}_7.7.7-1_amd64.deb " ]] \
         || bad "stage_verified_debs copied [$(ls "$s" | tr '\n' ' ')]"
     rm -rf "$s"
-    echo tampered >> "$tmp/dl/linux-modules-${kv}_7.7.7-070707.1_amd64.deb"
-    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a deb that does not match its hash"
+    echo tampered >> "$tmp/dl/linux-image-${kv}_7.7.7-1_amd64.deb"
+    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a deb that does not match the manifest"
     grep -q "SHA256 mismatch" "$tmp/stage-out" || bad "a hash mismatch should say so: $(cat "$tmp/stage-out")"
-    make_download "$tmp/dl"; echo extra > "$tmp/dl/linux-extra_1_amd64.deb"; chmod 0644 "$tmp/dl/linux-extra_1_amd64.deb"
-    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a deb missing from CHECKSUMS"
-    grep -q "not listed in the signed CHECKSUMS" "$tmp/stage-out" || bad "an unlisted deb should say so"
-    make_download "$tmp/dl"; rm "$tmp/dl/CHECKSUMS.gpg"
-    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a download without CHECKSUMS.gpg"
-    make_download "$tmp/dl"; echo "$(printf '0%.0s' {1..64})  linux-x.deb" >> "$tmp/dl/CHECKSUMS"
-    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a CHECKSUMS changed after signing"
-    make_download "$tmp/dl"; chmod 0664 "$tmp/dl/linux-modules-${kv}_7.7.7-070707.1_amd64.deb"
+    make_build "$tmp/dl"; echo extra > "$tmp/dl/linux-extra_1_amd64.deb"; chmod 0644 "$tmp/dl/linux-extra_1_amd64.deb"
+    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a deb missing from the manifest"
+    grep -q "not listed in SHA256SUMS" "$tmp/stage-out" || bad "an unlisted deb should say so"
+    make_build "$tmp/dl"; rm "$tmp/dl/SHA256SUMS"
+    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a build without SHA256SUMS"
+    make_build "$tmp/dl"; rm "$tmp/dl/linux-headers-${kv}_7.7.7-1_amd64.deb"
+    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a set missing a package the manifest lists"
+    grep -q "the set is incomplete" "$tmp/stage-out" || bad "an incomplete set should say so: $(cat "$tmp/stage-out")"
+    make_build "$tmp/dl"; chmod 0664 "$tmp/dl/linux-image-${kv}_7.7.7-1_amd64.deb"
     stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a group-writable deb"
-    make_download "$tmp/dl"; chmod 0775 "$tmp/dl"
+    make_build "$tmp/dl"; chmod 0664 "$tmp/dl/SHA256SUMS"
+    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a group-writable manifest"
+    make_build "$tmp/dl"; chmod 0775 "$tmp/dl"
     stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a group-writable directory"
-    make_download "$tmp/dl"
-    (KERNEL_POP_SIGNER_FPR=0000000000000000000000000000000000000000 stage_ok "$tmp/dl") && bad "stage_verified_debs should refuse a signature by another key"
+    make_build "$tmp/dl"; ln -s "$tmp/dl" "$tmp/dl-link"
+    stage_ok "$tmp/dl-link" && bad "stage_verified_debs should refuse a symlinked directory"
+    (PKEXEC_UID=$(( $(id -u) + 1 )) stage_ok "$tmp/dl") && bad "stage_verified_debs should refuse a build owned by someone other than the caller"
 
     # do_install, with the boot loader, dpkg and friends stubbed.
     running="$(uname -r)"
     run_install() {   # <scenario-name> [extra settings via env]; prints the script output
         local root="$tmp/inst-$1"
         rm -rf "$root"; mkdir -p "$root/boot" "$root/modules" "$root/staging" "$root/mok"
-        make_download "$root/dl"
+        # shellcheck disable=SC2086
+        make_build "$root/dl" ${EXTRA_DEBS:-}
         cat > "$root/grub.cfg" <<EOF2
 menuentry 'Ubuntu' --class ubuntu \$menuentry_id_option 'gnulinux-simple-x' {
 }
@@ -608,7 +590,7 @@ EOF2
             apt-get() { echo "$*" >> "$root/apt-args"; [[ "$1" == "purge" ]]; }
             update-initramfs() { touch "$KERNEL_POP_BOOT/initrd.img-$3"; }   # -c|-u -k <kver>
             if [[ -n "${DKMS_BROKEN:-}" ]]; then
-                dkms() { [[ "$1" == "status" ]] && echo "nvidia/550.54, $kv, x86_64: built"; [[ "$1" == "status" ]]; }
+                dkms() { [[ "$1" == "status" ]] && echo "nvidia/615.78.08, $kv, x86_64: built"; [[ "$1" == "status" ]]; }
             else
                 dkms() { return 0; }
             fi
@@ -629,6 +611,7 @@ EOF2
     out="$(DKMS_BROKEN=1 run_install off)" || bad "do_install (Secure Boot off) failed: $out"
     root="$tmp/inst-off"
     [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$kv-advanced-x" ]] || bad "saved default should point at the new kernel, got $(cat "$root/saved")"
+    grep -q "Kernel version (from package metadata): $kv" <<< "$out" || bad "the version should come from the image package: $out"
     grep -q "Reboot when ready" <<< "$out" || bad "a bootable install should end with Reboot when ready"
     grep -q "BOOT PENDING" <<< "$out" && bad "no BOOT marker expected with Secure Boot off"
     [[ "$(count 'DKMS WARNING:' "$out")" == 1 ]] || bad "one broken module should give one DKMS WARNING line, got $(count 'DKMS WARNING:' "$out")"
@@ -636,12 +619,24 @@ EOF2
     while IFS= read -r f; do
         [[ "$f" == "$root/staging/kernel-pop-install."*/*.deb ]] || bad "dpkg installed $f, not a staged copy"
     done < "$root/dpkg-args"
-    [[ "$(wc -l < "$root/dpkg-args")" == 3 ]] || bad "dpkg should get all three debs"
+    [[ "$(wc -l < "$root/dpkg-args")" == 2 ]] || bad "dpkg should get the image and the headers"
     [[ -z "$(ls -A "$root/staging")" ]] || bad "do_install left its staging directory behind"
 
     # GRUB_DISABLE_SUBMENU=y: the saved default is the bare entry id
     out="$(FLAT_GRUB=1 run_install flat)" || bad "do_install (flat GRUB menu) failed: $out"
     [[ "$(cat "$tmp/inst-flat/saved")" == "gnulinux-$kv-advanced-x" ]] || bad "flat menu saved default got $(cat "$tmp/inst-flat/saved")"
+
+    # linux-libc-dev in the set (even listed in the manifest): refused, nothing installed
+    out="$(EXTRA_DEBS="linux-libc-dev_7.7.7-1_amd64.deb" run_install libc)" && bad "do_install must refuse a set with linux-libc-dev"
+    [[ -e "$tmp/inst-libc/dpkg-args" ]] && bad "dpkg ran on a set with linux-libc-dev"
+    grep -q "never linux-libc-dev" <<< "$out" || bad "the libc-dev refusal should say why: $out"
+    # A -dbg package: refused the same way
+    out="$(EXTRA_DEBS="linux-image-${kv}-dbg_7.7.7-1_amd64.deb" run_install dbg)" && bad "do_install must refuse a set with a -dbg package"
+    [[ -e "$tmp/inst-dbg/dpkg-args" ]] && bad "dpkg ran on a set with a -dbg package"
+    # Headers of another kernel: refused
+    out="$(EXTRA_DEBS="linux-headers-7.7.6-kernelpop_7.7.6-1_amd64.deb" run_install otherheaders)" && bad "do_install must refuse headers of another kernel"
+    grep -q "does not belong to kernel $kv" <<< "$out" || bad "the mixed-set refusal should say why: $out"
+    [[ -e "$tmp/inst-otherheaders/dpkg-args" ]] && bad "dpkg ran on a mixed set"
 
     # Secure Boot enforcing, no key: refused before anything is installed
     out="$(SB_ON=1 run_install nokey)" && bad "do_install should refuse with Secure Boot on and no key"
@@ -659,7 +654,7 @@ EOF2
     out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled run_install signfail)" && bad "do_install should fail when signing fails under Secure Boot"
     root="$tmp/inst-signfail"
     [[ "$(count 'SIGN WARNING:' "$out")" == 1 ]] || bad "a failed sign should give exactly one SIGN WARNING line, got $(count 'SIGN WARNING:' "$out")"
-    [[ "$(cat "$root/apt-args" 2>/dev/null)" == "purge -y linux-headers-7.7.7-070707 linux-image-unsigned-$kv linux-modules-$kv" ]] \
+    [[ "$(cat "$root/apt-args" 2>/dev/null)" == "purge -y linux-headers-$kv linux-image-$kv" ]] \
         || bad "the rollback should purge exactly the installed packages, got [$(cat "$root/apt-args" 2>/dev/null)]"
     grep -q "removed again. Nothing is left installed" <<< "$out" || bad "the rollback should be reported: $out"
     [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "a rolled-back install changed the default"
@@ -680,27 +675,46 @@ EOF2
     out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled run_install enrolled)" || bad "do_install (enrolled) failed: $out"
     grep -q "Reboot when ready" <<< "$out" || bad "enrolled: should end with Reboot when ready"
 
-    # A tampered download never reaches dpkg
+    # A tampered build never reaches dpkg
     root="$tmp/inst-off"
     out="$(
-        make_download "$root/dl"; echo bad >> "$root/dl/linux-image-unsigned-${kv}_7.7.7-070707.1_amd64.deb"
+        make_build "$root/dl"; echo bad >> "$root/dl/linux-image-${kv}_7.7.7-1_amd64.deb"
         rm -f "$root/dpkg-args"
         dpkg() { echo called > "$root/dpkg-args"; }
         KERNEL_POP_STAGING="$root/staging" do_install "$root/dl" 2>&1
-    )" && bad "do_install should fail on a tampered download"
-    [[ -e "$root/dpkg-args" ]] && bad "dpkg ran on a tampered download"
+    )" && bad "do_install should fail on a tampered build"
+    [[ -e "$root/dpkg-args" ]] && bad "dpkg ran on a tampered build"
     [[ -z "$(ls -A "$root/staging")" ]] || bad "a refused install left its staging directory behind"
+    exit "$fails"
+) || { echo "FAIL: staging/do_install group"; fails=$((fails + 1)); }
 
-    gpgconf --homedir "$GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
-    unset GNUPGHOME KERNEL_POP_KEYRING KERNEL_POP_SIGNER_FPR PKEXEC_UID
-fi
+# ── Build tools: only allowlisted packages ever reach apt-get ────────────
+(
+    fails=0
+    apt-get() { echo "$*" >> "$tmp/deps-apt"; return 0; }
+    rm -f "$tmp/deps-apt"
+    out="$(do_install_build_deps pahole zstd 2>&1)" || bad "do_install_build_deps should install allowlisted packages: $out"
+    [[ "$(cat "$tmp/deps-apt")" == "install -y pahole zstd" ]] || bad "apt-get got [$(cat "$tmp/deps-apt" 2>/dev/null)]"
+    rm -f "$tmp/deps-apt"
+    (do_install_build_deps pahole bash >/dev/null 2>&1) && bad "do_install_build_deps should refuse a package outside the allowlist"
+    (do_install_build_deps 'pahole;id' >/dev/null 2>&1) && bad "do_install_build_deps should refuse an odd name"
+    (do_install_build_deps '../x' >/dev/null 2>&1) && bad "do_install_build_deps should refuse a path"
+    [[ -e "$tmp/deps-apt" ]] && bad "apt-get ran for a refused package list"
+    (do_install_build_deps >/dev/null 2>&1) && bad "do_install_build_deps should fail with no packages"
+    # A failed install is retried once after an index refresh
+    apt-get() { echo "$*" >> "$tmp/deps-apt"; [[ "$1" == "update" || -e "$tmp/deps-updated" ]] && { touch "$tmp/deps-updated"; return 0; }; return 1; }
+    rm -f "$tmp/deps-apt" "$tmp/deps-updated"
+    do_install_build_deps cpio >/dev/null 2>&1 || bad "do_install_build_deps should succeed after an index refresh"
+    [[ "$(tr '\n' '|' < "$tmp/deps-apt")" == "install -y cpio|update|install -y cpio|" ]] || bad "retry sequence got [$(tr '\n' '|' < "$tmp/deps-apt")]"
+    exit "$fails"
+) || { echo "FAIL: build tools group"; fails=$((fails + 1)); }
 
-# Optional: a real mainline download (debs + CHECKSUMS + CHECKSUMS.gpg) in
-# $KERNEL_POP_TEST_REAL_DEBS is verified with the real keyring.
+# Optional: a real finished build (debs + SHA256SUMS) in
+# $KERNEL_POP_TEST_REAL_DEBS is staged and verified.
 if [[ -n "${KERNEL_POP_TEST_REAL_DEBS:-}" ]]; then
     s="$(mktemp -d)"
-    out="$(PKEXEC_UID="$(id -u)" KERNEL_POP_KEYRING="$REAL_KEYRING" stage_verified_debs "$KERNEL_POP_TEST_REAL_DEBS" "$s" 2>&1)" \
-        || bad "the real download did not verify: $out"
+    out="$(PKEXEC_UID="$(id -u)" stage_verified_debs "$KERNEL_POP_TEST_REAL_DEBS" "$s" 2>&1)" \
+        || bad "the real build did not verify: $out"
     echo "$out" | grep "Verified"
     rm -rf "$s"
 fi

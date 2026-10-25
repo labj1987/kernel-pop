@@ -1,24 +1,32 @@
-use crate::download::{download_deb_set, is_cancelled, Progress};
-use crate::install::{
-    helper_problem, run_privileged_boot_once, run_privileged_install, run_privileged_remove,
-    run_privileged_remove_many, run_privileged_setup_signing, run_privileged_sign,
-    validate_mok_password, BootOutlook, ScriptReport,
+use crate::build::{
+    self, built_sets, ccache_available, free_bytes, is_build_cancelled, missing_build_deps,
+    space_problem, verify_built_set, BuildControl, BuildEvent, BuildRequest, BuiltSet, ConfigMode,
+    EventSink, Prepared, SourceTrust, Stage,
 };
+use crate::download::{download_files, is_cancelled, Progress, Remote};
+use crate::install::{
+    helper_problem, run_privileged_boot_once, run_privileged_install,
+    run_privileged_install_build_deps, run_privileged_remove, run_privileged_remove_many,
+    run_privileged_setup_signing, run_privileged_sign, validate_mok_password, BootOutlook,
+    ScriptReport,
+};
+use crate::kernelorg::{fetch_releases, fetch_signature, url_file_name, Moniker, Release};
+use crate::source::{inspect, Tarball};
 use crate::system::{
     compare_to_running, format_bytes, health_summary, install_blocker, install_warnings,
     prune_candidates, query_system, BootEntry, KernelSignature, KernelSigning, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
-use crate::versions::{fetch_deb_list, fetch_versions, KernelVersion};
+use crate::verify::{verify_tarball, Signer};
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, ListBox, Orientation, PasswordEntry, ProgressBar,
-    ScrolledWindow, SelectionMode, SpinButton, Spinner, Stack, Switch, TextView, WrapMode,
+    Align, Box as GtkBox, Button, CheckButton, Label, ListBox, Orientation, PasswordEntry,
+    ProgressBar, ScrolledWindow, SelectionMode, SpinButton, Spinner, Stack, TextView, WrapMode,
 };
 use libadwaita::prelude::*;
 use libadwaita::{
     AboutDialog, ActionRow, AlertDialog, Application, ApplicationWindow, Banner, HeaderBar,
-    PreferencesGroup, Toast, ToastOverlay,
+    PreferencesGroup, SwitchRow, Toast, ToastOverlay,
 };
 
 use std::cell::RefCell;
@@ -33,11 +41,11 @@ use std::sync::Arc;
 /// Late-bound handle to load_sysinfo, for callbacks created inside it.
 type ReloadSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
-/// Starts a download or privileged action under the global busy state, or
-/// returns None (with a toast) when another one is still running. The busy
-/// state lasts as long as the returned guard: move it into the action's
-/// completion callback, so it is released even when that callback never
-/// runs (a panicking task drops the callback, and with it the guard).
+/// Starts a download, build or privileged action under the global busy
+/// state, or returns None (with a toast) when another one is still running.
+/// The busy state lasts as long as the returned guard: move it into the
+/// action's completion callback, so it is released even when that callback
+/// never runs (a panicking task drops the callback, and with it the guard).
 type BeginBusy = Rc<dyn Fn(&'static str) -> Option<BusyGuard>>;
 
 struct BusyGuard(Rc<dyn Fn()>);
@@ -48,24 +56,85 @@ impl Drop for BusyGuard {
     }
 }
 
+/// Where the selected source's signature check stands.
+#[derive(Clone, Default)]
+enum SigState {
+    #[default]
+    None,
+    Checking,
+    Verified(Signer),
+    Failed(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Default)]
+enum ModeChoice {
+    #[default]
+    Match,
+    Trim,
+    Own,
+}
+
 #[derive(Default)]
 struct AppState {
-    versions: Vec<KernelVersion>,
-    selected_version: Option<KernelVersion>,
-    /// Directory of verified downloaded debs, ready to install.
-    staged_dir: Option<PathBuf>,
-    staged_version: Option<String>,
-    /// Package file names; every one verified against the signed CHECKSUMS.
-    staged_files: Vec<String>,
+    releases: Vec<Release>,
+    selected_release: Option<Release>,
+    /// The tarball on the Build page.
+    source: Option<Tarball>,
+    signature: SigState,
+    /// "Build unverified source", given for this one tarball only.
+    allow_unverified: bool,
+    mode: ModeChoice,
+    own_config: Option<PathBuf>,
+    missing_deps: Vec<String>,
+    /// Finished builds in ~/Downloads/kernel-pop, newest first.
+    built: Vec<BuiltSet>,
+    /// The build selected on the Install tab, and whether its packages
+    /// matched its manifest.
+    staged: Option<BuiltSet>,
+    staged_verified: bool,
     sysinfo: SystemInfo,
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// What is running right now, if anything: one download or privileged
-    /// action at a time. While set, every control that would start another
-    /// one is insensitive (see refresh_controls).
+    build_control: Option<Arc<BuildControl>>,
+    build_started: Option<std::time::Instant>,
+    /// What is running right now, if anything: one download, build or
+    /// privileged action at a time. While set, every control that would
+    /// start another one is insensitive (see refresh_controls).
     busy: Option<&'static str>,
-    /// RC-visibility toggle on the Browse tab. Off by default.
-    show_rc: bool,
 }
+
+impl AppState {
+    fn config_mode(&self) -> Option<ConfigMode> {
+        match self.mode {
+            ModeChoice::Match => Some(ConfigMode::MatchSystem),
+            ModeChoice::Trim => Some(ConfigMode::TrimToMachine),
+            ModeChoice::Own => self.own_config.clone().map(ConfigMode::OwnConfig),
+        }
+    }
+
+    /// The trust a build of the current source would carry, or None while
+    /// it may not be built.
+    fn source_trust(&self) -> Option<SourceTrust> {
+        match &self.signature {
+            SigState::Verified(s) => Some(SourceTrust::Verified(s.clone())),
+            SigState::Failed(reason) if self.allow_unverified => Some(SourceTrust::Unverified { reason: reason.clone() }),
+            _ => None,
+        }
+    }
+
+    fn can_build(&self) -> bool {
+        self.source.is_some() && self.source_trust().is_some() && self.missing_deps.is_empty() && self.config_mode().is_some()
+    }
+}
+
+/// Messages from worker threads to the GTK main loop: log lines (batched
+/// into the Log tab) and build stages.
+enum UiMsg {
+    Log(String),
+    Stage(Stage),
+}
+
+/// The Log tab keeps this many lines; the full build output is in build.log.
+const LOG_MAX_LINES: i32 = 6000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Async bridge: run future on Tokio, deliver result to GTK main thread
@@ -105,9 +174,9 @@ fn secure_boot_subtitle(sb: SecureBoot, signing: KernelSigning) -> &'static str 
         (SecureBoot::Enabled, KernelSigning::KeyNotEnrolled | KernelSigning::Unknown) =>
             "Enabled — signed kernels boot only once the signing key is enrolled",
         (SecureBoot::Enabled, KernelSigning::NoKey) =>
-            "Enabled — unsigned mainline kernels will not boot while it is on",
+            "Enabled — unsigned kernels built from source will not boot while it is on",
         (SecureBoot::Disabled, KernelSigning::NoKey) =>
-            "Off — unsigned mainline kernels can boot",
+            "Off — unsigned kernels can boot",
         (SecureBoot::Disabled, _) =>
             "Off — every kernel can boot; kernels are still signed as they are installed",
         (SecureBoot::Unknown, _) =>
@@ -190,8 +259,8 @@ pub fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Kernel Pop")
-        .default_width(780)
-        .default_height(660)
+        .default_width(860)
+        .default_height(820)
         .build();
 
     let toast_overlay = ToastOverlay::new();
@@ -226,7 +295,7 @@ pub fn build_ui(app: &Application) {
     sysinfo_page.set_margin_start(12);
     sysinfo_page.set_margin_end(12);
 
-    // "Newer kernel available" banner — populated by a background mainline
+    // "Newer kernel available" banner — populated by a background kernel.org
     // fetch after the (local, fast) system query renders; see load_sysinfo.
     let update_banner = Banner::new("");
     update_banner.set_revealed(false);
@@ -283,7 +352,7 @@ pub fn build_ui(app: &Application) {
     stack.add_titled(&sys_scroll, Some("system"), "System");
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE 2: Browse — mainline versions
+    //  PAGE 2: Browse — kernel.org releases
     // ═════════════════════════════════════════════════════════════════════════
     let browse_page = GtkBox::new(Orientation::Vertical, 0);
 
@@ -293,25 +362,11 @@ pub fn build_ui(app: &Application) {
 
     let search_bar = gtk4::SearchBar::new();
     let search_entry = gtk4::SearchEntry::new();
-    search_entry.set_placeholder_text(Some("Filter versions…"));
+    search_entry.set_placeholder_text(Some("Filter releases…"));
     search_bar.set_child(Some(&search_entry));
     search_bar.set_show_close_button(false);
     search_bar.set_search_mode(true);
     browse_page.append(&search_bar);
-
-    let rc_toggle_row = GtkBox::new(Orientation::Horizontal, 8);
-    rc_toggle_row.set_margin_start(12);
-    rc_toggle_row.set_margin_end(12);
-    rc_toggle_row.set_margin_bottom(4);
-    rc_toggle_row.set_halign(Align::End);
-    let rc_toggle_label = Label::new(Some("Show release candidates"));
-    rc_toggle_label.add_css_class("dim-label");
-    let rc_toggle = Switch::new();
-    rc_toggle.set_active(false);
-    rc_toggle.set_valign(Align::Center);
-    rc_toggle_row.append(&rc_toggle_label);
-    rc_toggle_row.append(&rc_toggle);
-    browse_page.append(&rc_toggle_row);
 
     let list_box = ListBox::new();
     list_box.set_selection_mode(SelectionMode::Single);
@@ -329,7 +384,7 @@ pub fn build_ui(app: &Application) {
     browse_page.append(&list_spinner);
 
     let selected_label = Label::builder()
-        .label("No version selected")
+        .label("No release selected")
         .margin_top(4)
         .margin_bottom(4)
         .build();
@@ -337,7 +392,11 @@ pub fn build_ui(app: &Application) {
     browse_page.append(&selected_label);
 
     let browse_bar = gtk4::ActionBar::new();
-    let download_btn = Button::builder().label("Download").sensitive(false).build();
+    let download_btn = Button::builder()
+        .label("Download Source")
+        .tooltip_text("Download the tarball and its signature from cdn.kernel.org to ~/Downloads/kernel-pop")
+        .sensitive(false)
+        .build();
     download_btn.add_css_class("suggested-action");
     browse_bar.pack_end(&download_btn);
     browse_page.append(&browse_bar);
@@ -345,7 +404,128 @@ pub fn build_ui(app: &Application) {
     stack.add_titled(&browse_page, Some("browse"), "Browse");
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE 3: Install — staged packages and install action
+    //  PAGE 3: Build — source, configuration, build
+    // ═════════════════════════════════════════════════════════════════════════
+    let build_page = GtkBox::new(Orientation::Vertical, 12);
+    build_page.set_margin_top(12);
+    build_page.set_margin_bottom(12);
+    build_page.set_margin_start(12);
+    build_page.set_margin_end(12);
+
+    let source_group = PreferencesGroup::builder()
+        .title("Kernel Source")
+        .description("Pick a release on the Browse tab, open a tarball, or drop a linux-*.tar.xz or .tar.gz onto this window")
+        .build();
+    let source_row = ActionRow::builder()
+        .title("No source selected")
+        .subtitle("Its version is read from the tarball's Makefile")
+        .build();
+    let open_btn = Button::builder().label("Open Tarball…").valign(Align::Center).build();
+    open_btn.add_css_class("flat");
+    source_row.add_suffix(&open_btn);
+    source_group.add(&source_row);
+    let sig_row = ActionRow::builder().title("Signature").subtitle("—").build();
+    let recheck_btn = Button::builder()
+        .label("Check Again")
+        .valign(Align::Center)
+        .visible(false)
+        .build();
+    recheck_btn.add_css_class("flat");
+    sig_row.add_suffix(&recheck_btn);
+    source_group.add(&sig_row);
+    let unverified_row = SwitchRow::builder()
+        .title("Build unverified source")
+        .subtitle("For your own patched tree only. The build log and the package folder record that the source was not verified.")
+        .visible(false)
+        .build();
+    source_group.add(&unverified_row);
+    build_page.append(&source_group);
+
+    let config_group = PreferencesGroup::builder().title("Configuration").build();
+    let match_check = CheckButton::new();
+    match_check.set_active(true);
+    let trim_check = CheckButton::new();
+    trim_check.set_group(Some(&match_check));
+    let own_check = CheckButton::new();
+    own_check.set_group(Some(&match_check));
+    let match_row = ActionRow::builder()
+        .title("Match this system")
+        .subtitle("Start from the running kernel's /boot config, so everything that works now keeps working")
+        .activatable_widget(&match_check)
+        .build();
+    match_row.add_prefix(&match_check);
+    let trim_row = ActionRow::builder()
+        .title("Trim to this machine")
+        .subtitle("Only drivers for the modules loaded right now. Hardware that is not plugged in now (USB devices, docks, external drives) may have no driver in this kernel.")
+        .activatable_widget(&trim_check)
+        .build();
+    trim_row.add_prefix(&trim_check);
+    let own_row = ActionRow::builder()
+        .title("Use my own .config")
+        .subtitle("No file chosen")
+        .activatable_widget(&own_check)
+        .build();
+    own_row.add_prefix(&own_check);
+    let own_btn = Button::builder().label("Choose…").valign(Align::Center).build();
+    own_btn.add_css_class("flat");
+    own_row.add_suffix(&own_btn);
+    config_group.add(&match_row);
+    config_group.add(&trim_row);
+    config_group.add(&own_row);
+    build_page.append(&config_group);
+
+    let req_group = PreferencesGroup::builder().title("Requirements").build();
+    let deps_row = ActionRow::builder().title("Build tools").subtitle("Checking…").build();
+    let deps_btn = Button::builder()
+        .label("Install…")
+        .tooltip_text("Install the missing build tools with apt (asks for authentication)")
+        .valign(Align::Center)
+        .visible(false)
+        .build();
+    deps_btn.add_css_class("flat");
+    deps_row.add_suffix(&deps_btn);
+    let ccache_row = ActionRow::builder().title("ccache").subtitle("Checking…").build();
+    let space_row = ActionRow::builder().title("Disk space").subtitle("Checking…").build();
+    req_group.add(&deps_row);
+    req_group.add(&ccache_row);
+    req_group.add(&space_row);
+    build_page.append(&req_group);
+
+    let stage_label = Label::builder().label("").halign(Align::Center).build();
+    stage_label.add_css_class("title-4");
+    stage_label.set_visible(false);
+    build_page.append(&stage_label);
+
+    let progress = ProgressBar::new();
+    progress.set_show_text(true);
+    progress.set_text(Some(""));
+    progress.set_visible(false);
+    build_page.append(&progress);
+
+    let build_btn_box = GtkBox::new(Orientation::Horizontal, 8);
+    build_btn_box.set_halign(Align::Center);
+    build_btn_box.set_margin_top(8);
+    let build_btn = Button::builder().label("Build Kernel").sensitive(false).build();
+    build_btn.add_css_class("pill");
+    build_btn.add_css_class("suggested-action");
+    let cancel_btn = Button::builder().label("Cancel").visible(false).build();
+    cancel_btn.add_css_class("pill");
+    cancel_btn.add_css_class("destructive-action");
+    build_btn_box.append(&build_btn);
+    build_btn_box.append(&cancel_btn);
+    build_page.append(&build_btn_box);
+
+    // Rows that show paths, user IDs ("Name <a@kernel.org>") and other text
+    // from outside: never parse it as Pango markup, or it is dropped.
+    for row in [&source_row, &sig_row, &own_row, &deps_row, &space_row] {
+        row.set_use_markup(false);
+    }
+
+    let build_scroll = ScrolledWindow::builder().vexpand(true).child(&build_page).build();
+    stack.add_titled(&build_scroll, Some("build"), "Build");
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  PAGE 4: Install — finished builds and the install action
     // ═════════════════════════════════════════════════════════════════════════
     let install_page = GtkBox::new(Orientation::Vertical, 12);
     install_page.set_margin_top(12);
@@ -353,19 +533,40 @@ pub fn build_ui(app: &Application) {
     install_page.set_margin_start(12);
     install_page.set_margin_end(12);
 
-    let staged_group = PreferencesGroup::builder().title("Staged Kernel").build();
-    let staged_row = ActionRow::builder()
-        .title("Nothing staged")
-        .subtitle("Go to Browse to download a kernel")
+    let built_group = PreferencesGroup::builder()
+        .title("Built Kernels")
+        .description("Finished builds in ~/Downloads/kernel-pop")
         .build();
+    let built_list = ListBox::new();
+    built_list.set_selection_mode(SelectionMode::Single);
+    built_list.add_css_class("boxed-list");
+    built_group.add(&built_list);
+    install_page.append(&built_group);
+
+    let staged_group = PreferencesGroup::builder().title("Selected Kernel").build();
+    let staged_row = ActionRow::builder()
+        .title("Nothing selected")
+        .subtitle("Build a kernel on the Build tab")
+        .build();
+    let delete_built_btn = Button::builder()
+        .label("Delete")
+        .tooltip_text("Delete this build's packages from ~/Downloads/kernel-pop")
+        .valign(Align::Center)
+        .visible(false)
+        .build();
+    delete_built_btn.add_css_class("flat");
+    delete_built_btn.add_css_class("destructive-action");
+    staged_row.add_suffix(&delete_built_btn);
     let status_row = ActionRow::builder().title("Version Status").subtitle("—").build();
+    let source_info_row = ActionRow::builder().title("Source").subtitle("—").build();
     staged_group.add(&staged_row);
     staged_group.add(&status_row);
+    staged_group.add(&source_info_row);
     install_page.append(&staged_group);
 
     let files_group = PreferencesGroup::builder()
         .title("Packages")
-        .description("Each one verified against the CHECKSUMS signed by Ubuntu's kernel team")
+        .description("Each one checked against the SHA256SUMS manifest written when it was built")
         .build();
     let files_list = ListBox::new();
     files_list.set_selection_mode(SelectionMode::None);
@@ -375,39 +576,36 @@ pub fn build_ui(app: &Application) {
 
     let steps_group = PreferencesGroup::builder().title("Install Will").build();
     let step_row = ActionRow::builder()
-        .title("Verify the packages again, dpkg install, then generate and VERIFY the initramfs, then update the boot loader")
-        .subtitle("The install fails loudly if a package does not match its signed checksum, or if initrd.img or the boot menu entry does not appear — no silent unbootable kernels")
+        .title("Check the packages again as root, dpkg install, build DKMS modules, then generate and VERIFY the initramfs, then update the boot loader")
+        .subtitle("The install fails loudly if a package does not match the manifest, or if initrd.img or the boot menu entry does not appear — no silent unbootable kernels. Only the kernel image and headers are installed, never linux-libc-dev.")
         .build();
     steps_group.add(&step_row);
     install_page.append(&steps_group);
 
-    let progress = ProgressBar::new();
-    progress.set_show_text(true);
-    progress.set_text(Some(""));
-    progress.set_visible(false);
-    install_page.append(&progress);
+    let install_progress = ProgressBar::new();
+    install_progress.set_show_text(true);
+    install_progress.set_text(Some(""));
+    install_progress.set_visible(false);
+    install_page.append(&install_progress);
 
     let btn_box = GtkBox::new(Orientation::Horizontal, 8);
     btn_box.set_halign(Align::Center);
     btn_box.set_margin_top(8);
-
     let install_btn = Button::builder().label("Install Kernel").sensitive(false).build();
     install_btn.add_css_class("pill");
     install_btn.add_css_class("suggested-action");
-
-    let cancel_dl_btn = Button::builder().label("Cancel Download").visible(false).build();
-    cancel_dl_btn.add_css_class("pill");
-    cancel_dl_btn.add_css_class("destructive-action");
-
     btn_box.append(&install_btn);
-    btn_box.append(&cancel_dl_btn);
     install_page.append(&btn_box);
+
+    for row in [&staged_row, &status_row, &source_info_row] {
+        row.set_use_markup(false);
+    }
 
     let install_scroll = ScrolledWindow::builder().vexpand(true).child(&install_page).build();
     stack.add_titled(&install_scroll, Some("install"), "Install");
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE 4: Log
+    //  PAGE 5: Log
     // ═════════════════════════════════════════════════════════════════════════
     let log_page = GtkBox::new(Orientation::Vertical, 0);
     let log_view = TextView::builder()
@@ -462,39 +660,117 @@ pub fn build_ui(app: &Application) {
     //  Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    let log_fn = {
+    // Append text to the Log tab, keeping at most LOG_MAX_LINES lines.
+    let append_log: Rc<dyn Fn(&str)> = {
         let log_view = log_view.clone();
-        move |msg: String| {
+        Rc::new(move |text: &str| {
             let buf = log_view.buffer();
             let mut end = buf.end_iter();
-            buf.insert(&mut end, &format!("{}\n", msg));
+            buf.insert(&mut end, text);
+            buf.insert(&mut end, "\n");
+            let lines = buf.line_count();
+            if lines > LOG_MAX_LINES {
+                let mut start = buf.start_iter();
+                if let Some(mut cut) = buf.iter_at_line(lines - LOG_MAX_LINES) {
+                    buf.delete(&mut start, &mut cut);
+                }
+            }
             let mark = buf.create_mark(None, &buf.end_iter(), false);
             log_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
-        }
+            buf.delete_mark(&mark);
+        })
     };
 
-    // Sensitivity of every control that starts a download or a privileged
-    // action, from the state: nothing can start while something is busy.
-    // The per-kernel Sign / Boot Next Time / Remove buttons live in
+    let log_fn = {
+        let append_log = append_log.clone();
+        move |msg: String| append_log(&msg)
+    };
+
+    // Worker threads (signature check, build) report through this channel;
+    // the main loop drains it in batches so a fast build cannot flood GTK.
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
+    {
+        let append_log = append_log.clone();
+        let stage_label = stage_label.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Some(first) = ui_rx.recv().await {
+                let mut batch = String::new();
+                let handle = |m: UiMsg, batch: &mut String| match m {
+                    UiMsg::Log(l) => {
+                        if !batch.is_empty() {
+                            batch.push('\n');
+                        }
+                        batch.push_str(&l);
+                    }
+                    UiMsg::Stage(s) => {
+                        stage_label.set_label(s.label());
+                        stage_label.set_visible(true);
+                    }
+                };
+                handle(first, &mut batch);
+                while let Ok(m) = ui_rx.try_recv() {
+                    handle(m, &mut batch);
+                }
+                if !batch.is_empty() {
+                    append_log(&batch);
+                }
+                glib::timeout_future(std::time::Duration::from_millis(150)).await;
+            }
+        });
+    }
+    let event_sink: EventSink = {
+        let tx = ui_tx.clone();
+        Arc::new(move |e: BuildEvent| {
+            let _ = tx.send(match e {
+                BuildEvent::Stage(s) => UiMsg::Stage(s),
+                BuildEvent::Line(l) => UiMsg::Log(l),
+            });
+        })
+    };
+
+    // Sensitivity of every control that starts a download, a build or a
+    // privileged action, from the state: nothing can start while something
+    // is busy. The per-kernel Sign / Boot Next Time / Remove buttons live in
     // kernels_list, so making the list insensitive covers them, including
     // rows rebuilt while busy.
     let refresh_controls: Rc<dyn Fn()> = {
         let state = state.clone();
         let download_btn = download_btn.clone();
+        let build_btn = build_btn.clone();
         let install_btn = install_btn.clone();
         let prune_btn = prune_btn.clone();
         let setup_signing_btn = setup_signing_btn.clone();
         let kernels_list = kernels_list.clone();
-        let cancel_dl_btn = cancel_dl_btn.clone();
+        let cancel_btn = cancel_btn.clone();
+        let open_btn = open_btn.clone();
+        let own_btn = own_btn.clone();
+        let recheck_btn = recheck_btn.clone();
+        let unverified_row = unverified_row.clone();
+        let deps_btn = deps_btn.clone();
+        let config_group = config_group.clone();
+        let built_list = built_list.clone();
+        let delete_built_btn = delete_built_btn.clone();
         Rc::new(move || {
             let s = state.borrow();
             let idle = s.busy.is_none();
-            download_btn.set_sensitive(idle && s.selected_version.is_some());
-            install_btn.set_sensitive(idle && s.staged_dir.is_some());
+            download_btn.set_sensitive(idle && s.selected_release.is_some());
+            build_btn.set_sensitive(idle && s.can_build());
+            install_btn.set_sensitive(idle && s.staged.is_some() && s.staged_verified);
             prune_btn.set_sensitive(idle);
             setup_signing_btn.set_sensitive(idle);
             kernels_list.set_sensitive(idle);
-            cancel_dl_btn.set_visible(s.download_cancel.is_some());
+            open_btn.set_sensitive(idle);
+            own_btn.set_sensitive(idle);
+            recheck_btn.set_sensitive(idle);
+            unverified_row.set_sensitive(idle);
+            deps_btn.set_sensitive(idle);
+            deps_btn.set_visible(!s.missing_deps.is_empty());
+            config_group.set_sensitive(idle);
+            built_list.set_sensitive(idle);
+            delete_built_btn.set_sensitive(idle);
+            delete_built_btn.set_visible(s.staged.is_some());
+            cancel_btn.set_visible(s.download_cancel.is_some() || s.build_control.is_some());
+            cancel_btn.set_label(if s.build_control.is_some() { "Cancel Build" } else { "Cancel Download" });
         })
     };
 
@@ -506,6 +782,8 @@ pub fn build_ui(app: &Application) {
                 let mut s = state.borrow_mut();
                 s.busy = None;
                 s.download_cancel = None;
+                s.build_control = None;
+                s.build_started = None;
             }
             refresh_controls();
         })
@@ -527,21 +805,23 @@ pub fn build_ui(app: &Application) {
         })
     };
 
-    let update_install_tab = {
+    // The Install tab, from the selected build.
+    let update_install_tab: Rc<dyn Fn()> = {
         let staged_row = staged_row.clone();
         let status_row = status_row.clone();
+        let source_info_row = source_info_row.clone();
         let files_list = files_list.clone();
         let refresh_controls = refresh_controls.clone();
         let state = state.clone();
-        move || {
+        Rc::new(move || {
             let s = state.borrow();
             while let Some(c) = files_list.first_child() { files_list.remove(&c); }
 
-            match (&s.staged_dir, &s.staged_version) {
-                (Some(dir), Some(ver)) => {
-                    staged_row.set_title(&format!("Linux {}", ver));
-                    staged_row.set_subtitle(&dir.display().to_string());
-
+            match &s.staged {
+                Some(set) => {
+                    staged_row.set_title(&format!("Linux {}", set.kernelrelease));
+                    staged_row.set_subtitle(&set.dir.display().to_string());
+                    let ver = &set.kernelrelease;
                     match compare_to_running(&s.sysinfo.running_kernel, ver) {
                         VersionRelation::Newer => status_row.set_subtitle(
                             &format!("Upgrade: {} → {}", s.sysinfo.running_kernel, ver)),
@@ -551,24 +831,25 @@ pub fn build_ui(app: &Application) {
                             &format!("Downgrade: {} → {}", s.sysinfo.running_kernel, ver)),
                         VersionRelation::Unknown => status_row.set_subtitle("—"),
                     }
-
-                    for fname in &s.staged_files {
-                        let row = ActionRow::builder().title(fname).build();
-                        let badge = Label::new(Some("SHA256 ✓"));
-                        badge.add_css_class("success");
+                    source_info_row.set_subtitle(if set.source.is_empty() { "—" } else { &set.source });
+                    for fname in &set.debs {
+                        let row = ActionRow::builder().title(fname).use_markup(false).build();
+                        let badge = Label::new(Some(if s.staged_verified { "SHA256 ✓" } else { "checking…" }));
+                        badge.add_css_class(if s.staged_verified { "success" } else { "dim-label" });
                         row.add_suffix(&badge);
                         files_list.append(&row);
                     }
                 }
-                _ => {
-                    staged_row.set_title("Nothing staged");
-                    staged_row.set_subtitle("Go to Browse to download a kernel");
+                None => {
+                    staged_row.set_title("Nothing selected");
+                    staged_row.set_subtitle("Build a kernel on the Build tab");
                     status_row.set_subtitle("—");
+                    source_info_row.set_subtitle("—");
                 }
             }
             drop(s);
             refresh_controls();
-        }
+        })
     };
 
     // load_sysinfo — declared as Rc so remove/install callbacks can re-run it
@@ -867,26 +1148,24 @@ pub fn build_ui(app: &Application) {
                     state.borrow_mut().sysinfo = info;
                     update_install_tab();
 
-                    // Nice-to-have, not safety-critical: check for a newer
-                    // mainline kernel over the network without blocking the
-                    // System tab's (local, fast) render above. A failed
-                    // fetch is silent — same Browse-tab data source, just
-                    // fire-and-forget here.
+                    // Nice-to-have, not safety-critical: check kernel.org for a
+                    // newer stable release without blocking the System tab's
+                    // (local, fast) render above. A failed fetch is silent —
+                    // the Browse tab shows the same data and its errors.
                     update_banner.set_revealed(false);
-                    spawn_async(fetch_versions(), move |result| {
-                        let versions = match result {
-                            Ok(v) => v,
+                    spawn_async(fetch_releases(), move |result| {
+                        let releases = match result {
+                            Ok(r) => r,
                             Err(_e) => {
                                 #[cfg(debug_assertions)]
-                                eprintln!("update-check: fetch_versions failed: {_e}");
+                                eprintln!("update-check: fetch_releases failed: {_e}");
                                 return;
                             }
                         };
-                        let newest_stable = versions.iter().find(|v| !v.is_rc);
-                        if let Some(newest) = newest_stable {
+                        if let Some(newest) = releases.iter().find(|r| r.moniker == Moniker::Stable) {
                             if compare_to_running(&running_kernel, &newest.version) == VersionRelation::Newer {
                                 update_banner.set_title(&format!(
-                                    "Kernel {} is available — see Browse tab to install",
+                                    "Linux {} (stable) is out — download it on the Browse tab to build it",
                                     newest.version
                                 ));
                                 update_banner.set_revealed(true);
@@ -1098,56 +1377,52 @@ pub fn build_ui(app: &Application) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Populate browse list — badges relative to the running kernel
+    //  Browse list — kernel.org releases, badges relative to the running kernel
     // ─────────────────────────────────────────────────────────────────────────
-    fn populate_list(
-        list_box: &ListBox,
-        versions: &[KernelVersion],
-        filter: &str,
-        running: &str,
-        show_rc: bool,
-    ) {
+    fn populate_list(list_box: &ListBox, releases: &[Release], filter: &str, running: &str) {
         while let Some(c) = list_box.first_child() { list_box.remove(&c); }
         let filter = filter.to_lowercase();
 
-        for ver in versions {
-            if ver.is_rc && !show_rc { continue; }
-            if !filter.is_empty() && !ver.version.contains(&filter) { continue; }
-
-            let subtitle = match compare_to_running(running, &ver.version) {
-                VersionRelation::Newer  => "Newer than running".to_string(),
-                VersionRelation::Same   => "Matches running kernel".to_string(),
-                VersionRelation::Older  => "Older than running".to_string(),
-                VersionRelation::Unknown => String::new(),
+        for rel in releases {
+            if !filter.is_empty() && !rel.version.contains(&filter) && !rel.moniker.label().contains(&filter) {
+                continue;
+            }
+            let relation = match compare_to_running(running, &rel.version) {
+                VersionRelation::Newer => "newer than running",
+                VersionRelation::Same => "matches the running kernel",
+                VersionRelation::Older => "older than running",
+                VersionRelation::Unknown => "",
             };
-
+            let mut parts = vec![rel.moniker.label().to_string()];
+            if !rel.released.is_empty() {
+                parts.push(format!("released {}", rel.released));
+            }
+            if !relation.is_empty() {
+                parts.push(relation.to_string());
+            }
+            if rel.pgp.is_none() {
+                parts.push("no signature published".to_string());
+            }
             let row = ActionRow::builder()
-                .title(&ver.version)
-                .subtitle(&subtitle)
+                .title(&rel.version)
+                .subtitle(parts.join(" · "))
                 .activatable(true)
                 .build();
-
-            if compare_to_running(running, &ver.version) == VersionRelation::Same {
+            if compare_to_running(running, &rel.version) == VersionRelation::Same {
                 row.add_css_class("success");
             }
-
-            if ver.is_rc {
-                let badge = Label::new(Some("RC"));
+            if rel.is_eol {
+                let badge = Label::new(Some("EOL"));
                 badge.add_css_class("caption");
-                badge.add_css_class("pill");
                 badge.add_css_class("warning");
                 badge.set_valign(Align::Center);
                 row.add_suffix(&badge);
             }
-
             list_box.append(&row);
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Load versions
-    // ─────────────────────────────────────────────────────────────────────────
-    let load_versions = {
+    let load_releases = {
         let list_box = list_box.clone();
         let list_spinner = list_spinner.clone();
         let selected_label = selected_label.clone();
@@ -1164,10 +1439,10 @@ pub fn build_ui(app: &Application) {
             // Removing the rows deselects, which clears the selection and
             // the Download button through row-selected.
             while let Some(c) = list_box.first_child() { list_box.remove(&c); }
-            state.borrow_mut().selected_version = None;
+            state.borrow_mut().selected_release = None;
             refresh_controls();
             selected_label.set_label("Loading…");
-            log_fn("Fetching version list from kernel.ubuntu.com…".to_string());
+            log_fn("Fetching the release list from kernel.org…".to_string());
 
             let list_box = list_box.clone();
             let list_spinner = list_spinner.clone();
@@ -1177,46 +1452,40 @@ pub fn build_ui(app: &Application) {
             let log_fn = log_fn.clone();
             let search_entry = search_entry.clone();
 
-            spawn_async(fetch_versions(), move |result| {
+            spawn_async(fetch_releases(), move |result| {
                 list_spinner.stop();
                 list_spinner.set_visible(false);
                 match result {
                     Err(e) => {
-                        log_fn(format!("Error fetching versions: {}", e));
-                        banner.set_title(&format!("Failed to load versions: {}", e));
+                        log_fn(format!("Error fetching releases: {e:#}"));
+                        banner.set_title(&format!("Failed to load releases: {e}"));
                         banner.set_revealed(true);
-                        selected_label.set_label("Could not load version list");
+                        selected_label.set_label("Could not load the release list");
                     }
-                    Ok(versions) => {
-                        let rc_count = versions.iter().filter(|v| v.is_rc).count();
-                        log_fn(format!(
-                            "Found {} stable versions, {} release candidates",
-                            versions.len() - rc_count,
-                            rc_count
-                        ));
-                        state.borrow_mut().versions = versions.clone();
-                        let (running, show_rc) = {
-                            let s = state.borrow();
-                            (s.sysinfo.running_kernel.clone(), s.show_rc)
-                        };
-                        populate_list(&list_box, &versions, &search_entry.text(), &running, show_rc);
-                        selected_label.set_label("No version selected");
+                    Ok(mut releases) => {
+                        // A version can be listed twice (as mainline and as
+                        // stable right after a release); rows are looked up by
+                        // version, so keep the first.
+                        let mut seen = std::collections::HashSet::new();
+                        releases.retain(|r| seen.insert(r.version.clone()));
+                        log_fn(format!("kernel.org lists {} releases", releases.len()));
+                        state.borrow_mut().releases = releases.clone();
+                        let running = state.borrow().sysinfo.running_kernel.clone();
+                        populate_list(&list_box, &releases, &search_entry.text(), &running);
+                        selected_label.set_label("No release selected");
                     }
                 }
             });
         }
     };
 
-    load_versions();
+    load_releases();
 
-    { let lv = load_versions.clone(); refresh_btn.connect_clicked(move |_| lv()); }
+    { let lr = load_releases.clone(); refresh_btn.connect_clicked(move |_| lr()); }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Row selection — connected exactly once, looked up by the row's title
-    //  (the version string), never by row index: with an active filter the
-    //  visible rows are a subset, so an index into the full versions vec
-    //  would select the wrong kernel.
-    // ─────────────────────────────────────────────────────────────────────────
+    // Row selection — connected exactly once, looked up by the row's title
+    // (the version string), never by row index: with an active filter the
+    // visible rows are a subset.
     {
         let state = state.clone();
         let refresh_controls = refresh_controls.clone();
@@ -1224,15 +1493,12 @@ pub fn build_ui(app: &Application) {
         list_box.connect_row_selected(move |_, row| {
             let selected = row
                 .and_then(|r| r.downcast_ref::<ActionRow>().map(|ar| ar.title().to_string()))
-                .and_then(|title| {
-                    state.borrow().versions.iter().find(|v| v.version == title).cloned()
-                });
-
+                .and_then(|title| state.borrow().releases.iter().find(|r| r.version == title).cloned());
             match &selected {
-                Some(ver) => selected_label.set_label(&format!("Selected: {}", ver.version)),
-                None => selected_label.set_label("No version selected"),
+                Some(r) => selected_label.set_label(&format!("Selected: {} ({})", r.version, r.moniker.label())),
+                None => selected_label.set_label("No release selected"),
             }
-            state.borrow_mut().selected_version = selected;
+            state.borrow_mut().selected_release = selected;
             refresh_controls();
         });
     }
@@ -1243,84 +1509,569 @@ pub fn build_ui(app: &Application) {
         search_entry.connect_search_changed(move |entry| {
             // Clone out and drop the borrow first: populate_list can remove the
             // selected row, firing row-selected which takes borrow_mut().
-            let (versions, running, show_rc) = {
+            let (releases, running) = {
                 let s = state.borrow();
-                (s.versions.clone(), s.sysinfo.running_kernel.clone(), s.show_rc)
+                (s.releases.clone(), s.sysinfo.running_kernel.clone())
             };
-            populate_list(&list_box, &versions, &entry.text(), &running, show_rc);
-        });
-    }
-
-    {
-        let list_box = list_box.clone();
-        let state = state.clone();
-        let search_entry = search_entry.clone();
-        rc_toggle.connect_state_set(move |_, active| {
-            state.borrow_mut().show_rc = active;
-            let (versions, running) = {
-                let s = state.borrow();
-                (s.versions.clone(), s.sysinfo.running_kernel.clone())
-            };
-            populate_list(&list_box, &versions, &search_entry.text(), &running, active);
-            glib::Propagation::Proceed
+            populate_list(&list_box, &releases, &entry.text(), &running);
         });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Download — resolve the deb set, then download + verify each file
+    //  Build page: source rows, requirements
+    // ─────────────────────────────────────────────────────────────────────────
+    let update_source_rows: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let source_row = source_row.clone();
+        let sig_row = sig_row.clone();
+        let recheck_btn = recheck_btn.clone();
+        let unverified_row = unverified_row.clone();
+        let refresh_controls = refresh_controls.clone();
+        Rc::new(move || {
+            let s = state.borrow();
+            match &s.source {
+                Some(t) => {
+                    source_row.set_title(&format!("Linux {}", t.version.kernelversion()));
+                    source_row.set_subtitle(&t.path.display().to_string());
+                }
+                None => {
+                    source_row.set_title("No source selected");
+                    source_row.set_subtitle("Its version is read from the tarball's Makefile");
+                }
+            }
+            sig_row.remove_css_class("success");
+            sig_row.remove_css_class("error");
+            match &s.signature {
+                SigState::None => sig_row.set_subtitle("—"),
+                SigState::Checking => sig_row.set_subtitle("Checking against the kernel.org keys…"),
+                SigState::Verified(signer) => {
+                    sig_row.set_subtitle(&format!("Good signature from {} ({}), key fetched from kernel.org", signer.uid, signer.grouped_fingerprint()));
+                    sig_row.add_css_class("success");
+                }
+                SigState::Failed(why) => {
+                    sig_row.set_subtitle(&format!("NOT VERIFIED — {why}"));
+                    sig_row.add_css_class("error");
+                }
+            }
+            let failed = matches!(s.signature, SigState::Failed(_));
+            recheck_btn.set_visible(failed);
+            unverified_row.set_visible(failed);
+            if unverified_row.is_active() != s.allow_unverified {
+                unverified_row.set_active(s.allow_unverified);
+            }
+            drop(s);
+            refresh_controls();
+        })
+    };
+
+    // Build tools, ccache and disk space, checked without blocking the UI.
+    let refresh_requirements: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let deps_row = deps_row.clone();
+        let ccache_row = ccache_row.clone();
+        let space_row = space_row.clone();
+        let refresh_controls = refresh_controls.clone();
+        Rc::new(move || {
+            let state = state.clone();
+            let deps_row = deps_row.clone();
+            let ccache_row = ccache_row.clone();
+            let space_row = space_row.clone();
+            let refresh_controls = refresh_controls.clone();
+            spawn_async(
+                async move {
+                    tokio::task::spawn_blocking(|| {
+                        (missing_build_deps(), ccache_available(), free_bytes(&build::build_root()), free_bytes(std::path::Path::new("/boot")))
+                    })
+                    .await
+                },
+                move |result| {
+                    let Ok((missing, ccache, cache_free, boot_free)) = result else { return };
+                    if missing.is_empty() {
+                        deps_row.set_subtitle("All installed");
+                    } else {
+                        deps_row.set_subtitle(&format!("Missing: {}", missing.join(", ")));
+                    }
+                    ccache_row.set_subtitle(if ccache {
+                        "Installed — used, so rebuilds and the next point release compile much faster"
+                    } else {
+                        "Not installed (optional) — install ccache to make rebuilds much faster"
+                    });
+                    let (mode, boot_need) = {
+                        let mut s = state.borrow_mut();
+                        s.missing_deps = missing;
+                        (s.config_mode().unwrap_or(ConfigMode::MatchSystem), s.sysinfo.boot_needed_bytes)
+                    };
+                    match space_problem(&mode, cache_free, boot_free, boot_need) {
+                        Some(p) => space_row.set_subtitle(&p),
+                        None => space_row.set_subtitle(&format!(
+                            "{} free for the build (about {} needed){}",
+                            cache_free.map(format_bytes).unwrap_or_else(|| "?".into()),
+                            format_bytes(mode.disk_need()),
+                            boot_free.map(|b| format!(", {} free in /boot", format_bytes(b))).unwrap_or_default()
+                        )),
+                    }
+                    refresh_controls();
+                },
+            );
+        })
+    };
+    refresh_requirements();
+
+    // Look into a tarball, find or fetch its signature, verify it.
+    let set_source: Rc<dyn Fn(PathBuf)> = {
+        let state = state.clone();
+        let begin_busy = begin_busy.clone();
+        let update_source_rows = update_source_rows.clone();
+        let log_fn = log_fn.clone();
+        let ui_tx = ui_tx.clone();
+        let toast_overlay = toast_overlay.clone();
+        let stack = stack.clone();
+        Rc::new(move |path: PathBuf| {
+            let Some(busy) = begin_busy("signature check") else { return };
+            {
+                let mut s = state.borrow_mut();
+                s.source = None;
+                s.signature = SigState::Checking;
+                s.allow_unverified = false;
+            }
+            update_source_rows();
+            stack.set_visible_child_name("build");
+            log_fn(format!("Source: {}", path.display()));
+            let state = state.clone();
+            let update_source_rows = update_source_rows.clone();
+            let log_fn = log_fn.clone();
+            let tx = ui_tx.clone();
+            let toast_overlay = toast_overlay.clone();
+            spawn_async(
+                async move {
+                    let p = path.clone();
+                    let tarball = tokio::task::spawn_blocking(move || inspect(&p)).await??;
+                    let sig = match tarball.sibling_signature() {
+                        Some(sig) => sig,
+                        None => {
+                            // No .tar.sign next to it: fetch kernel.org's by the
+                            // version in the Makefile.
+                            let _ = tx.send(UiMsg::Log(format!(
+                                "No signature next to the tarball; fetching kernel.org's for Linux {}",
+                                tarball.version.release_name()
+                            )));
+                            match fetch_signature(&tarball.version, build::downloads_root()).await {
+                                Ok(sig) => sig,
+                                Err(e) => return Ok::<_, anyhow::Error>((tarball, Err(format!("{e:#}")))),
+                            }
+                        }
+                    };
+                    let t2 = tarball.clone();
+                    let verdict = tokio::task::spawn_blocking(move || {
+                        let log = move |l: String| {
+                            let _ = tx.send(UiMsg::Log(l));
+                        };
+                        verify_tarball(&t2, &sig, &log).map_err(|e| format!("{e:#}"))
+                    })
+                    .await?;
+                    Ok((tarball, verdict))
+                },
+                move |result: anyhow::Result<(Tarball, Result<Signer, String>)>| {
+                    drop(busy);
+                    match result {
+                        Err(e) => {
+                            log_fn(format!("Not a usable kernel source: {e:#}"));
+                            toast_overlay.add_toast(Toast::new("Not a kernel source tarball — see Log tab"));
+                            state.borrow_mut().signature = SigState::None;
+                        }
+                        Ok((tarball, verdict)) => {
+                            log_fn(format!("Kernel version from the Makefile: {}", tarball.version.kernelversion()));
+                            let mut s = state.borrow_mut();
+                            s.source = Some(tarball);
+                            match verdict {
+                                Ok(signer) => {
+                                    log_fn(format!("Signature: good, from {} ({})", signer.uid, signer.grouped_fingerprint()));
+                                    s.signature = SigState::Verified(signer);
+                                }
+                                Err(why) => {
+                                    log_fn(format!("Signature: NOT VERIFIED — {why}. The build stays blocked unless \"Build unverified source\" is turned on for this tarball."));
+                                    toast_overlay.add_toast(Toast::new("The source could not be verified — see the Build tab"));
+                                    s.signature = SigState::Failed(why);
+                                }
+                            }
+                        }
+                    }
+                    update_source_rows();
+                },
+            );
+        })
+    };
+
+    // Open Tarball…
+    {
+        let window = window.clone();
+        let set_source = set_source.clone();
+        open_btn.connect_clicked(move |_| {
+            let filters = gio::ListStore::new::<gtk4::FileFilter>();
+            let tarballs = gtk4::FileFilter::new();
+            tarballs.set_name(Some("Kernel source tarballs"));
+            for p in ["*.tar.xz", "*.tar.gz", "*.tgz"] {
+                tarballs.add_pattern(p);
+            }
+            filters.append(&tarballs);
+            let all = gtk4::FileFilter::new();
+            all.set_name(Some("All files"));
+            all.add_pattern("*");
+            filters.append(&all);
+            let dialog = gtk4::FileDialog::builder()
+                .title("Open a kernel source tarball")
+                .filters(&filters)
+                .initial_folder(&gio::File::for_path(build::downloads_root()))
+                .build();
+            let set_source = set_source.clone();
+            dialog.open(Some(&window), None::<&gio::Cancellable>, move |res| {
+                if let Some(path) = res.ok().and_then(|f| f.path()) {
+                    set_source(path);
+                }
+            });
+        });
+    }
+
+    // Drop a tarball anywhere on the window.
+    {
+        let set_source = set_source.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gtk4::gdk::DragAction::COPY);
+        drop_target.connect_drop(move |_, value, _, _| {
+            let Some(path) = value.get::<gio::File>().ok().and_then(|f| f.path()) else { return false };
+            if let Some(running) = state.borrow().busy {
+                toast_overlay.add_toast(Toast::new(&format!("Wait until the {running} has finished")));
+                return false;
+            }
+            set_source(path);
+            true
+        });
+        window.add_controller(drop_target);
+    }
+
+    // Check Again (a failed fetch of the keys or the signature).
+    {
+        let set_source = set_source.clone();
+        let state = state.clone();
+        recheck_btn.connect_clicked(move |_| {
+            let path = state.borrow().source.as_ref().map(|t| t.path.clone());
+            if let Some(p) = path {
+                set_source(p);
+            }
+        });
+    }
+
+    // Build unverified source: one explicit override per tarball.
+    {
+        let state = state.clone();
+        let window = window.clone();
+        let update_source_rows = update_source_rows.clone();
+        let log_fn = log_fn.clone();
+        unverified_row.connect_active_notify(move |row| {
+            let want = row.is_active();
+            if want == state.borrow().allow_unverified {
+                return;
+            }
+            if !want {
+                state.borrow_mut().allow_unverified = false;
+                update_source_rows();
+                return;
+            }
+            let dialog = AlertDialog::builder()
+                .heading("Build source that is not verified?")
+                .body("This tarball has no valid signature from a kernel.org developer, so nothing shows that it is the code kernel.org released. Only go on for a tree you made or patched yourself. The build log and the package folder will say the source was unverified.")
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("allow", "Build Unverified")]);
+            dialog.set_response_appearance("allow", libadwaita::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let state = state.clone();
+            let update_source_rows = update_source_rows.clone();
+            let log_fn = log_fn.clone();
+            dialog.connect_response(None, move |_, resp| {
+                let allow = resp == "allow";
+                state.borrow_mut().allow_unverified = allow;
+                if allow {
+                    let path = state.borrow().source.as_ref().map(|t| t.path.display().to_string()).unwrap_or_default();
+                    log_fn(format!("WARNING: building {path} without a verified signature was allowed for this tarball"));
+                }
+                update_source_rows();
+            });
+            dialog.present(Some(&window));
+        });
+    }
+
+    // Configuration mode
+    {
+        let set_mode = {
+            let state = state.clone();
+            let refresh_controls = refresh_controls.clone();
+            let refresh_requirements = refresh_requirements.clone();
+            move |m: ModeChoice| {
+                state.borrow_mut().mode = m;
+                refresh_controls();
+                refresh_requirements();
+            }
+        };
+        for (check, m) in [(&match_check, ModeChoice::Match), (&trim_check, ModeChoice::Trim), (&own_check, ModeChoice::Own)] {
+            let set_mode = set_mode.clone();
+            check.connect_toggled(move |c| {
+                if c.is_active() {
+                    set_mode(m);
+                }
+            });
+        }
+    }
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let own_row = own_row.clone();
+        let own_check = own_check.clone();
+        let refresh_controls = refresh_controls.clone();
+        own_btn.connect_clicked(move |_| {
+            let dialog = gtk4::FileDialog::builder().title("Choose a kernel .config").build();
+            let state = state.clone();
+            let own_row = own_row.clone();
+            let own_check = own_check.clone();
+            let refresh_controls = refresh_controls.clone();
+            dialog.open(Some(&window), None::<&gio::Cancellable>, move |res| {
+                if let Some(path) = res.ok().and_then(|f| f.path()) {
+                    own_row.set_subtitle(&format!("{} — the same fixes are applied, then make olddefconfig", path.display()));
+                    state.borrow_mut().own_config = Some(path);
+                    own_check.set_active(true);
+                    refresh_controls();
+                }
+            });
+        });
+    }
+
+    // Install the missing build tools.
+    {
+        let state = state.clone();
+        let begin_busy = begin_busy.clone();
+        let log_fn = log_fn.clone();
+        let toast_overlay = toast_overlay.clone();
+        let refresh_requirements = refresh_requirements.clone();
+        deps_btn.connect_clicked(move |_| {
+            let missing = state.borrow().missing_deps.clone();
+            if missing.is_empty() { return; }
+            let Some(busy) = begin_busy("build tools install") else { return };
+            log_fn(format!("Installing build tools: {}", missing.join(" ")));
+            let log_fn = log_fn.clone();
+            let toast_overlay = toast_overlay.clone();
+            let refresh_requirements = refresh_requirements.clone();
+            spawn_async(
+                async move { tokio::task::spawn_blocking(move || run_privileged_install_build_deps(&missing)).await },
+                move |result| {
+                    drop(busy);
+                    match result {
+                        Ok(Ok(out)) => {
+                            log_output(&log_fn, &out);
+                            toast_overlay.add_toast(Toast::new("Build tools installed"));
+                        }
+                        Ok(Err(e)) => {
+                            log_fn(format!("Installing the build tools failed: {e}"));
+                            toast_overlay.add_toast(Toast::new("Installing the build tools failed — see Log tab"));
+                        }
+                        Err(e) => log_fn(format!("Task error: {e}")),
+                    }
+                    refresh_requirements();
+                },
+            );
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Install tab: the list of finished builds
+    // ─────────────────────────────────────────────────────────────────────────
+    // Re-read ~/Downloads/kernel-pop and select `select` (or the newest).
+    let load_built: Rc<dyn Fn(Option<PathBuf>)> = {
+        let state = state.clone();
+        let built_list = built_list.clone();
+        let update_install_tab = update_install_tab.clone();
+        Rc::new(move |select: Option<PathBuf>| {
+            let state = state.clone();
+            let built_list = built_list.clone();
+            let update_install_tab = update_install_tab.clone();
+            spawn_async(
+                async move { tokio::task::spawn_blocking(built_sets).await.unwrap_or_default() },
+                move |sets: Vec<BuiltSet>| {
+                    let keep = select.or_else(|| state.borrow().staged.as_ref().map(|s| s.dir.clone()));
+                    {
+                        // The files may have changed (a rebuild into the same
+                        // folder): whatever gets selected is checked again.
+                        let mut s = state.borrow_mut();
+                        s.built = sets.clone();
+                        s.staged = None;
+                        s.staged_verified = false;
+                    }
+                    while let Some(c) = built_list.first_child() { built_list.remove(&c); }
+                    let mut to_select = None;
+                    for (i, set) in sets.iter().enumerate() {
+                        let row = ActionRow::builder()
+                            .title(format!("Linux {}", set.kernelrelease))
+                            .subtitle(set.dir.display().to_string())
+                            .use_markup(false)
+                            .activatable(true)
+                            .build();
+                        if set.source.starts_with("UNVERIFIED") {
+                            let badge = Label::new(Some("unverified source"));
+                            badge.add_css_class("caption");
+                            badge.add_css_class("warning");
+                            badge.set_valign(Align::Center);
+                            row.add_suffix(&badge);
+                        }
+                        if keep.as_ref() == Some(&set.dir) || (keep.is_none() && i == 0) {
+                            to_select = Some(row.clone());
+                        }
+                        built_list.append(&row);
+                    }
+                    if sets.is_empty() {
+                        let row = ActionRow::builder().title("No builds yet").subtitle("Build a kernel on the Build tab").build();
+                        row.set_activatable(false);
+                        row.set_selectable(false);
+                        built_list.append(&row);
+                        let mut s = state.borrow_mut();
+                        s.staged = None;
+                        s.staged_verified = false;
+                    }
+                    match to_select {
+                        Some(row) => built_list.select_row(Some(&row)),
+                        None => {
+                            built_list.unselect_all();
+                            update_install_tab();
+                        }
+                    }
+                },
+            );
+        })
+    };
+
+    {
+        let state = state.clone();
+        let update_install_tab = update_install_tab.clone();
+        let log_fn = log_fn.clone();
+        built_list.connect_row_selected(move |list, row| {
+            let index = row.map(|r| r.index()).filter(|i| *i >= 0).map(|i| i as usize);
+            let set = index.and_then(|i| state.borrow().built.get(i).cloned());
+            let same = set.is_some() && state.borrow().staged == set;
+            if same && state.borrow().staged_verified {
+                return;
+            }
+            {
+                let mut s = state.borrow_mut();
+                s.staged = set.clone();
+                s.staged_verified = false;
+            }
+            update_install_tab();
+            let Some(set) = set else { return };
+            let state = state.clone();
+            let update_install_tab = update_install_tab.clone();
+            let log_fn = log_fn.clone();
+            let list = list.clone();
+            spawn_async(
+                async move {
+                    let s2 = set.clone();
+                    (set, tokio::task::spawn_blocking(move || verify_built_set(&s2)).await)
+                },
+                move |(set, result)| {
+                    // Only if it is still the selected one.
+                    if state.borrow().staged.as_ref() != Some(&set) {
+                        return;
+                    }
+                    match result {
+                        Ok(Ok(())) => state.borrow_mut().staged_verified = true,
+                        Ok(Err(e)) => {
+                            log_fn(format!("{}: {e:#} — not installable; build it again", set.dir.display()));
+                            list.unselect_all();
+                        }
+                        Err(e) => log_fn(format!("Task error: {e}")),
+                    }
+                    update_install_tab();
+                },
+            );
+        });
+    }
+
+    // Delete a finished build.
+    {
+        let state = state.clone();
+        let window = window.clone();
+        let load_built = load_built.clone();
+        let log_fn = log_fn.clone();
+        delete_built_btn.connect_clicked(move |_| {
+            let Some(set) = state.borrow().staged.clone() else { return };
+            let dialog = AlertDialog::builder()
+                .heading(format!("Delete the build of Linux {}?", set.kernelrelease))
+                .body(format!("{} and everything in it (packages, config, build log) is deleted. Installed kernels are not touched.", set.dir.display()))
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+            dialog.set_response_appearance("delete", libadwaita::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let state = state.clone();
+            let load_built = load_built.clone();
+            let log_fn = log_fn.clone();
+            dialog.connect_response(None, move |_, resp| {
+                if resp != "delete" { return; }
+                match std::fs::remove_dir_all(&set.dir) {
+                    Ok(()) => log_fn(format!("Deleted {}", set.dir.display())),
+                    Err(e) => log_fn(format!("Could not delete {}: {e}", set.dir.display())),
+                }
+                {
+                    let mut s = state.borrow_mut();
+                    s.staged = None;
+                    s.staged_verified = false;
+                }
+                load_built(None);
+            });
+            dialog.present(Some(&window));
+        });
+    }
+
+    load_built(None);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Download a release's tarball and signature
     // ─────────────────────────────────────────────────────────────────────────
     {
         let state = state.clone();
         let progress = progress.clone();
         let log_fn = log_fn.clone();
-        let update_install_tab = update_install_tab.clone();
         let stack = stack.clone();
         let toast_overlay = toast_overlay.clone();
         let begin_busy = begin_busy.clone();
         let refresh_controls = refresh_controls.clone();
+        let set_source = set_source.clone();
 
         download_btn.connect_clicked(move |_| {
-            let ver = { state.borrow().selected_version.clone() };
-            let Some(ver) = ver else { return };
-            let Some(busy) = begin_busy("download") else { return };
-
-            if let Some(f) = state.borrow().sysinfo.free_root_bytes {
-                if f < MIN_ROOT_BYTES {
-                    toast_overlay.add_toast(Toast::new("Low disk space — install may fail"));
-                }
+            let rel = { state.borrow().selected_release.clone() };
+            let Some(rel) = rel else { return };
+            let mut files = vec![];
+            for url in std::iter::once(&rel.source).chain(rel.pgp.as_ref()) {
+                let Some(name) = url_file_name(url) else {
+                    toast_overlay.add_toast(Toast::new("kernel.org listed an unusual download URL"));
+                    return;
+                };
+                files.push(Remote { url: url.clone(), filename: name.to_string() });
             }
+            let Some(busy) = begin_busy("download") else { return };
 
             progress.set_visible(true);
             progress.set_fraction(0.0);
-            progress.set_text(Some(&format!("Resolving packages for {}…", ver.version)));
-            stack.set_visible_child_name("install");
-            log_fn(format!("Resolving package list for Linux {}…", ver.version));
+            progress.set_text(Some(&format!("Downloading Linux {}…", rel.version)));
+            stack.set_visible_child_name("build");
+            log_fn(format!("Downloading Linux {} from cdn.kernel.org…", rel.version));
 
             let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            let dest_dir = PathBuf::from(format!(
-                "{}/Downloads/mainline-kernel-v{}",
-                std::env::var("HOME").unwrap_or("/tmp".into()),
-                ver.version
-            ));
-            {
-                let mut s = state.borrow_mut();
-                s.download_cancel = Some(cancel_flag.clone());
-                // The download rewrites this directory, so what was staged
-                // from it is no longer a verified set.
-                if s.staged_dir.as_ref() == Some(&dest_dir) {
-                    s.staged_dir = None;
-                    s.staged_version = None;
-                    s.staged_files.clear();
-                }
-            }
-            update_install_tab();
+            state.borrow_mut().download_cancel = Some(cancel_flag.clone());
+            refresh_controls();
 
             // Progress channel — sent from the Tokio side, drained on the GTK
             // main context; the loop exits when the sender drops.
             let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
             let download_start = std::time::Instant::now();
-
             {
                 let progress = progress.clone();
                 glib::MainContext::default().spawn_local(async move {
@@ -1331,10 +2082,7 @@ pub fn build_ui(app: &Application) {
                             continue;
                         }
                         last_ui = std::time::Instant::now();
-                        let label_prefix = format!(
-                            "[{}/{}] {}",
-                            msg.file_index + 1, msg.file_count, msg.filename
-                        );
+                        let label_prefix = format!("[{}/{}] {}", msg.file_index + 1, msg.file_count, msg.filename);
                         if let Some(t) = msg.total {
                             if t > 0 {
                                 progress.set_fraction(msg.downloaded as f64 / t as f64);
@@ -1356,74 +2104,231 @@ pub fn build_ui(app: &Application) {
                 });
             }
 
-            let state = state.clone();
             let progress = progress.clone();
             let log_fn = log_fn.clone();
-            let update_install_tab = update_install_tab.clone();
             let toast_overlay = toast_overlay.clone();
-            let refresh_controls = refresh_controls.clone();
-            let cancel_flag2 = cancel_flag.clone();
-            let ver2 = ver.clone();
-            let dest_dir2 = dest_dir.clone();
-
+            let set_source = set_source.clone();
             spawn_async(
-                async move {
-                    let set = fetch_deb_list(&ver2).await?;
-                    let file_info: Vec<String> = set.debs.iter().map(|d| d.filename.clone()).collect();
-                    let tx = prog_tx;
-                    download_deb_set(
-                        set,
-                        dest_dir2,
-                        move |p| { let _ = tx.send(p); },
-                        cancel_flag2,
-                    )
-                    .await?;
-                    Ok::<Vec<String>, anyhow::Error>(file_info)
-                },
+                download_files(files, build::downloads_root(), move |p| { let _ = prog_tx.send(p); }, cancel_flag),
                 move |result| {
                     drop(busy);
-
                     match result {
                         Err(e) => {
                             if is_cancelled(&e) {
                                 log_fn("Download cancelled.".to_string());
-                                progress.set_text(Some("Cancelled"));
+                                progress.set_text(Some("Download cancelled"));
                             } else {
-                                log_fn(format!("Download failed: {:#}", e));
+                                log_fn(format!("Download failed: {e:#}"));
                                 progress.set_text(Some("Download failed"));
                                 toast_overlay.add_toast(Toast::new("Download failed — see Log tab"));
                             }
                         }
-                        Ok(file_info) => {
-                            log_fn(format!(
-                                "Downloaded {} packages to {}, each verified against the CHECKSUMS signed by Ubuntu's kernel team",
-                                file_info.len(), dest_dir.display()
-                            ));
-                            progress.set_fraction(1.0);
-                            progress.set_text(Some("Ready to install"));
-                            {
-                                let mut s = state.borrow_mut();
-                                s.staged_dir = Some(dest_dir.clone());
-                                s.staged_version = Some(ver.version.clone());
-                                s.staged_files = file_info;
+                        Ok(paths) => {
+                            log_fn(format!("Downloaded {}", paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")));
+                            progress.set_visible(false);
+                            if let Some(tarball) = paths.first() {
+                                set_source(tarball.clone());
                             }
-                            update_install_tab();
-                            toast_overlay.add_toast(Toast::new("Download complete"));
                         }
                     }
-                    refresh_controls();
                 },
             );
         });
     }
 
-    // Cancel download
+    // Cancel a download or a build
     {
         let state = state.clone();
-        cancel_dl_btn.connect_clicked(move |_| {
-            if let Some(flag) = &state.borrow().download_cancel {
+        let log_fn = log_fn.clone();
+        cancel_btn.connect_clicked(move |_| {
+            let s = state.borrow();
+            if let Some(flag) = &s.download_cancel {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            if let Some(control) = &s.build_control {
+                log_fn("Cancelling the build…".to_string());
+                control.cancel();
+            }
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Build: prepare (extract + configure), show the summary, build
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+        let state = state.clone();
+        let window = window.clone();
+        let log_fn = log_fn.clone();
+        let toast_overlay = toast_overlay.clone();
+        let begin_busy = begin_busy.clone();
+        let refresh_controls = refresh_controls.clone();
+        let stage_label = stage_label.clone();
+        let progress = progress.clone();
+        let event_sink = event_sink.clone();
+        let load_built = load_built.clone();
+        let stack = stack.clone();
+        let refresh_requirements = refresh_requirements.clone();
+
+        build_btn.connect_clicked(move |_| {
+            let req = {
+                let s = state.borrow();
+                let (Some(tarball), Some(trust), Some(mode)) = (s.source.clone(), s.source_trust(), s.config_mode()) else { return };
+                if !s.missing_deps.is_empty() { return; }
+                BuildRequest { tarball, trust, mode, running_kernel: s.sysinfo.running_kernel.clone() }
+            };
+            let boot_need = state.borrow().sysinfo.boot_needed_bytes;
+            let tree_log = build::tree_dir(&req.tarball.version).join("build.log");
+            let Some(busy) = begin_busy("build") else { return };
+            let control = BuildControl::new();
+            {
+                let mut s = state.borrow_mut();
+                s.build_control = Some(control.clone());
+                s.build_started = Some(std::time::Instant::now());
+            }
+            refresh_controls();
+            log_fn(format!("Preparing the build of Linux {}…", req.tarball.version.kernelversion()));
+            stage_label.set_label("Preparing");
+            stage_label.set_visible(true);
+            progress.set_visible(true);
+            progress.set_fraction(0.0);
+
+            // Elapsed time and a pulsing bar while the build runs.
+            {
+                let state = state.clone();
+                let progress = progress.clone();
+                // Runs while the build holds the busy state; between the
+                // configure step and the yes to the summary it just waits.
+                glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                    let s = state.borrow();
+                    if s.build_control.is_none() {
+                        return glib::ControlFlow::Break;
+                    }
+                    match s.build_started {
+                        Some(start) => {
+                            let secs = start.elapsed().as_secs();
+                            progress.set_text(Some(&format!("{:02}:{:02}:{:02} elapsed", secs / 3600, secs / 60 % 60, secs % 60)));
+                            progress.pulse();
+                        }
+                        None => progress.set_text(Some("Waiting for you to confirm the configuration")),
+                    }
+                    glib::ControlFlow::Continue
+                });
+            }
+
+            let busy_slot: Rc<RefCell<Option<BusyGuard>>> = Rc::new(RefCell::new(Some(busy)));
+            let finish = {
+                let busy_slot = busy_slot.clone();
+                let progress = progress.clone();
+                let stage_label = stage_label.clone();
+                let refresh_requirements = refresh_requirements.clone();
+                move |label: &str| {
+                    busy_slot.borrow_mut().take();
+                    stage_label.set_label(label);
+                    progress.set_visible(false);
+                    refresh_requirements();
+                }
+            };
+
+            let window = window.clone();
+            let log_fn = log_fn.clone();
+            let toast_overlay = toast_overlay.clone();
+            let event_sink = event_sink.clone();
+            let load_built = load_built.clone();
+            let stack = stack.clone();
+            let state = state.clone();
+            let sink = event_sink.clone();
+            let c2 = control.clone();
+            spawn_async(
+                async move { tokio::task::spawn_blocking(move || build::prepare(req, sink, c2, boot_need)).await },
+                move |result| {
+                    let prepared: Prepared = match result {
+                        Ok(Ok(p)) => p,
+                        Ok(Err(e)) => {
+                            if is_build_cancelled(&e) {
+                                log_fn("Build cancelled.".to_string());
+                                finish("Build cancelled");
+                            } else {
+                                log_fn(format!("Preparing the build failed: {e:#}"));
+                                if tree_log.exists() {
+                                    log_fn(format!("The output is in {}", tree_log.display()));
+                                }
+                                toast_overlay.add_toast(Toast::new("Preparing the build failed — see Log tab"));
+                                finish("Preparing the build failed");
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            log_fn(format!("Task error: {e}"));
+                            finish("Build failed");
+                            return;
+                        }
+                    };
+                    // Show what will be built and wait for a yes.
+                    state.borrow_mut().build_started = None;
+                    let dialog = AlertDialog::builder()
+                        .heading(format!("Build Linux {}?", prepared.summary.kernelrelease))
+                        .body(prepared.summary.text())
+                        .build();
+                    dialog.add_responses(&[("cancel", "Cancel"), ("build", "Build")]);
+                    dialog.set_response_appearance("build", libadwaita::ResponseAppearance::Suggested);
+                    dialog.set_default_response(Some("build"));
+                    dialog.set_close_response("cancel");
+                    let prepared_slot = Rc::new(RefCell::new(Some(prepared)));
+                    let finish = Rc::new(finish);
+                    dialog.connect_response(None, move |_, resp| {
+                        let Some(prepared) = prepared_slot.borrow_mut().take() else { return };
+                        if resp != "build" {
+                            log_fn("Build not started; the configured tree is deleted.".to_string());
+                            spawn_async(async move { tokio::task::spawn_blocking(move || prepared.discard()).await }, |_| {});
+                            finish("");
+                            return;
+                        }
+                        let krel = prepared.summary.kernelrelease.clone();
+                        log_fn(format!("Building Linux {krel} — this takes a while; the full output goes to build.log"));
+                        state.borrow_mut().build_started = Some(std::time::Instant::now());
+                        let state = state.clone();
+                        let log_fn = log_fn.clone();
+                        let toast_overlay = toast_overlay.clone();
+                        let load_built = load_built.clone();
+                        let stack = stack.clone();
+                        let finish = finish.clone();
+                        let tree_log = tree_log.clone();
+                        let sink = event_sink.clone();
+                        let control = control.clone();
+                        spawn_async(
+                            async move { tokio::task::spawn_blocking(move || build::build(prepared, sink, control)).await },
+                            move |result| {
+                                let elapsed = state.borrow().build_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+                                let took = format!("{}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60);
+                                match result {
+                                    Ok(Ok(set)) => {
+                                        log_fn(format!("Built Linux {} in {took}: {}", set.kernelrelease, set.dir.display()));
+                                        toast_overlay.add_toast(Toast::new("Kernel built — ready to install"));
+                                        finish(&format!("Built in {took}"));
+                                        load_built(Some(set.dir.clone()));
+                                        stack.set_visible_child_name("install");
+                                    }
+                                    Ok(Err(e)) if is_build_cancelled(&e) => {
+                                        log_fn("Build cancelled; its files were removed.".to_string());
+                                        finish("Build cancelled");
+                                    }
+                                    Ok(Err(e)) => {
+                                        log_fn(format!("Build failed after {took}: {e:#}"));
+                                        log_fn(format!("The full output is in {}", tree_log.display()));
+                                        toast_overlay.add_toast(Toast::new("Build failed — see Log tab"));
+                                        finish("Build failed");
+                                    }
+                                    Err(e) => {
+                                        log_fn(format!("Task error: {e}"));
+                                        finish("Build failed");
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    dialog.present(Some(&window));
+                },
+            );
         });
     }
 
@@ -1435,7 +2340,7 @@ pub fn build_ui(app: &Application) {
         let log_fn = log_fn.clone();
         let stack = stack.clone();
         let toast_overlay = toast_overlay.clone();
-        let progress = progress.clone();
+        let progress = install_progress.clone();
         let load_sysinfo = load_sysinfo.clone();
         let window = window.clone();
         let preflight_state = state.clone();
@@ -1443,7 +2348,11 @@ pub fn build_ui(app: &Application) {
         let begin_busy = begin_busy.clone();
 
         let start_install: Rc<dyn Fn()> = Rc::new(move || {
-            let dir = { state.borrow().staged_dir.clone() };
+            let dir = {
+                let s = state.borrow();
+                if !s.staged_verified { return; }
+                s.staged.as_ref().map(|set| set.dir.clone())
+            };
             let Some(dir) = dir else { return };
             let Some(busy) = begin_busy("kernel install") else { return };
             let dir_str = dir.display().to_string();
@@ -1523,7 +2432,15 @@ pub fn build_ui(app: &Application) {
                 dialog.present(Some(&window));
                 return;
             }
-            let warnings = install_warnings(&preflight_state.borrow().sysinfo);
+            let mut warnings = install_warnings(&preflight_state.borrow().sysinfo);
+            if let Some(f) = preflight_state.borrow().sysinfo.free_root_bytes {
+                if f < MIN_ROOT_BYTES {
+                    warnings.push(format!("/ has only {} free; the modules and initramfs need room too.", format_bytes(f)));
+                }
+            }
+            if preflight_state.borrow().staged.as_ref().is_some_and(|s| s.source.starts_with("UNVERIFIED")) {
+                warnings.push("This kernel was built from source that was not verified against a kernel.org signature.".to_string());
+            }
             if warnings.is_empty() {
                 start_install();
                 return;
@@ -1565,7 +2482,7 @@ pub fn build_ui(app: &Application) {
                 .website("https://github.com/labj1987/kernel-pop")
                 .issue_url("https://github.com/labj1987/kernel-pop/issues")
                 .comments(format!(
-                    "GTK4 + Rust GUI for installing Ubuntu mainline kernels with a verified initramfs.\n\nRunning kernel: {}\nInstalled kernels: {}",
+                    "GTK4 + Rust GUI that builds kernel.org kernels for this machine and installs them with a verified initramfs.\n\nRunning kernel: {}\nInstalled kernels: {}",
                     running, count
                 ))
                 .build();
@@ -1576,6 +2493,18 @@ pub fn build_ui(app: &Application) {
 
     // Clear log
     { let lv = log_view.clone(); clear_btn.connect_clicked(move |_| { lv.buffer().set_text(""); }); }
+
+    // Closing the window stops a running build: its process group would
+    // otherwise keep compiling with nobody to collect the packages.
+    {
+        let state = state.clone();
+        window.connect_close_request(move |_| {
+            if let Some(control) = state.borrow().build_control.clone() {
+                control.cancel();
+            }
+            glib::Propagation::Proceed
+        });
+    }
 
     window.present();
 }

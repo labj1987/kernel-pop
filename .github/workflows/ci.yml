@@ -35,8 +35,9 @@ jobs:
       - name: Install GTK4 / libadwaita headers
         run: |
           sudo apt-get update -qq
-          # gpgv: the CHECKSUMS signature tests run it.
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config gpgv
+          # gnupg/gpgv: the tarball signature tests make a throwaway key and run gpgv;
+          # xz-utils/gzip: the tarball tests compress with them.
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config gnupg gpgv xz-utils gzip
       - name: Build
         run: cargo build --locked
       - name: Test
@@ -59,8 +60,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           # sbsigntool/openssl and an EFI binary (systemd-boot-efi) let the
-          # signing tests run, gnupg/gpgv the download verification tests.
-          sudo apt-get install -y -qq shellcheck sbsigntool openssl systemd-boot-efi gnupg gpgv
+          # signing tests run.
+          sudo apt-get install -y -qq shellcheck sbsigntool openssl systemd-boot-efi
           shellcheck -S warning scripts/privileged-install.sh scripts/tests/test-privileged.sh build-appimage.sh
       # KERNEL_POP_REQUIRE_ALL_TESTS turns every skipped test group into a failure.
       - name: Privileged-script helper tests

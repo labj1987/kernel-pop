@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const SCRIPT: &str = "/usr/lib/kernel-pop/privileged-install.sh";
-const KEYRING: &str = "/usr/lib/kernel-pop/kernel-ppa.gpg";
 
 /// Lines of script output kept in an error message.
 const ERROR_TAIL_LINES: usize = 15;
@@ -18,7 +17,7 @@ const LINE_PREFIX: &str = "[kernel-pop] ";
 /// AppImage's root and the file system root. AppRun exports
 /// KERNEL_POP_BUNDLE (the AppImage's mount point) so the app can compare the
 /// bundled copies with the installed ones.
-const HELPER_FILES: [&str; 2] = [SCRIPT, KEYRING];
+const HELPER_FILES: [&str; 1] = [SCRIPT];
 
 /// Why the installed privileged helper cannot be used, or None when it
 /// matches this build. A helper from another version would be run with
@@ -202,9 +201,9 @@ pub fn run_privileged_sign(version: &str) -> Result<String> {
     run_script(&["--sign".to_string(), version.to_string()])
 }
 
-/// Install a downloaded .deb set. The script copies the set into a
-/// root-only directory and verifies it there (CHECKSUMS signature, every
-/// package's SHA256), derives the kernel version from the package metadata
+/// Install a built .deb set. The script copies the set into a root-only
+/// directory and verifies it there (every package's SHA256 against the
+/// manifest the build wrote), derives the kernel version from the package metadata
 /// (never from filenames), signs it when signing is set up, builds DKMS
 /// modules, generates the initramfs, verifies it exists, and updates the
 /// boot loader (GRUB or systemd-boot, whichever the machine actually uses).
@@ -213,6 +212,14 @@ pub fn run_privileged_install(deb_dir: &str) -> Result<String> {
         bail!("Download directory not found: {}", deb_dir);
     }
     run_script(&["--install".to_string(), deb_dir.to_string()])
+}
+
+/// Install missing kernel build tools with apt. The script accepts only
+/// package names from its own fixed allowlist.
+pub fn run_privileged_install_build_deps(packages: &[String]) -> Result<String> {
+    let mut args = vec!["--install-build-deps".to_string()];
+    args.extend_from_slice(packages);
+    run_script(&args)
 }
 
 /// Remove an installed kernel by full version string. The script refuses
@@ -294,22 +301,16 @@ mod tests {
         }
         let put = |d: &Path, f: &str, b: &[u8]| std::fs::write(d.join(f.trim_start_matches('/')), b).unwrap();
         put(&bundle, SCRIPT, b"script v2");
-        put(&bundle, KEYRING, b"ring");
         // Nothing installed
         assert!(helper_problem_in(Some(&bundle), &root).unwrap().contains("not installed"));
         // Installed, but an older script
         put(&root, SCRIPT, b"script v1");
-        put(&root, KEYRING, b"ring");
         assert!(helper_problem_in(Some(&bundle), &root).unwrap().contains("another version"));
-        // Script current but the keyring missing
+        // Current
         put(&root, SCRIPT, b"script v2");
-        std::fs::remove_file(root.join(KEYRING.trim_start_matches('/'))).unwrap();
-        assert!(helper_problem_in(Some(&bundle), &root).unwrap().contains("kernel-ppa.gpg is missing"));
-        // Both current
-        put(&root, KEYRING, b"ring");
         assert_eq!(helper_problem_in(Some(&bundle), &root), None);
         // An incomplete bundle
-        std::fs::remove_file(bundle.join(KEYRING.trim_start_matches('/'))).unwrap();
+        std::fs::remove_file(bundle.join(SCRIPT.trim_start_matches('/'))).unwrap();
         assert!(helper_problem_in(Some(&bundle), &root).unwrap().contains("incomplete"));
         // Development build: only presence
         assert_eq!(helper_problem_in(None, &root), None);
