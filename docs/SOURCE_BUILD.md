@@ -15,11 +15,18 @@ kernel, and why each step is the way it is. The code is in `src/kernelorg.rs`,
    `.tar.gz`). The compression is read from the file's magic bytes and the
    version from the top-level Makefile (`VERSION`, `PATCHLEVEL`, `SUBLEVEL`,
    `EXTRAVERSION`), never from the file name.
-2. **Verify** (below). A bad or missing signature blocks the build unless
+2. **Copy and verify.** The tarball is copied into
+   `~/.cache/kernel-pop/source/` (0700, the file 0600; emptied on the next
+   selection), and the signature is checked on that copy (below). The build
+   extracts the same copy, so a tarball in a place someone else can write
+   (a shared folder, removable media, `/tmp`) cannot be swapped between the
+   check and the build. A bad or missing signature blocks the build unless
    "Build unverified source" is turned on for that one tarball.
 3. **Prepare** (`build::prepare`, as the user): refuse to run as root, check
-   the build tools, check disk space, empty `~/.cache/kernel-pop/build/`,
-   extract into `~/.cache/kernel-pop/build/linux-X.Y.Z/`
+   the build tools, empty `~/.cache/kernel-pop/build/` (a failed build's tree
+   is kept until here, so its space counts as free), check disk space, list
+   the whole tarball and refuse it if any member is outside its one
+   top-level directory, extract into `~/.cache/kernel-pop/build/linux-X.Y.Z/`
    (`tar --strip-components=1`), configure (below), and show the summary.
 4. **Build** (`build::build`, as the user, after the summary is accepted):
    `make -j$(nproc) bindeb-pkg KDEB_PKGVERSION=<version>-1` with
@@ -30,10 +37,12 @@ kernel, and why each step is the way it is. The code is in `src/kernelorg.rs`,
    packages (picked by their Package field) are moved into
    `~/Downloads/kernel-pop/.linux-<release>.new/` with the final config
    (`config-<release>`), `build-info.txt` (source, signature verdict, mode),
-   `build.log` and a `SHA256SUMS` manifest, and that directory is renamed to
-   `linux-<release>/` last. Everything else bindeb-pkg wrote
-   (`linux-libc-dev`, `.buildinfo`, `.changes`) and the build tree are
-   deleted.
+   a copy of `build.log` and a `SHA256SUMS` manifest. An earlier build of the
+   same release is moved aside, the new directory renamed to
+   `linux-<release>/`, and only then is the earlier one deleted (if the
+   rename fails it is put back; on any error the temp directory goes).
+   Everything else bindeb-pkg wrote (`linux-libc-dev`, `.buildinfo`,
+   `.changes`) and the build tree are deleted.
 6. **Install** through `pkexec` and `privileged-install.sh --install`, which
    is the only privileged step.
 
@@ -55,19 +64,25 @@ Kernel Pop does exactly that, without any bundled key:
 
 1. A throwaway `GNUPGHOME` (0700, removed afterwards, its gpg-agent and
    dirmngr stopped).
-2. `gpg --auto-key-locate clear,nodefault,wkd --locate-keys
-   torvalds@kernel.org gregkh@kernel.org`, so keys come from kernel.org's
-   WKD only, never from a keyserver or the user's keyring. If the signature
-   carries a "signer's user ID" subpacket naming another `@kernel.org`
-   address, that key is fetched the same way. (Current releases carry only
-   the issuer fingerprint; on 2026-10-24 every listed release, mainline 7.3
-   included, was signed by Greg Kroah-Hartman's key
-   `647F 2865 4894 E3BD 4571 99BE 38DB BDC8 6092 693E`.)
+2. `gpg --auto-key-locate clear,nodefault,wkd --locate-keys --
+   torvalds@kernel.org gregkh@kernel.org` (given up after 90 seconds), so
+   keys come from kernel.org's WKD only, never from a keyserver or the
+   user's keyring. If the signature carries a "signer's user ID" subpacket
+   naming another `@kernel.org` address, that key is fetched the same way.
+   (Current releases carry only the issuer fingerprint; on 2026-10-24 every
+   listed release, mainline 7.3 included, was signed by Greg Kroah-Hartman's
+   key `647F 2865 4894 E3BD 4571 99BE 38DB BDC8 6092 693E`.)
 3. The fetched keys are exported to a keyring of their own, and
    `xz -dc tarball | gpgv --keyring <that keyring> linux-X.tar.sign -` runs
    with an empty home. Only GOODSIG together with VALIDSIG counts; BADSIG,
    expired or revoked keys and a key not in the keyring are failures, and so
-   is a tarball that does not decompress.
+   is a tarball that does not decompress (unless gpgv stopped reading because
+   the signature file itself is unusable; then gpgv's reason is shown).
+4. The good signature must come from a key whose user ID is
+   torvalds@kernel.org or gregkh@kernel.org, the release signers
+   signature.html names. Any other kernel.org developer's signature (the
+   signer picks the user ID subpacket, and hundreds of developers have WKD
+   keys) is reported but not "verified": it needs the override.
 
 A dropped tarball without a `.tar.sign` next to it gets kernel.org's,
 fetched from `cdn.kernel.org/pub/linux/kernel/vN.x/linux-<name>.tar.sign` by

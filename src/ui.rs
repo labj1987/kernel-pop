@@ -11,7 +11,7 @@ use crate::install::{
     ScriptReport,
 };
 use crate::kernelorg::{fetch_releases, fetch_signature, url_file_name, Moniker, Release};
-use crate::source::{inspect, Tarball};
+use crate::source::{inspect, private_copy, Tarball};
 use crate::system::{
     compare_to_running, format_bytes, health_summary, install_blocker, install_warnings,
     prune_candidates, query_system, BootEntry, KernelSignature, KernelSigning, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
@@ -1532,7 +1532,7 @@ pub fn build_ui(app: &Application) {
             match &s.source {
                 Some(t) => {
                     source_row.set_title(&format!("Linux {}", t.version.kernelversion()));
-                    source_row.set_subtitle(&t.path.display().to_string());
+                    source_row.set_subtitle(&t.origin.display().to_string());
                 }
                 None => {
                     source_row.set_title("No source selected");
@@ -1580,7 +1580,11 @@ pub fn build_ui(app: &Application) {
             spawn_async(
                 async move {
                     tokio::task::spawn_blocking(|| {
-                        (missing_build_deps(), ccache_available(), free_bytes(&build::build_root()), free_bytes(std::path::Path::new("/boot")))
+                        // An earlier failed build's tree is removed when the next
+                        // build starts, so its space counts as free here.
+                        let root = build::build_root();
+                        let cache_free = free_bytes(&root).map(|f| f + build::dir_size(&root));
+                        (missing_build_deps(), ccache_available(), cache_free, free_bytes(std::path::Path::new("/boot")))
                     })
                     .await
                 },
@@ -1645,7 +1649,9 @@ pub fn build_ui(app: &Application) {
             spawn_async(
                 async move {
                     let p = path.clone();
-                    let tarball = tokio::task::spawn_blocking(move || inspect(&p)).await??;
+                    // Checked and later built: Kernel Pop's private copy, so the
+                    // file cannot be swapped between the check and the build.
+                    let tarball = tokio::task::spawn_blocking(move || inspect(&p).and_then(|t| private_copy(&t))).await??;
                     let sig = match tarball.sibling_signature() {
                         Some(sig) => sig,
                         None => {
@@ -2494,15 +2500,30 @@ pub fn build_ui(app: &Application) {
     // Clear log
     { let lv = log_view.clone(); clear_btn.connect_clicked(move |_| { lv.buffer().set_text(""); }); }
 
-    // Closing the window stops a running build: its process group would
-    // otherwise keep compiling with nobody to collect the packages.
+    // Closing the window stops a running build first: its process group
+    // would otherwise keep compiling with nobody to collect the packages.
+    // The window closes once the build has stopped and cleaned up.
     {
         let state = state.clone();
-        window.connect_close_request(move |_| {
-            if let Some(control) = state.borrow().build_control.clone() {
+        let toast_overlay = toast_overlay.clone();
+        window.connect_close_request(move |w| {
+            let Some(control) = state.borrow().build_control.clone() else {
+                return glib::Propagation::Proceed;
+            };
+            if !control.is_cancelled() {
                 control.cancel();
+                toast_overlay.add_toast(Toast::new("Stopping the build before closing…"));
             }
-            glib::Propagation::Proceed
+            let state = state.clone();
+            let w = w.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                if state.borrow().build_control.is_some() {
+                    return glib::ControlFlow::Continue;
+                }
+                w.destroy();
+                glib::ControlFlow::Break
+            });
+            glib::Propagation::Stop
         });
     }
 

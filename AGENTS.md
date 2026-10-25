@@ -48,7 +48,9 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   torvalds@ and gregkh@kernel.org (and an @kernel.org signer the signature
   names) into a throwaway GNUPGHOME, export to a keyring, `gpgv` over the
   decompressed tar on stdin. `parse_gpgv_status` needs GOODSIG and VALIDSIG;
-  expired/revoked keys are refused.
+  expired/revoked keys are refused, and only a release signer
+  (`SIGNER_ADDRESSES`) counts as verified. The check runs on the private
+  copy `source::private_copy` makes, which is also what the build extracts.
 - `build.rs` — `BUILD_DEPS` (equal to the script's allowlist, a test checks),
   `prepare` (disk preflight, extract into `~/.cache/kernel-pop/build/`,
   configure, `ConfigSummary`) and `build` (`make bindeb-pkg`, publish to

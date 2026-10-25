@@ -453,6 +453,18 @@ fn scripts_config(tree: &Path) -> Command {
     c
 }
 
+/// Bytes used by everything under `path` (symlinks not followed); 0 when
+/// it does not exist.
+pub fn dir_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return 0 };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|rd| rd.flatten().map(|e| dir_size(&e.path())).sum())
+        .unwrap_or(0)
+}
+
 /// Remove everything in the build root (a failed or cancelled earlier
 /// build). It is Kernel Pop's own directory.
 fn clear_build_root(root: &Path) -> Result<()> {
@@ -476,9 +488,6 @@ pub fn prepare(req: BuildRequest, events: EventSink, control: Arc<BuildControl>,
         bail!("Build tools are missing: {}", missing.join(", "));
     }
     let root = build_root();
-    if let Some(p) = space_problem(&req.mode, free_bytes(&root), free_bytes(Path::new("/boot")), boot_need) {
-        bail!("{p}");
-    }
     let base_config = match &req.mode {
         ConfigMode::OwnConfig(p) => p.clone(),
         _ => PathBuf::from(format!("/boot/config-{}", req.running_kernel)),
@@ -486,7 +495,12 @@ pub fn prepare(req: BuildRequest, events: EventSink, control: Arc<BuildControl>,
     if !base_config.is_file() {
         bail!("The base config {} does not exist", base_config.display());
     }
+    // What an earlier failed build left is Kernel Pop's own and goes first,
+    // so it does not count against the space this build needs.
     clear_build_root(&root)?;
+    if let Some(p) = space_problem(&req.mode, free_bytes(&root), free_bytes(Path::new("/boot")), boot_need) {
+        bail!("{p}");
+    }
     let tree = tree_dir(&req.tarball.version);
     std::fs::create_dir_all(&tree).with_context(|| format!("Could not create {}", tree.display()))?;
     let log = tree.join("build.log");
@@ -509,7 +523,12 @@ pub fn prepare(req: BuildRequest, events: EventSink, control: Arc<BuildControl>,
 fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) -> Result<ConfigSummary> {
     let ccache = ccache_available();
     r.note(format!("Kernel Pop {} source build", env!("CARGO_PKG_VERSION")));
-    r.note(format!("Source: {} (Linux {})", req.tarball.path.display(), req.tarball.version.kernelversion()));
+    r.note(format!(
+        "Source: {} (Linux {}; building Kernel Pop's private copy {})",
+        req.tarball.origin.display(),
+        req.tarball.version.kernelversion(),
+        req.tarball.path.display()
+    ));
     r.note(format!("Source signature: {}", req.trust.describe()));
     if let SourceTrust::Unverified { .. } = req.trust {
         r.note("WARNING: this source was NOT verified against a kernel.org signature; it is built only because that was explicitly allowed for this tarball.");
@@ -517,6 +536,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     r.note(format!("Configuration: {} (base {})", req.mode.label(), base_config.display()));
 
     r.stage(Stage::Extract);
+    crate::source::check_single_top_dir(&req.tarball)?;
     let mut tar = Command::new("tar");
     tar.arg("-xf").arg(&req.tarball.path).arg("-C").arg(tree).args(["--strip-components=1", "--no-same-owner"]);
     r.run(tar, "Extracting the source")?;
@@ -813,19 +833,35 @@ fn run_build(p: &Prepared, r: &Runner, root: &Path) -> Result<BuiltSet> {
 
     // Publish: everything goes into a temp dir next to the final one, which
     // is renamed into place last, so the install step only ever sees a
-    // complete set with its manifest.
+    // complete set with its manifest. On any error the temp dir goes again
+    // and an earlier build of the same kernel stays as it was.
     let downloads = downloads_root();
     std::fs::create_dir_all(&downloads)?;
     set_mode_sync(&downloads, crate::download::DIR_MODE)?;
     let out = downloads.join(format!("linux-{krel}"));
     let tmp = downloads.join(format!(".linux-{krel}.new"));
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp)?;
+    let published = publish(p, r, &keep, &names, &tmp, &out);
+    if published.is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
     }
-    std::fs::create_dir(&tmp)?;
-    set_mode_sync(&tmp, crate::download::DIR_MODE)?;
+    published?;
+    r.note(format!("Packages: {} — in {}", names.join(", "), out.display()));
+    std::fs::remove_dir_all(&p.tree).with_context(|| format!("Could not delete the build tree {}", p.tree.display()))?;
+    remove_package_outputs(root);
+    Ok(BuiltSet { dir: out, kernelrelease: krel.clone(), debs: names, source: p.request.trust.describe() })
+}
+
+/// Fill `tmp` with the packages, config, build-info, build log and manifest,
+/// then swap it in as `out`.
+fn publish(p: &Prepared, r: &Runner, keep: &[(PathBuf, String)], names: &[String], tmp: &Path, out: &Path) -> Result<()> {
+    let krel = &p.summary.kernelrelease;
+    if tmp.exists() {
+        std::fs::remove_dir_all(tmp)?;
+    }
+    std::fs::create_dir(tmp)?;
+    set_mode_sync(tmp, crate::download::DIR_MODE)?;
     let mut manifest = BTreeMap::new();
-    for ((path, _), name) in keep.iter().zip(&names) {
+    for ((path, _), name) in keep.iter().zip(names) {
         let dest = tmp.join(name);
         move_file(path, &dest)?;
         set_mode_sync(&dest, crate::download::FILE_MODE)?;
@@ -833,10 +869,9 @@ fn run_build(p: &Prepared, r: &Runner, root: &Path) -> Result<BuiltSet> {
     }
     let cfg = tmp.join(format!("config-{krel}"));
     std::fs::copy(p.tree.join(".config"), &cfg)?;
-    set_mode_sync(&cfg, crate::download::FILE_MODE)?;
     let info = format!(
         "kernel: {krel}\nsource: {}\nsignature: {}\nconfiguration: {}\nbase config: {}\nbuilt: {}\n",
-        p.request.tarball.path.display(),
+        p.request.tarball.origin.display(),
         p.request.trust.describe(),
         p.summary.mode.label(),
         p.summary.base_config.display(),
@@ -844,20 +879,32 @@ fn run_build(p: &Prepared, r: &Runner, root: &Path) -> Result<BuiltSet> {
     );
     std::fs::write(tmp.join(BUILD_INFO), info)?;
     std::fs::write(tmp.join(MANIFEST), manifest_text(&manifest))?;
-    for f in [BUILD_INFO, MANIFEST] {
-        set_mode_sync(&tmp.join(f), crate::download::FILE_MODE)?;
+    r.note(format!("Publishing to {}", out.display()));
+    // A copy: the log in the tree stays complete if anything below fails.
+    std::fs::copy(&p.log, tmp.join("build.log"))?;
+    for f in [cfg.clone(), tmp.join(BUILD_INFO), tmp.join(MANIFEST), tmp.join("build.log")] {
+        set_mode_sync(&f, crate::download::FILE_MODE)?;
     }
-    r.note(format!("Packages: {}", names.join(", ")));
-    r.note(format!("Moved to {}; deleting the build tree", out.display()));
-    move_file(&p.log, &tmp.join("build.log"))?;
-    set_mode_sync(&tmp.join("build.log"), crate::download::FILE_MODE)?;
-    if out.exists() {
-        std::fs::remove_dir_all(&out).with_context(|| format!("Could not replace the earlier build in {}", out.display()))?;
+    // Swap: the earlier set is moved aside first and only deleted once the
+    // new one is in place; if the rename fails it is put back.
+    let old = out.with_file_name(format!(".linux-{krel}.old"));
+    if old.exists() {
+        std::fs::remove_dir_all(&old)?;
     }
-    std::fs::rename(&tmp, &out)?;
-    std::fs::remove_dir_all(&p.tree).with_context(|| format!("Could not delete the build tree {}", p.tree.display()))?;
-    remove_package_outputs(root);
-    Ok(BuiltSet { dir: out, kernelrelease: krel.clone(), debs: names, source: p.request.trust.describe() })
+    let had_old = out.exists();
+    if had_old {
+        std::fs::rename(out, &old).with_context(|| format!("Could not move the earlier build in {} aside", out.display()))?;
+    }
+    if let Err(e) = std::fs::rename(tmp, out) {
+        if had_old {
+            let _ = std::fs::rename(&old, out);
+        }
+        return Err(e).with_context(|| format!("Could not move the new build into {}", out.display()));
+    }
+    if had_old {
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    Ok(())
 }
 
 /// The first output line of bindeb-pkg's packaging step.
@@ -1020,6 +1067,69 @@ mod tests {
         verify_built_set(&sets[0]).unwrap();
         std::fs::write(set.join("linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb"), b"changed").unwrap();
         assert!(verify_built_set(&sets[0]).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn publishing_replaces_an_earlier_set_whole() {
+        let d = crate::source::tests::scratch("publish");
+        let tree = d.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join(".config"), "CONFIG_X=y\n").unwrap();
+        let log = tree.join("build.log");
+        std::fs::write(&log, "log\n").unwrap();
+        let tb = d.join("linux-7.2.12.tar.xz");
+        crate::source::tests::compress_to("xz", &crate::source::tests::tar_bytes("linux-7.2.12", crate::source::tests::MAKEFILE), &tb);
+        let tarball = crate::source::inspect(&tb).unwrap();
+        let summary = ConfigSummary {
+            base_config: "/boot/config-x".into(),
+            mode: ConfigMode::MatchSystem,
+            localversion: LOCALVERSION.into(),
+            kernelrelease: "7.2.12-kernelpop".into(),
+            fixes: vec![],
+            notes: vec![],
+            modules: 1,
+            ccache: false,
+        };
+        let request = BuildRequest { tarball, trust: SourceTrust::Unverified { reason: "test".into() }, mode: ConfigMode::MatchSystem, running_kernel: "x".into() };
+        let p = Prepared { request, tree: tree.clone(), summary, log: log.clone() };
+        let runner = Runner { events: Arc::new(|_| {}), log: Mutex::new(std::fs::File::create(d.join("runner.log")).unwrap()), control: BuildControl::new() };
+        let out = d.join("linux-7.2.12-kernelpop");
+        let tmp = d.join(".linux-7.2.12-kernelpop.new");
+        for round in ["first", "second"] {
+            let deb = d.join("linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb");
+            std::fs::write(&deb, round).unwrap();
+            let keep = vec![(deb, "linux-image-7.2.12-kernelpop".to_string())];
+            let names = vec!["linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb".to_string()];
+            publish(&p, &runner, &keep, &names, &tmp, &out).unwrap();
+            assert_eq!(std::fs::read_to_string(out.join(&names[0])).unwrap(), round);
+            let set = built_sets_in(&d);
+            assert_eq!(set.len(), 1);
+            verify_built_set(&set[0]).unwrap();
+            assert!(set[0].source.starts_with("UNVERIFIED"));
+            assert!(out.join("build.log").exists() && out.join("config-7.2.12-kernelpop").exists());
+            // The tree's own log stays where it was.
+            assert!(log.exists());
+        }
+        assert!(!tmp.exists());
+        assert!(!d.join(".linux-7.2.12-kernelpop.old").exists());
+        // A failure part way (a package that is not there) leaves the
+        // earlier set untouched; the caller removes the temp dir.
+        let keep = vec![(d.join("missing.deb"), "x".to_string())];
+        assert!(publish(&p, &runner, &keep, &["missing.deb".to_string()], &tmp, &out).is_err());
+        assert_eq!(std::fs::read_to_string(out.join("linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb")).unwrap(), "second");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn dir_sizes_add_up() {
+        let d = crate::source::tests::scratch("dirsize");
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("a/x"), [0u8; 100]).unwrap();
+        std::fs::write(d.join("a/b/y"), [0u8; 23]).unwrap();
+        std::os::unix::fs::symlink("/usr", d.join("a/link")).unwrap();
+        assert_eq!(dir_size(&d.join("a")), 123 + "/usr".len() as u64);
+        assert_eq!(dir_size(&d.join("nope")), 0);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

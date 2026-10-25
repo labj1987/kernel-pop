@@ -824,6 +824,7 @@ stage_verified_debs() {
         (( n > 0 )) || die "No .deb files found in $src"
         while read -r h f; do
             [[ -n "$h" ]] || continue
+            [[ "$f" =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]*\.deb$ ]] || die "$MANIFEST lists '$f', which is not a plain package file name"
             [[ -f "$dst/$f" ]] || die "$MANIFEST lists $f, which is not in $src — the set is incomplete"
         done < "$dst/$MANIFEST"
         log "Verified: $n package(s) match $MANIFEST"

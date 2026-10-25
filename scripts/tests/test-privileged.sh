@@ -539,6 +539,9 @@ unset KERNEL_POP_MOK_DIR KERNEL_POP_SIGNED_DIR KERNEL_POP_BOOT
     grep -q "not listed in SHA256SUMS" "$tmp/stage-out" || bad "an unlisted deb should say so"
     make_build "$tmp/dl"; rm "$tmp/dl/SHA256SUMS"
     stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a build without SHA256SUMS"
+    make_build "$tmp/dl"; echo "$(printf '0%.0s' {1..64})  ../../etc/passwd" >> "$tmp/dl/SHA256SUMS"
+    stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a manifest entry that is not a plain .deb name"
+    grep -q "not a plain package file name" "$tmp/stage-out" || bad "an odd manifest name should say so: $(cat "$tmp/stage-out")"
     make_build "$tmp/dl"; rm "$tmp/dl/linux-headers-${kv}_7.7.7-1_amd64.deb"
     stage_ok "$tmp/dl" && bad "stage_verified_debs should refuse a set missing a package the manifest lists"
     grep -q "the set is incomplete" "$tmp/stage-out" || bad "an incomplete set should say so: $(cat "$tmp/stage-out")"
@@ -687,6 +690,34 @@ EOF2
     [[ -z "$(ls -A "$root/staging")" ]] || bad "a refused install left its staging directory behind"
     exit "$fails"
 ) || { echo "FAIL: staging/do_install group"; fails=$((fails + 1)); }
+
+# ── Real packages: the Package field decides, never the file name ───────
+# Tiny .debs built with the real dpkg-deb, named to mislead.
+(
+    fails=0
+    unset -f dpkg-deb
+    mkdeb() {   # <file> <Package>
+        local d; d="$(mktemp -d)"
+        mkdir -p "$d/DEBIAN"
+        printf 'Package: %s\nVersion: 1\nArchitecture: all\nMaintainer: t <t@invalid>\nDescription: test\n' "$2" > "$d/DEBIAN/control"
+        dpkg-deb --build --root-owner-group "$d" "$1" >/dev/null 2>&1 || echo "FAIL: could not build $1"
+        rm -rf "$d"
+    }
+    r="$tmp/realdebs"; mkdir -p "$r"
+    mkdeb "$r/linux-image-9.9.9-kernelpop_1_amd64.deb" linux-libc-dev
+    deb_allowed "$r/linux-image-9.9.9-kernelpop_1_amd64.deb" && bad "a deb whose Package is linux-libc-dev must be refused whatever its file name"
+    mkdeb "$r/linux-headers-9.9.9-kernelpop_1_amd64.deb" linux-image-9.9.9-kernelpop-dbg
+    deb_allowed "$r/linux-headers-9.9.9-kernelpop_1_amd64.deb" && bad "a deb whose Package is a -dbg image must be refused whatever its file name"
+    mkdeb "$r/evil_1_all.deb" linux-image-9.9.9-kernelpop
+    deb_allowed "$r/evil_1_all.deb" || bad "a deb whose Package is a kernel image is allowed whatever its file name"
+    mkdeb "$r/linux-image-1.1.1-kernelpop_1_amd64.deb" linux-headers-9.9.9-kernelpop
+    got="$(kver_from_debs "$r")"; rc=$?
+    [[ $rc -ne 0 || "$got" == "9.9.9-kernelpop" ]] || bad "kver_from_debs read [$got] from a file name instead of the Package field"
+    rm -f "$r/linux-image-9.9.9-kernelpop_1_amd64.deb" "$r/linux-headers-9.9.9-kernelpop_1_amd64.deb"
+    got="$(kver_from_debs "$r")"
+    [[ "$got" == "9.9.9-kernelpop" ]] || bad "kver_from_debs should read 9.9.9-kernelpop from the Package field, got [$got]"
+    exit "$fails"
+) || { echo "FAIL: real packages group"; fails=$((fails + 1)); }
 
 # ── Build tools: only allowlisted packages ever reach apt-get ────────────
 (

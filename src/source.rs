@@ -106,7 +106,12 @@ pub fn parse_makefile(text: &str) -> Result<SourceVersion> {
 /// A kernel source tarball that has been looked into.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tarball {
+    /// The file that is checked and built. After `private_copy` this is
+    /// Kernel Pop's own copy, which nobody else can change.
     pub path: PathBuf,
+    /// Where the user's tarball is (shown, and where a sibling .tar.sign is
+    /// looked for).
+    pub origin: PathBuf,
     pub compression: Compression,
     pub version: SourceVersion,
     /// The tree's top-level directory inside the tarball ("linux-7.2.12").
@@ -118,12 +123,12 @@ impl Tarball {
     /// linux-7.2.12.tar.xz -> linux-7.2.12.tar.sign. (Only used to find a
     /// sibling file; the version always comes from the Makefile.)
     pub fn sibling_signature(&self) -> Option<PathBuf> {
-        let name = self.path.file_name()?.to_str()?;
+        let name = self.origin.file_name()?.to_str()?;
         let stem = name.strip_suffix(".xz").or_else(|| name.strip_suffix(".gz"))?;
         if !stem.ends_with(".tar") {
             return None;
         }
-        let sig = self.path.with_file_name(format!("{stem}.sign"));
+        let sig = self.origin.with_file_name(format!("{stem}.sign"));
         sig.is_file().then_some(sig)
     }
 }
@@ -152,7 +157,69 @@ pub fn inspect(path: &Path) -> Result<Tarball> {
     let _ = child.wait();
     let (top_dir, makefile) = found.with_context(|| format!("{} does not look like a kernel source tarball", path.display()))?;
     let version = parse_makefile(&makefile).context("Could not read the kernel version from the tarball's Makefile")?;
-    Ok(Tarball { path: path.to_path_buf(), compression, version, top_dir })
+    Ok(Tarball { path: path.to_path_buf(), origin: path.to_path_buf(), compression, version, top_dir })
+}
+
+/// ~/.cache/kernel-pop/source: the private (0700) copy of the selected
+/// tarball. The signature is checked on this copy and the build extracts
+/// this copy, so a tarball in a place someone else can write (a shared
+/// folder, removable media, /tmp) cannot be swapped after the check.
+pub fn private_dir() -> PathBuf {
+    crate::build::build_root().parent().map(|p| p.join("source")).unwrap_or_else(|| PathBuf::from("/nonexistent"))
+}
+
+/// Copy `t` into `dir` (emptied first; created 0700) and look into the copy.
+/// The copy must hold the same kernel version as the original.
+pub fn private_copy_in(t: &Tarball, dir: &Path) -> Result<Tarball> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).with_context(|| format!("Could not clear {}", dir.display()))?;
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("Could not create {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let name = t.origin.file_name().context("the tarball has no file name")?;
+    let copy = dir.join(name);
+    std::fs::copy(&t.path, &copy).with_context(|| format!("Could not copy {} to {}", t.path.display(), copy.display()))?;
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
+    let mut c = inspect(&copy)?;
+    if c.version != t.version || c.top_dir != t.top_dir {
+        bail!("{} changed while it was being copied", t.origin.display());
+    }
+    c.origin = t.origin.clone();
+    Ok(c)
+}
+
+pub fn private_copy(t: &Tarball) -> Result<Tarball> {
+    private_copy_in(t, &private_dir())
+}
+
+/// Check that every member of the tarball is under its one top-level
+/// directory (the extraction strips that directory), by listing it in full.
+pub fn check_single_top_dir(t: &Tarball) -> Result<()> {
+    let out = Command::new("tar")
+        .arg("-tf")
+        .arg(&t.path)
+        .stderr(Stdio::null())
+        .output()
+        .context("Could not run tar to list the tarball")?;
+    if !out.status.success() {
+        bail!("tar could not list {}", t.path.display());
+    }
+    let prefix = format!("{}/", t.top_dir);
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = line.strip_prefix("./").unwrap_or(line);
+        if name != t.top_dir && name != prefix && !name.starts_with(&prefix) {
+            bail!("The tarball holds {name}, outside its top-level directory {} — refusing to build it", t.top_dir);
+        }
+        if name.split('/').any(|c| c == "..") {
+            bail!("The tarball holds an unsafe member name: {name}");
+        }
+    }
+    Ok(())
 }
 
 /// The top-level directory and the contents of `<top>/Makefile` from a tar
@@ -298,6 +365,53 @@ pub mod tests {
     }
 
     #[test]
+    fn private_copy_is_private_and_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("private");
+        let xz = d.join("linux-7.2.12.tar.xz");
+        compress_to("xz", &tar_bytes("linux-7.2.12", MAKEFILE), &xz);
+        std::fs::write(d.join("linux-7.2.12.tar.sign"), b"sig").unwrap();
+        let t = inspect(&xz).unwrap();
+        let dir = d.join("private");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stale.tar.xz"), b"old").unwrap();
+        let c = private_copy_in(&t, &dir).unwrap();
+        assert_eq!(c.path, dir.join("linux-7.2.12.tar.xz"));
+        assert_eq!(c.origin, xz);
+        assert!(!dir.join("stale.tar.xz").exists());
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&c.path).unwrap().permissions().mode() & 0o777, 0o600);
+        // The signature is still looked for next to the user's file.
+        assert_eq!(c.sibling_signature(), Some(d.join("linux-7.2.12.tar.sign")));
+        // Changing the original afterwards does not change what is built.
+        std::fs::write(&xz, b"swapped").unwrap();
+        assert_eq!(inspect(&c.path).unwrap().version.kernelversion(), "7.2.12");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn members_outside_the_top_directory_are_refused() {
+        let d = scratch("topdir");
+        let good = d.join("good.tar.xz");
+        compress_to("xz", &tar_bytes("linux-7.2.12", MAKEFILE), &good);
+        check_single_top_dir(&inspect(&good).unwrap()).unwrap();
+        // The Makefile comes first, then a member under another directory.
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, data) in [("linux-7.2.12/Makefile", MAKEFILE.as_bytes()), ("other/evil", b"x".as_slice())] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, data).unwrap();
+        }
+        let bad = d.join("bad.tar.xz");
+        compress_to("xz", &b.into_inner().unwrap(), &bad);
+        let t = inspect(&bad).unwrap();
+        assert!(check_single_top_dir(&t).unwrap_err().to_string().contains("outside"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn sibling_signature_is_found_next_to_the_tarball() {
         let d = scratch("sibling");
         let xz = d.join("linux-7.2.12.tar.xz");
@@ -306,7 +420,7 @@ pub mod tests {
         assert_eq!(t.sibling_signature(), None);
         std::fs::write(d.join("linux-7.2.12.tar.sign"), b"sig").unwrap();
         assert_eq!(t.sibling_signature(), Some(d.join("linux-7.2.12.tar.sign")));
-        let odd = Tarball { path: d.join("kernel.xz"), ..t };
+        let odd = Tarball { origin: d.join("kernel.xz"), ..t };
         assert_eq!(odd.sibling_signature(), None);
         std::fs::remove_dir_all(&d).unwrap();
     }

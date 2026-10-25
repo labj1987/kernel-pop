@@ -4,19 +4,30 @@
 //! key is published over WKD on kernel.org.
 //!
 //! No key ships with Kernel Pop. At verify time the keys of the developers
-//! who sign releases (Linus Torvalds and Greg Kroah-Hartman) are fetched over
-//! WKD into a throwaway GNUPGHOME, exported to a keyring of their own, and
-//! `gpgv` checks the decompressed tarball (streamed on stdin) against that
-//! keyring alone. A signature that names another @kernel.org signer gets
-//! that signer's key fetched as well.
+//! who sign releases (Linus Torvalds and Greg Kroah-Hartman, the two the
+//! page names) are fetched over WKD into a throwaway GNUPGHOME, exported to a
+//! keyring of their own, and `gpgv` checks the decompressed tarball (streamed
+//! on stdin) against that keyring alone. A signature that names another
+//! @kernel.org signer gets that key fetched too, but a good signature from
+//! anyone who does not sign releases is not "verified": it needs the same
+//! explicit override as no signature at all.
 
 use crate::source::Tarball;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// The kernel.org developers whose keys are always fetched.
+/// The kernel.org developers who sign releases; their keys are always
+/// fetched, and only a signature from one of them counts as verified.
 pub const SIGNER_ADDRESSES: [&str; 2] = ["torvalds@kernel.org", "gregkh@kernel.org"];
+
+/// How long fetching the keys over WKD may take before the check gives up.
+const WKD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Whether a key's user ID belongs to one of the release signers.
+pub fn is_release_signer(uid: &str) -> bool {
+    uid_address(uid).is_some_and(|a| SIGNER_ADDRESSES.contains(&a.as_str()))
+}
 
 /// Who signed a tarball.
 #[derive(Debug, Clone, PartialEq)]
@@ -154,12 +165,10 @@ impl GnupgHome {
 
     /// Fetch the keys for `addresses` over WKD only. Returns gpg's messages.
     fn locate_keys(&self, addresses: &[&str]) -> Result<String> {
-        let out = self
-            .gpg()
-            .args(["--auto-key-locate", "clear,nodefault,wkd", "--locate-keys"])
-            .args(addresses)
-            .output()
-            .context("Could not run gpg to fetch the kernel.org signing keys (install the gnupg package)")?;
+        let mut cmd = self.gpg();
+        cmd.args(["--auto-key-locate", "clear,nodefault,wkd", "--locate-keys", "--"]).args(addresses);
+        let out = output_with_timeout(cmd, WKD_TIMEOUT)
+            .context("Could not fetch the kernel.org signing keys (is gnupg installed and the network up?)")?;
         Ok(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 
@@ -200,6 +209,37 @@ impl Drop for GnupgHome {
     }
 }
 
+/// Run `cmd` (stdin closed, output captured), killing it after `limit`.
+fn output_with_timeout(mut cmd: Command, limit: std::time::Duration) -> Result<std::process::Output> {
+    use std::io::Read;
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut out = child.stdout.take().context("no stdout")?;
+    let mut err = child.stderr.take().context("no stderr")?;
+    let t_out = std::thread::spawn(move || {
+        let mut b = vec![];
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = vec![];
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("gave up after {} seconds", limit.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    Ok(std::process::Output { status, stdout: t_out.join().unwrap_or_default(), stderr: t_err.join().unwrap_or_default() })
+}
+
 /// Run gpgv on `sig` over the decompressed `tarball` against `keyring`
 /// only, with an empty private home so no user keyring is consulted.
 pub fn gpgv_tarball(tarball: &Tarball, sig: &Path, keyring: &Path) -> Result<GpgvVerdict> {
@@ -223,15 +263,23 @@ pub fn gpgv_tarball(tarball: &Tarball, sig: &Path, keyring: &Path) -> Result<Gpg
         .output();
     let dec = decompress.wait_with_output().context("Could not wait for the decompressor")?;
     let gpgv = gpgv.context("Could not run gpgv (install the gpgv package)")?;
-    if !dec.status.success() {
-        return Ok(GpgvVerdict::Bad {
-            reason: format!(
-                "the tarball is damaged and could not be decompressed ({})",
-                String::from_utf8_lossy(&dec.stderr).trim()
-            ),
-        });
+    let verdict = parse_gpgv_status(&String::from_utf8_lossy(&gpgv.stdout));
+    if dec.status.success() {
+        return Ok(verdict);
     }
-    Ok(parse_gpgv_status(&String::from_utf8_lossy(&gpgv.stdout)))
+    // gpgv stops reading early when the signature file itself is unusable,
+    // and the decompressor then dies of SIGPIPE: that is gpgv's verdict to
+    // report, not a damaged tarball.
+    use std::os::unix::process::ExitStatusExt;
+    if dec.status.signal() == Some(libc::SIGPIPE) && !matches!(verdict, GpgvVerdict::Good { .. }) {
+        return Ok(verdict);
+    }
+    Ok(GpgvVerdict::Bad {
+        reason: format!(
+            "the tarball is damaged and could not be decompressed ({})",
+            String::from_utf8_lossy(&dec.stderr).trim()
+        ),
+    })
 }
 
 /// Verify a kernel.org tarball against its `.tar.sign`, fetching the
@@ -260,7 +308,16 @@ pub fn verify_tarball(tarball: &Tarball, sig: &Path, log: &dyn Fn(String)) -> Re
     match gpgv_tarball(tarball, sig, &ring)? {
         GpgvVerdict::Good { primary_fpr } => {
             let uid = gnupg.uid_of(&primary_fpr).unwrap_or_else(|| "unknown user ID".into());
-            Ok(Signer { uid, fingerprint: primary_fpr })
+            let signer = Signer { uid, fingerprint: primary_fpr };
+            if !is_release_signer(&signer.uid) {
+                bail!(
+                    "The signature is good, but it is from {} ({}), who does not sign kernel.org releases ({} do)",
+                    signer.uid,
+                    signer.grouped_fingerprint(),
+                    SIGNER_ADDRESSES.join(" and ")
+                );
+            }
+            Ok(signer)
         }
         GpgvVerdict::MissingKey { keyid } => bail!(
             "The signature was made by key {keyid}, which is not the key kernel.org publishes for {}",
@@ -306,6 +363,11 @@ mod tests {
         assert_eq!(uid_address("no address"), None);
         let s = Signer { uid: String::new(), fingerprint: "647F28654894E3BD457199BE38DBBDC86092693E".into() };
         assert_eq!(s.grouped_fingerprint(), "647F 2865 4894 E3BD 4571 99BE 38DB BDC8 6092 693E");
+        assert!(is_release_signer("Greg Kroah-Hartman <gregkh@kernel.org>"));
+        assert!(is_release_signer("Linus Torvalds <Torvalds@kernel.org>"));
+        assert!(!is_release_signer("Some Developer <someone@kernel.org>"));
+        assert!(!is_release_signer("Greg <gregkh@kernel.org.evil.test>"));
+        assert!(!is_release_signer("unknown user ID"));
     }
 
     /// A throwaway signing key in its own GNUPGHOME, exported as a keyring.
@@ -380,7 +442,7 @@ mod tests {
         let pos = changed.windows(6).position(|w| w == b"Linux ").unwrap();
         changed[pos] = b'l';
         compress_to("xz", &changed, &xz);
-        assert!(matches!(gpgv_tarball(&t, &sig, &key.ring).unwrap(), GpgvVerdict::Bad { .. }));
+        assert!(matches!(gpgv_tarball(&t, &sig, &key.ring).unwrap(), GpgvVerdict::Bad { reason } if reason.contains("BADSIG")));
 
         // One byte of the compressed file changed: it no longer decompresses.
         compress_to("xz", &tar, &xz);
@@ -388,16 +450,17 @@ mod tests {
         let mid = raw.len() / 2;
         raw[mid] ^= 0x01;
         std::fs::write(&xz, &raw).unwrap();
-        assert!(matches!(gpgv_tarball(&t, &sig, &key.ring).unwrap(), GpgvVerdict::Bad { .. }));
+        assert!(matches!(gpgv_tarball(&t, &sig, &key.ring).unwrap(), GpgvVerdict::Bad { reason } if reason.contains("damaged")));
 
         // Signed by a key that is not in the keyring.
         compress_to("xz", &tar, &xz);
         let other = TestKey::new();
         assert!(matches!(gpgv_tarball(&t, &sig, &other.ring).unwrap(), GpgvVerdict::MissingKey { .. }));
 
-        // Not a signature at all.
+        // Not a signature at all: gpgv's reason, not "damaged".
         std::fs::write(&sig, b"not a signature").unwrap();
-        assert!(matches!(gpgv_tarball(&t, &sig, &key.ring).unwrap(), GpgvVerdict::Bad { .. }));
+        let v = gpgv_tarball(&t, &sig, &key.ring).unwrap();
+        assert!(matches!(&v, GpgvVerdict::Bad { reason } if !reason.contains("damaged")), "{v:?}");
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -446,7 +509,7 @@ mod tests {
         raw[mid] ^= 0x01;
         let xz = d.join(name);
         std::fs::write(&xz, &raw).unwrap();
-        let tx = Tarball { path: xz.clone(), ..t };
+        let tx = Tarball { path: xz.clone(), origin: xz.clone(), ..t };
         let err = verify_tarball(&tx, &tx.sibling_signature().unwrap(), &|l| println!("{l}")).unwrap_err().to_string();
         println!("one byte of the .xz changed: {err}");
         assert!(err.contains("damaged"), "{err}");
