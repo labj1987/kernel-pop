@@ -123,9 +123,24 @@ in its allowlist.
 Base config:
 
 - **Match this system** (default): `/boot/config-$(uname -r)`.
+- **Tuned for this machine**: the same, then `make LSMOD=<list>
+  localmodconfig` with three sources joined: the modules loaded right now
+  (from `/proc/modules`; modules rarely unload, so this covers what was used
+  since the last boot), the driver for every device the kernel sees in use
+  or not (each `/sys/devices/**/modalias` resolved with `modprobe -R`), and
+  a fixed list of drivers for hardware that is often plugged in later or
+  used now and then (`build::TUNED_EXTRA_MODULES`: USB storage, card
+  readers, common file systems, input devices and game controllers, USB
+  audio and webcams, Bluetooth, USB network adapters and phone tethering,
+  docks and Thunderbolt, printers and serial adapters, VPN, container and
+  VM networking, dm-crypt, loop, zram, ntsync). Hardware that is neither
+  present nor one of those kinds (an unusual USB gadget, a different Wi-Fi
+  card) may have no driver. Kernel messages in the journal were also
+  tried as a history of earlier boots; on the test machine they named no
+  module that was not loaded already, so they are not used.
 - **Trim to this machine**: the same, then
   `make LSMOD=<lsmod output> localmodconfig` with the modules loaded right
-  now. Hardware that is not plugged in or in use (USB devices, docks,
+  now only. Hardware that is not plugged in or in use (USB devices, docks,
   external drives) may have no driver.
 - **Use my own .config**: the chosen file.
 
@@ -209,6 +224,7 @@ installed but empty (cold), debug info off:
 | Mode | Modules | Build time | Build tree at its largest | Image deb | Headers deb |
 | --- | --- | --- | --- | --- | --- |
 | Match this system | 6703 | 26 min 5 s | 6.7 GB | 117 MB | 10.6 MB |
+| Tuned for this machine (196 loaded, 23 more for present devices, 110 extras) | 369 | 8 min 2 s | 3.5 GB | 34 MB | 10.3 MB |
 | Trim to this machine (201 modules loaded) | 226 | 6 min 41 s | 3.2 GB | 28.5 MB | 10.3 MB |
 
 The Match build took longer here than the 18 min 48 s in the container

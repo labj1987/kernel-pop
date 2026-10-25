@@ -70,6 +70,7 @@ enum SigState {
 enum ModeChoice {
     #[default]
     Match,
+    Tuned,
     Trim,
     Own,
 }
@@ -106,6 +107,7 @@ impl AppState {
     fn config_mode(&self) -> Option<ConfigMode> {
         match self.mode {
             ModeChoice::Match => Some(ConfigMode::MatchSystem),
+            ModeChoice::Tuned => Some(ConfigMode::TunedForMachine),
             ModeChoice::Trim => Some(ConfigMode::TrimToMachine),
             ModeChoice::Own => self.own_config.clone().map(ConfigMode::OwnConfig),
         }
@@ -444,6 +446,8 @@ pub fn build_ui(app: &Application) {
     let config_group = PreferencesGroup::builder().title("Configuration").build();
     let match_check = CheckButton::new();
     match_check.set_active(true);
+    let tuned_check = CheckButton::new();
+    tuned_check.set_group(Some(&match_check));
     let trim_check = CheckButton::new();
     trim_check.set_group(Some(&match_check));
     let own_check = CheckButton::new();
@@ -454,6 +458,12 @@ pub fn build_ui(app: &Application) {
         .activatable_widget(&match_check)
         .build();
     match_row.add_prefix(&match_check);
+    let tuned_row = ActionRow::builder()
+        .title("Tuned for this machine")
+        .subtitle("Drivers for the hardware in this computer plus the kinds people plug in (USB storage, controllers, headsets, webcams, docks, VPN and container networking). Builds in a fraction of the time.")
+        .activatable_widget(&tuned_check)
+        .build();
+    tuned_row.add_prefix(&tuned_check);
     let trim_row = ActionRow::builder()
         .title("Trim to this machine")
         .subtitle("Only drivers for the modules loaded right now. Hardware that is not plugged in now (USB devices, docks, external drives) may have no driver in this kernel.")
@@ -470,6 +480,7 @@ pub fn build_ui(app: &Application) {
     own_btn.add_css_class("flat");
     own_row.add_suffix(&own_btn);
     config_group.add(&match_row);
+    config_group.add(&tuned_row);
     config_group.add(&trim_row);
     config_group.add(&own_row);
     build_page.append(&config_group);
@@ -1820,7 +1831,12 @@ pub fn build_ui(app: &Application) {
                 refresh_requirements();
             }
         };
-        for (check, m) in [(&match_check, ModeChoice::Match), (&trim_check, ModeChoice::Trim), (&own_check, ModeChoice::Own)] {
+        for (check, m) in [
+            (&match_check, ModeChoice::Match),
+            (&tuned_check, ModeChoice::Tuned),
+            (&trim_check, ModeChoice::Trim),
+            (&own_check, ModeChoice::Own),
+        ] {
             let set_mode = set_mode.clone();
             check.connect_toggled(move |c| {
                 if c.is_active() {

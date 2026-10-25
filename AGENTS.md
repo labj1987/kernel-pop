@@ -52,6 +52,9 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   (`SIGNER_ADDRESSES`) counts as verified. The check runs on the private
   copy `source::private_copy` makes, which is also what the build extracts.
 - `build.rs` — `BUILD_DEPS` (equal to the script's allowlist, a test checks),
+  the config modes (`ConfigMode`; Tuned feeds localmodconfig the loaded
+  modules, the modalias-resolved drivers of every device and
+  `TUNED_EXTRA_MODULES`),
   `prepare` (disk preflight, extract into `~/.cache/kernel-pop/build/`,
   configure, `ConfigSummary`) and `build` (`make bindeb-pkg`, publish to
   `~/Downloads/kernel-pop/linux-<release>/` with `SHA256SUMS`, the final

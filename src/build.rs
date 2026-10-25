@@ -46,6 +46,45 @@ pub const BUILD_DEPS: &[&str] = &[
 pub const BUILD_NEED_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 /// The same for "Trim to this machine", which builds far fewer modules.
 pub const TRIM_BUILD_NEED_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+/// The same for "Tuned for this machine".
+pub const TUNED_BUILD_NEED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Drivers "Tuned for this machine" always keeps, for hardware that is often
+/// plugged in later or used only now and then: USB storage and card
+/// readers, the common file systems, input devices and game controllers,
+/// USB audio and webcams, Bluetooth, USB network adapters and phone
+/// tethering, docks, printers and serial adapters, and the networking that
+/// VPNs, containers and virtual machines load on demand. Names that do not
+/// exist in a tree are ignored by localmodconfig.
+pub const TUNED_EXTRA_MODULES: &[&str] = &[
+    // storage and card readers
+    "usb_storage", "uas", "sd_mod", "sr_mod", "cdrom", "mmc_block", "sdhci", "sdhci_pci", "sdhci_acpi",
+    "rtsx_pci", "rtsx_pci_sdmmc", "rtsx_usb", "rtsx_usb_sdmmc", "nvme",
+    // file systems
+    "vfat", "fat", "msdos", "exfat", "ntfs3", "isofs", "udf", "ext4", "btrfs", "xfs", "f2fs", "hfsplus",
+    "fuse", "squashfs", "overlay", "nls_utf8", "nls_cp437", "nls_iso8859_1", "nls_ascii", "cifs", "nfs", "nfsv4",
+    // input and game controllers
+    "usbhid", "hid_generic", "hid_multitouch", "hid_logitech_dj", "hid_logitech_hidpp", "hid_sony",
+    "hid_playstation", "hid_nintendo", "hid_microsoft", "hid_apple", "hid_steam", "xpad", "joydev", "uinput",
+    "i2c_hid_acpi",
+    // audio and video
+    "snd_usb_audio", "uvcvideo",
+    // Bluetooth
+    "bluetooth", "btusb", "btintel", "btrtl", "btbcm", "btmtk",
+    // USB network adapters and phone tethering
+    "usbnet", "cdc_ether", "cdc_ncm", "cdc_mbim", "rndis_host", "r8152", "ax88179_178a", "asix", "ipheth",
+    // docks, USB-C and Thunderbolt
+    "thunderbolt", "typec_displayport", "ucsi_acpi", "typec_ucsi",
+    // printers and serial adapters
+    "usblp", "cdc_acm", "usbserial", "ftdi_sio", "cp210x", "ch341", "pl2303",
+    // VPNs, containers and virtual machines
+    "tun", "tap", "wireguard", "veth", "bridge", "br_netfilter", "vxlan", "macvlan", "ipvlan", "nf_tables",
+    "nft_compat", "nft_chain_nat", "nf_nat", "nf_conntrack", "xt_MASQUERADE", "xt_conntrack", "xt_addrtype",
+    "iptable_nat", "iptable_filter", "ip6table_nat", "ip6table_filter", "kvm", "kvm_intel", "kvm_amd",
+    "vhost_net", "vhost_vsock",
+    // encrypted and image-backed disks, compressed swap, Wine/Proton sync
+    "dm_crypt", "dm_mod", "loop", "zram", "ntsync",
+];
 
 /// The build profile that keeps bindeb-pkg from making a linux-image-*-dbg
 /// package (its prefix follows KDEB_SOURCENAME, left at its default).
@@ -124,6 +163,9 @@ pub enum ConfigMode {
     MatchSystem,
     /// The same, then localmodconfig against the loaded modules.
     TrimToMachine,
+    /// The same, then localmodconfig against the loaded modules, the
+    /// drivers for every device present, and `TUNED_EXTRA_MODULES`.
+    TunedForMachine,
     /// A .config file the user chose, with the fixes.
     OwnConfig(PathBuf),
 }
@@ -133,6 +175,7 @@ impl ConfigMode {
         match self {
             ConfigMode::MatchSystem => "Match this system",
             ConfigMode::TrimToMachine => "Trim to this machine",
+            ConfigMode::TunedForMachine => "Tuned for this machine",
             ConfigMode::OwnConfig(_) => "Use my own .config",
         }
     }
@@ -140,6 +183,7 @@ impl ConfigMode {
     pub fn disk_need(&self) -> u64 {
         match self {
             ConfigMode::TrimToMachine => TRIM_BUILD_NEED_BYTES,
+            ConfigMode::TunedForMachine => TUNED_BUILD_NEED_BYTES,
             _ => BUILD_NEED_BYTES,
         }
     }
@@ -598,23 +642,38 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     };
     olddefconfig()?;
 
-    if req.mode == ConfigMode::TrimToMachine {
-        let lsmod = Command::new("lsmod").output().context("Could not run lsmod")?;
-        if !lsmod.status.success() {
-            bail!("lsmod failed");
+    if matches!(req.mode, ConfigMode::TrimToMachine | ConfigMode::TunedForMachine) {
+        let loaded = loaded_modules().context("Could not read the loaded modules")?;
+        let mut keep: Vec<String> = loaded.clone();
+        let mut what = format!("the {} modules loaded right now", loaded.len());
+        if req.mode == ConfigMode::TunedForMachine {
+            let present = present_device_modules();
+            let extra: Vec<String> = TUNED_EXTRA_MODULES.iter().map(|m| m.to_string()).collect();
+            let new_present = present.iter().filter(|m| !loaded.contains(m)).count();
+            keep.extend(present);
+            keep.extend(extra);
+            what = format!(
+                "the {} modules loaded right now, {} more for devices present but not in use, and {} common plug-in, VPN, container and VM drivers",
+                loaded.len(),
+                new_present,
+                TUNED_EXTRA_MODULES.len()
+            );
         }
+        keep.sort();
+        keep.dedup();
         let list = tree.join(".kernel-pop-lsmod");
-        std::fs::write(&list, &lsmod.stdout)?;
-        let loaded = String::from_utf8_lossy(&lsmod.stdout).lines().count().saturating_sub(1);
+        std::fs::write(&list, lsmod_text(&keep))?;
         let mut c = make(tree, ccache);
         c.arg(format!("LSMOD={}", list.display())).arg("localmodconfig");
         r.run(c, "make localmodconfig")?;
         apply_fixes()?;
         olddefconfig()?;
-        fixes.push(format!("localmodconfig: only modules for the {loaded} modules loaded right now"));
-        notes.push(
-            "Trimmed: hardware that is not plugged in or in use right now (USB devices, docks, external drives) may have no driver in this kernel.".into(),
-        );
+        fixes.push(format!("localmodconfig: only drivers for {what}"));
+        notes.push(if req.mode == ConfigMode::TrimToMachine {
+            "Trimmed: hardware that is not plugged in or in use right now (USB devices, docks, external drives) may have no driver in this kernel.".into()
+        } else {
+            "Tuned: hardware that is not present now and not a common plug-in kind (an unusual USB gadget, a different Wi-Fi card) may have no driver in this kernel; Match this system includes everything.".into()
+        });
     }
 
     let config = std::fs::read_to_string(tree.join(".config"))?;
@@ -677,6 +736,78 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         r.note(l.to_string());
     }
     Ok(summary)
+}
+
+/// Module names from /proc/modules.
+fn loaded_modules() -> Result<Vec<String>> {
+    Ok(parse_proc_modules(&std::fs::read_to_string("/proc/modules")?))
+}
+
+pub fn parse_proc_modules(text: &str) -> Vec<String> {
+    text.lines().filter_map(|l| l.split_whitespace().next()).map(normalize_module).collect()
+}
+
+/// Module names use '_' and '-' interchangeably; localmodconfig compares
+/// them with '_'.
+fn normalize_module(name: &str) -> String {
+    name.trim().replace('-', "_")
+}
+
+/// The drivers for every device the kernel sees, in use or not: each
+/// device's modalias resolved with `modprobe --resolve-alias`.
+fn present_device_modules() -> Vec<String> {
+    let mut aliases = std::collections::BTreeSet::new();
+    collect_modaliases(Path::new("/sys/devices"), &mut aliases, 0);
+    let mut mods = std::collections::BTreeSet::new();
+    for chunk in aliases.into_iter().collect::<Vec<_>>().chunks(64) {
+        // One modprobe per alias (it resolves one at a time); run them in a
+        // single shell to keep the process count down.
+        let script = chunk.iter().map(|a| format!("modprobe -R {} 2>/dev/null;", shell_quote(a))).collect::<String>();
+        if let Ok(out) = Command::new("sh").arg("-c").arg(script).output() {
+            for l in String::from_utf8_lossy(&out.stdout).lines() {
+                if !l.trim().is_empty() {
+                    mods.insert(normalize_module(l));
+                }
+            }
+        }
+    }
+    mods.into_iter().collect()
+}
+
+fn collect_modaliases(dir: &Path, out: &mut std::collections::BTreeSet<String>, depth: usize) {
+    if depth > 24 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_modaliases(&e.path(), out, depth + 1);
+        } else if e.file_name() == "modalias" {
+            if let Ok(a) = std::fs::read_to_string(e.path()) {
+                let a = a.trim();
+                if !a.is_empty() {
+                    out.insert(a.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// An lsmod-style listing of `modules` for localmodconfig's LSMOD.
+pub fn lsmod_text(modules: &[String]) -> String {
+    let mut s = String::from("Module                  Size  Used by\n");
+    for m in modules {
+        s.push_str(&format!("{m} 0 0\n"));
+    }
+    s
 }
 
 /// A kernel release string is used in paths and package names: a plain token.
@@ -984,6 +1115,21 @@ mod tests {
     }
 
     #[test]
+    fn module_lists_for_localmodconfig() {
+        let proc = "nvidia_drm 167936 88 - Live 0x0000000000000000 (POE)\nsnd-hda-intel 69632 3 - Live 0x0\n";
+        assert_eq!(parse_proc_modules(proc), ["nvidia_drm", "snd_hda_intel"]);
+        let text = lsmod_text(&["btusb".to_string(), "usb_storage".to_string()]);
+        assert_eq!(text, "Module                  Size  Used by\nbtusb 0 0\nusb_storage 0 0\n");
+        assert_eq!(shell_quote("pci:v0000'x"), "'pci:v0000'\\''x'");
+        // Every extra is a plain module name, listed once.
+        let mut seen = std::collections::HashSet::new();
+        for m in TUNED_EXTRA_MODULES {
+            assert!(m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "{m}");
+            assert!(seen.insert(*m), "{m} listed twice");
+        }
+    }
+
+    #[test]
     fn config_values() {
         let c = "CONFIG_RUST=y\nCONFIG_LOCALVERSION=\"-kernelpop\"\n# CONFIG_DEBUG_INFO_NONE is not set\nCONFIG_E1000=m\nCONFIG_EXT4_FS=y\nCONFIG_SND=m\n";
         assert_eq!(config_value(c, "RUST").as_deref(), Some("y"));
@@ -1216,6 +1362,7 @@ mod tests {
         let path = PathBuf::from(std::env::var("KERNEL_POP_LIVE_TARBALL").expect("set KERNEL_POP_LIVE_TARBALL"));
         let mode = match std::env::var("KERNEL_POP_LIVE_MODE").as_deref() {
             Ok("trim") => ConfigMode::TrimToMachine,
+            Ok("tuned") => ConfigMode::TunedForMachine,
             _ => ConfigMode::MatchSystem,
         };
         let tarball = crate::source::inspect(&path).unwrap();

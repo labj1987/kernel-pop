@@ -4,6 +4,18 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.1.0 — 2026-10-24
+
+**New configuration: Tuned for this machine.** It builds only the drivers this computer
+needs: everything loaded now, the driver for every device it has (in use or not), and the
+kinds of hardware people plug in later or use now and then: USB drives and card readers,
+the common file systems, keyboards, mice and game controllers, USB headsets and webcams,
+Bluetooth, USB network adapters and phone tethering, docks and Thunderbolt, printers, and
+the networking VPNs, containers and virtual machines need. On a typical desktop that is a
+few hundred drivers instead of almost seven thousand, so a kernel builds in about a third
+of the time (8 minutes instead of 26 on the test machine). Match this system stays the
+default and still includes everything.
+
 ## 2.0.0 — 2026-10-24
 
 **Kernel Pop now builds kernels from kernel.org source.** Ubuntu's mainline kernel archive
