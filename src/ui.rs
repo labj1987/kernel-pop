@@ -921,7 +921,9 @@ pub fn build_ui(app: &Application) {
                         Some(KeyEnrollment::Pending) => " The DKMS key (NVIDIA driver) is waiting for enrollment too.",
                         _ => "",
                     };
-                    signing_row.set_subtitle(&format!("{}{dkms_note}", signing_subtitle(info.kernel_signing)));
+                    let base = signing_subtitle(info.kernel_signing);
+                    let sep = if dkms_note.is_empty() || base.ends_with('.') { "" } else { "." };
+                    signing_row.set_subtitle(&format!("{base}{sep}{dkms_note}"));
                     setup_signing_btn.set_visible(
                         matches!(info.kernel_signing, KernelSigning::NoKey | KernelSigning::KeyNotEnrolled)
                             || info.dkms_key == Some(KeyEnrollment::NotEnrolled),
