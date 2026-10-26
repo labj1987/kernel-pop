@@ -186,8 +186,8 @@ writes only inside the checkout:
 
 Rust is pinned in `rust-toolchain.toml`; bump it there and in the toolchain
 steps of both workflows together (each workflow checks they agree). The
-workflows' actions are pinned to full commit SHAs, and Dependabot
-(`.github/dependabot.yml`) proposes the updates.
+workflows' actions are pinned to full commit SHAs, and the weekly
+maintenance round updates them (see `.github/dependabot.yml`).
 
 **Gotcha (fixed in v1.0.6):** `appimagetool`'s own built-in zsync
 generation silently no-ops on the GitHub Actions runner even when
