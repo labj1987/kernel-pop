@@ -32,8 +32,9 @@ VFS-panics on boot. This app is built around not letting that happen:
 ## Features
 
 - Browse kernel.org's current mainline, stable and longterm releases with
-  newer/same/older badges relative to the running kernel, and a banner on
-  the System tab when a newer stable release is out
+  newer/same/older badges relative to the running kernel, an EOL badge on
+  end-of-life longterm releases and a search filter, and a banner on the
+  System tab when a newer stable release is out
 - Download a release's tarball and signature from cdn.kernel.org with
   progress, retries and cancellation, or open or drop a tarball you already
   have
@@ -43,7 +44,8 @@ VFS-panics on boot. This app is built around not letting that happen:
   without its `.tar.sign` gets kernel.org's fetched. A missing or bad
   signature blocks the build; for your own patched tree there is one
   explicit "Build unverified source" switch per tarball, and the build log
-  says the source was unverified
+  says the source was unverified. Mainline release candidates have no
+  published signature, so building one needs that switch
 - Three configurations: **Match this system** (the default: the running
   kernel's `/boot/config-*`), **Tuned for this machine** (only drivers for
   the hardware in this computer plus the kinds people plug in, such as USB
@@ -63,6 +65,8 @@ VFS-panics on boot. This app is built around not letting that happen:
   "keep the newest N" in one step. Kernels from other sources, such as
   Ubuntu's own, are shown and managed the same way
 - Boot a chosen installed kernel on the next restart only
+- Sign a single installed kernel with Kernel Pop's key from its row on the
+  System tab, once signing is set up
 - With Secure Boot on, a kernel that could not boot is never installed:
   the install is refused until signing is set up, and a kernel whose
   signing fails is removed again
@@ -75,6 +79,12 @@ VFS-panics on boot. This app is built around not letting that happen:
   per module; a failure is a warning, not an install error
 - Disk space checks for the build, / and /boot
 - Install log in-app plus /var/log/kernel-pop.log
+
+## Requirements
+
+An x86_64 Debian- or Ubuntu-based system (apt and dpkg: Kernel Pop builds
+`.deb` packages and installs them with dpkg) with polkit, booting with GRUB,
+systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI.
 
 ## Install
 
@@ -89,6 +99,28 @@ once more to update them. If that authentication is cancelled, the app
 still opens but shows a banner, and installing, removing and signing
 kernels stay off until you restart it and authenticate.
 
+### Updating
+
+Each release ships a `.zsync` file next to the AppImage, and the AppImage
+carries its update information, so AppImageUpdate updates it in place.
+Downloading the new AppImage works too. Its first launch asks for
+authentication once to update the helper.
+
+### Uninstalling
+
+Delete the AppImage, then the files Kernel Pop put on the system:
+
+    sudo rm -rf /usr/lib/kernel-pop
+    sudo rm -f /usr/share/polkit-1/actions/io.github.labj1987.KernelPop.policy /var/log/kernel-pop.log
+    rm -rf ~/.cache/kernel-pop ~/Downloads/kernel-pop
+
+`/var/lib/kernel-pop/` holds the signing key (`mok/`) and signing state.
+Keep it while kernels signed with that key are installed and Secure Boot is
+on: those kernels need the enrolled key, not the file, to boot, but you need
+the file to sign new ones. Remove it with `sudo rm -rf /var/lib/kernel-pop`
+once you no longer use Kernel Pop's kernels. Kernels it installed are
+ordinary packages: remove them on the System tab first, or with apt.
+
 ## Using it
 
 1. The System tab shows the running kernel and the health of every
@@ -100,8 +132,10 @@ kernels stay off until you restart it and authenticate.
    tools, and hit Build Kernel. Check the summary, then confirm. A build
    takes a while; the finished packages go to
    `~/Downloads/kernel-pop/linux-<version>-kernelpop/` with the final
-   config and the build log, and the build tree is deleted.
-4. Review the build on the Install tab and hit Install Kernel.
+   config, the build log, `build-info.txt` and a `SHA256SUMS` manifest, and
+   the build tree is deleted.
+4. Review the build on the Install tab and hit Install Kernel, or Delete a
+   build you no longer need.
 5. Reboot when ready, or use Boot Next Time on the System tab to try it
    once while keeping your current default. The new kernel only reports
    success after its initramfs is verified on disk.
@@ -124,7 +158,7 @@ kernels stay off until you restart it and authenticate.
 
 ![Install tab](docs/screenshots/install-tab.png)
 
-**Log** — the full run log, from the release list through the signature check
+**Log** — the run log, from the release list through the signature check (the last 6000 lines; the full build output is in `build.log`)
 
 ![Log tab](docs/screenshots/log-tab.png)
 
@@ -139,7 +173,10 @@ refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
 (or Secure Boot turned off) before they can boot:
 
 1. On the System tab, Kernel signing → **Set Up Signing**. Choose a
-   one-time password (8-16 characters). Kernel Pop installs `sbsigntool`,
+   one-time password: 8-16 printable ASCII characters, no spaces (MOK
+   Manager reads it with a US keyboard layout). Setting up again replaces
+   it, and a password chosen earlier, here or in another app, stops working.
+   Kernel Pop installs `sbsigntool`,
    `openssl` and `mokutil` if they are missing, creates a key in
    `/var/lib/kernel-pop/mok/`, signs every installed kernel and queues the
    key for enrollment, together with the DKMS module-signing key (what the
@@ -153,13 +190,14 @@ refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
 
 From then on every kernel Kernel Pop installs is signed (`sbsign`, then
 `sbverify` before the image in `/boot` is replaced), whether Secure Boot is
-on or off. A signing failure is a `SIGN WARNING` in the log, never an
-install failure. Signing adds a signature, so a kernel already signed by
+on or off. With Secure Boot off, a signing failure is a `SIGN WARNING` in
+the log, not an install failure; with it enforcing, the kernel is removed
+again (below). Signing adds a signature, so a kernel already signed by
 Ubuntu keeps its original one too; Ubuntu's own kernels show "Signed by
 Ubuntu" and boot under Secure Boot without the setup. Kernel Pop uses its
 own key rather than Ubuntu's module-signing MOK, which shim does not accept
-for kernels. Without the setup, kernels are installed unsigned exactly as
-before.
+for kernels. Without the setup, kernels are installed unsigned when Secure
+Boot is off; with it on, the install is refused (below).
 
 With Secure Boot enforcing, Kernel Pop only installs a kernel that will be
 signed with a key that is enrolled or waiting for enrollment:
@@ -180,19 +218,24 @@ on.
 DKMS modules (such as NVIDIA) are signed with Ubuntu's MOK key, as usual.
 The kernels Kernel Pop builds keep the options that let a kernel trust
 enrolled MOK keys for module signatures (the machine keyring), and the
-build summary warns if a configuration turns them off. Whether a DKMS module
-then loads under Secure Boot depends, as with any kernel, on that MOK key
-being enrolled.
+build summary warns if a configuration turns them off. Under Secure Boot a
+DKMS module loads only once that MOK key is enrolled: Set Up Signing queues
+it for enrollment together with Kernel Pop's own key, the System tab shows
+whether it is enrolled, and with Secure Boot on the install warns when it
+is not.
 
 ## Building from source
 
-    apt install -y cargo rustc libgtk-4-dev libadwaita-1-dev pkg-config
-    cargo build --release
+    apt install -y libgtk-4-dev libadwaita-1-dev pkg-config
+    cargo build --release --locked
+
+The compiler is pinned in `rust-toolchain.toml` (Rust 1.96.0), which rustup
+picks up automatically; a distribution's `cargo`/`rustc` may be older.
 
 Or build the AppImage. An ordinary user is enough once the build
 dependencies are installed:
 
-    apt install -y cargo rustc libgtk-4-dev libadwaita-1-dev pkg-config zsync wget file desktop-file-utils
+    apt install -y libgtk-4-dev libadwaita-1-dev pkg-config zsync wget file desktop-file-utils
     bash build-appimage.sh
 
 ## Acknowledgements
