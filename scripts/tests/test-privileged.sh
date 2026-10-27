@@ -607,14 +607,17 @@ else
             [[ "$(head -1 "$KERNEL_POP_MOK_PENDING")" == "moknew-size $(stat -c %s "$moknew")" ]] || fail "the shared list should record MokNew's size: $(head -1 "$KERNEL_POP_MOK_PENDING")"
             grep -q "Secret-pw2" "$calls" && fail "the password reached mokutil's argv"
 
+            # Each queue_key_enrollment below runs in a subshell of its own: its
+            # EXIT trap removes its work directory, which a second call in the
+            # same shell would replace.
             # The DKMS key was already waiting (queued by another tool): listed once.
             : > "$calls"; write_moknew x509 "$tmp/dkms/c.der"
-            queue_key_enrollment Secret-pw3 >/dev/null 2>&1 || fail "queue with the DKMS key waiting"
+            (queue_key_enrollment Secret-pw3 >/dev/null 2>&1) || fail "queue with the DKMS key waiting"
             [[ "$(queued)" == "Kernel Pop kernel signing key|Test DKMS key|" ]] || fail "dedupe: queued [$(queued)]"
 
             # Kernel Pop's key is already enrolled: only the DKMS key is queued; no request to replace.
             : > "$calls"; rm -f "$moknew"; ENROLLED_CN="Kernel Pop kernel signing key"
-            queue_key_enrollment Secret-pw4 >/dev/null 2>&1 || fail "queue with our key enrolled"
+            (queue_key_enrollment Secret-pw4 >/dev/null 2>&1) || fail "queue with our key enrolled"
             [[ "$(queued)" == "Test DKMS key|" ]] || fail "enrolled key skipped: queued [$(queued)]"
             grep -q REVOKE "$calls" && fail "nothing was waiting, so nothing should be revoked"
 
