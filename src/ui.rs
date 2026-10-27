@@ -173,6 +173,8 @@ fn secure_boot_subtitle(sb: SecureBoot, signing: KernelSigning) -> &'static str 
             "Enabled — finish enrolling the signing key at the next reboot, or newly signed kernels will not boot",
         (SecureBoot::Enabled, KernelSigning::KeyNotEnrolled | KernelSigning::Unknown) =>
             "Enabled — signed kernels boot only once the signing key is enrolled",
+        (SecureBoot::Enabled, KernelSigning::EfiVarsNotMounted) =>
+            "Enabled — the EFI variables are not mounted, so the signing key's enrollment cannot be checked",
         (SecureBoot::Enabled, KernelSigning::NoKey) =>
             "Enabled — unsigned kernels built from source will not boot while it is on",
         (SecureBoot::Disabled, KernelSigning::NoKey) =>
@@ -192,6 +194,8 @@ fn signing_subtitle(signing: KernelSigning) -> &'static str {
         KernelSigning::EnrollmentPending =>
             "Enrollment pending — confirm it at the blue MOK Manager screen on the next reboot",
         KernelSigning::Enrolled => "Set up — every kernel Kernel Pop installs is signed with an enrolled key",
+        KernelSigning::EfiVarsNotMounted =>
+            "Key present; the EFI variables are not mounted, so its enrollment cannot be read. Mount them (sudo mount -t efivarfs efivarfs /sys/firmware/efi/efivars) or reboot",
         KernelSigning::Unknown =>
             "Key present; could not read its enrollment state (mokutil missing?)",
     }
@@ -1768,7 +1772,9 @@ pub fn build_ui(app: &Application) {
         let set_source = set_source.clone();
         let state = state.clone();
         recheck_btn.connect_clicked(move |_| {
-            let path = state.borrow().source.as_ref().map(|t| t.path.clone());
+            // The user's file, not the private copy: set_source copies it
+            // into the private directory again.
+            let path = state.borrow().source.as_ref().map(|t| t.origin.clone());
             if let Some(p) = path {
                 set_source(p);
             }

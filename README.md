@@ -41,7 +41,8 @@ VFS-panics on boot. This app is built around not letting that happen:
 - Every source is verified before it is built: the signature must be a good
   one from a kernel.org developer (Linus Torvalds or Greg Kroah-Hartman),
   whose key is fetched from kernel.org over WKD each time. A dropped tarball
-  without its `.tar.sign` gets kernel.org's fetched. A missing or bad
+  without its `.tar.sign` gets kernel.org's fetched. When fetching the keys
+  or the signature fails, Check Again on the Build tab tries again. A missing or bad
   signature blocks the build; for your own patched tree there is one
   explicit "Build unverified source" switch per tarball, and the build log
   says the source was unverified. Mainline release candidates have no
@@ -118,7 +119,9 @@ Delete the AppImage, then the files Kernel Pop put on the system:
 Keep it while kernels signed with that key are installed and Secure Boot is
 on: those kernels need the enrolled key, not the file, to boot, but you need
 the file to sign new ones. Remove it with `sudo rm -rf /var/lib/kernel-pop`
-once you no longer use Kernel Pop's kernels. Kernels it installed are
+once you no longer use Kernel Pop's kernels. `/var/lib/mok-pending/` is
+shared with other apps that queue Secure Boot keys; remove it only if none
+is left. Kernels it installed are
 ordinary packages: remove them on the System tab first, or with apt.
 
 ## Using it
@@ -176,6 +179,12 @@ refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
    one-time password: 8-16 printable ASCII characters, no spaces (MOK
    Manager reads it with a US keyboard layout). Setting up again replaces
    it, and a password chosen earlier, here or in another app, stops working.
+   A waiting request that holds anything setup can't carry over (a hash
+   entry, or an entry it can't read) is left alone: finish it at the next
+   reboot, then set up again. If the new request can't be written, setup
+   tries once more; if that fails too, the log names every key that is no
+   longer waiting, with its SHA1 fingerprint, and you run Set Up Signing
+   again.
    Kernel Pop installs `sbsigntool`,
    `openssl` and `mokutil` if they are missing, creates a key in
    `/var/lib/kernel-pop/mok/`, signs every installed kernel and queues the
@@ -187,6 +196,15 @@ refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
    Yes, and type the password once. It enrolls all the keys.
 3. Back in Linux, check that the System tab shows the keys as enrolled,
    and only then turn Secure Boot on.
+
+Only root can read the waiting request, so setup writes the keys it queued
+to `/var/lib/mok-pending/list`, a list shared with other apps that queue
+keys in the same request. The System tab trusts it only while the request
+is unchanged since then: once the keys are enrolled at boot, or the request
+is replaced by other means, the list is ignored, and an enrolled key always
+shows as enrolled. If the EFI variables are not mounted (some chroot tools
+unmount them on exit), the System tab says so, and Set Up Signing and the
+install mount them before they look at the keys.
 
 From then on every kernel Kernel Pop installs is signed (`sbsign`, then
 `sbverify` before the image in `/boot` is replaced), whether Secure Boot is

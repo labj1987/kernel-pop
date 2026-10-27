@@ -32,6 +32,9 @@ done
 # dpkg-deb stub: "<file>" -> Package name is the file's basename up to '_'
 dpkg-deb() { local b; b="$(basename "$2")"; echo "${b%%_*}"; }
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# No EFI firmware directory unless a test sets one, so nothing ever mounts
+# the real machine's EFI variables; the shared list of waiting keys in $tmp.
+export KERNEL_POP_EFI="$tmp/no-efi" KERNEL_POP_MOK_PENDING="$tmp/mok-pending/list"
 
 deb_allowed "$tmp/linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb"   || bad "deb_allowed image"
 deb_allowed "$tmp/linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb" || bad "deb_allowed headers"
@@ -233,6 +236,33 @@ ln -s boot/vmlinuz-6.5.0-1-generic "$tmp/ksroot/vmlinuz"
 [[ "$(kernelstub_slot_for_kver 6.5.0-1-generic)" == "vmlinuz.efi" ]] || bad "kernelstub slot should follow the / links"
 [[ -z "$(kernelstub_slot_for_kver 7.1.3-070103-generic)" ]] || bad "kernelstub slot should ignore /boot links when / has them"
 unset KERNEL_POP_BOOT KERNEL_POP_ROOTFS
+
+# ── EFI variables mounted before anything about MokNew is decided ───────
+(
+    r=0
+    mount() { echo "mount $*" >> "$tmp/mount-calls"; return "${MOUNT_RC:-0}"; }
+    : > "$tmp/mount-calls"
+    ensure_efivarfs || r=1                                             # no EFI: nothing to do
+    [[ -s "$tmp/mount-calls" ]] && { echo "FAIL: mounted without EFI firmware"; r=1; }
+    export KERNEL_POP_EFI="$tmp/efi" KERNEL_POP_EFIVARS="$tmp/efi/efivars"
+    mkdir -p "$KERNEL_POP_EFIVARS"
+    ensure_efivarfs >/dev/null || r=1                                  # not a mountpoint: mounted
+    [[ "$(cat "$tmp/mount-calls")" == "mount -t efivarfs -o nosuid,nodev,noexec efivarfs $tmp/efi/efivars" ]] \
+        || { echo "FAIL: efivarfs mount call: $(cat "$tmp/mount-calls")"; r=1; }
+    : > "$tmp/mount-calls"
+    out="$(MOUNT_RC=32 ensure_efivarfs 2>&1)" && { echo "FAIL: a failed mount must stop the run"; r=1; }
+    grep -q "EFI variables are not mounted and could not be mounted" <<< "$out" || { echo "FAIL: failed mount message: $out"; r=1; }
+    : > "$tmp/mount-calls"
+    KERNEL_POP_EFIVARS=/proc ensure_efivarfs || r=1                     # another filesystem: mounted
+    [[ -s "$tmp/mount-calls" ]] && { echo "FAIL: mounted over a mountpoint"; r=1; }
+    # The signing setup and the install preflight both check first.
+    out="$(printf 'Secret-pw1\n' | MOUNT_RC=32 do_setup_signing 2>&1)" && { echo "FAIL: setup went on without EFI variables"; r=1; }
+    grep -q "could not be mounted" <<< "$out" || { echo "FAIL: setup without EFI variables: $out"; r=1; }
+    grep -q "setup started" <<< "$out" && { echo "FAIL: setup started without EFI variables"; r=1; }
+    out="$(MOUNT_RC=32 secure_boot_preflight 2>&1)" && { echo "FAIL: install preflight went on without EFI variables"; r=1; }
+    rm -rf "$tmp/efi"
+    exit "$r"
+) || bad "efivarfs mount checks"
 
 # ── Enrollment state and the Secure Boot preflight ───────────────────────
 for pair in "is already enrolled:enrolled" "is already in the enrollment request:pending" \
@@ -479,7 +509,8 @@ else
                     --import)
                         local hf="${*: -1}"
                         [[ "${*: -2:1}" == "--hash-file" && "$(stat -c '%a' "$hf")" == "600" ]] || return 1
-                        cat "$hf" >> "$calls"; echo "$hf" > "$tmp/hashfile-path" ;;
+                        cat "$hf" >> "$calls"; echo "$hf" > "$tmp/hashfile-path"
+                        printf 'attrdata' > "$KERNEL_POP_EFIVARS/MokNew-$MOK_GUID" ;;
                 esac
             }
             apt-get() { echo "apt-get should not run: tools are installed" >> "$calls"; return 1; }
@@ -494,7 +525,9 @@ else
             grep -q "Secret-pw1" "$calls" && { echo "FAIL: the password reached mokutil's argv"; r=1; }
             grep -q "Secret-pw1" <<< "$out" && { echo "FAIL: the password was printed"; r=1; }
             grep -qE -- "--import [^ ]*/key-1.der --hash-file" "$calls" || { echo "FAIL: mokutil --import call: $(cat "$calls")"; r=1; }
-            [[ "$(cat "$(dirname "$KERNEL_POP_MOK_DIR")/mok-pending")" == "$(cert_sha1 "$KERNEL_POP_MOK_DIR/signing.der")" ]] || { echo "FAIL: the queued key was not recorded for the app"; r=1; }
+            [[ "$(cat "$KERNEL_POP_MOK_PENDING")" == "moknew-size 8"$'\n'"$(cert_sha1 "$KERNEL_POP_MOK_DIR/signing.der")" ]] || { echo "FAIL: the queued key was not recorded for the apps: $(cat "$KERNEL_POP_MOK_PENDING")"; r=1; }
+            [[ "$(stat -c %a "$KERNEL_POP_MOK_PENDING")" == 644 && "$(stat -c %a "$(dirname "$KERNEL_POP_MOK_PENDING")")" == 755 ]] || { echo "FAIL: the shared list must be readable by the apps"; r=1; }
+            [[ -z "$(compgen -G "$(dirname "$KERNEL_POP_MOK_PENDING")/.list.*")" ]] || { echo "FAIL: a temp list was left behind"; r=1; }
             grep -qF '$6$teststalt$fakehash' "$calls" || { echo "FAIL: the hash file did not hold the hash"; r=1; }
             [[ -e "$(cat "$tmp/hashfile-path")" ]] && { echo "FAIL: the hash file was left behind"; r=1; }
             grep -q "apt-get should not run" "$calls" && { echo "FAIL: apt-get ran with every tool installed"; r=1; }
@@ -548,10 +581,19 @@ else
                     --generate-hash) local a b; IFS= read -r a; IFS= read -r b; echo '$6$salt$hash' ;;
                     --revoke-import) echo "REVOKE" >> "$calls"; rm -f "$moknew" ;;
                     --import)
-                        local f; shift
-                        while [[ "$1" != "--hash-file" ]]; do echo "IMPORT $(cert_cn "$1")" >> "$calls"; shift; done ;;
+                        local -a files=(); shift
+                        while [[ "$1" != "--hash-file" ]]; do files+=("$1"); shift; done
+                        # $tmp/import-fails: how many imports fail before one works.
+                        if [[ -s "$tmp/import-fails" ]] && (( $(cat "$tmp/import-fails") > 0 )); then
+                            echo $(( $(cat "$tmp/import-fails") - 1 )) > "$tmp/import-fails"
+                            echo "FAILED-IMPORT" >> "$calls"; return 1
+                        fi
+                        for f in "${files[@]}"; do echo "IMPORT $(cert_cn "$f")" >> "$calls"; done
+                        write_moknew x509 "${files[@]}" ;;
                 esac
             }
+            list_fps() { tail -n +2 "$KERNEL_POP_MOK_PENDING" | sort | tr '\n' ' '; }
+            fps_of() { local f; for f in "$@"; do cert_sha1 "$f"; done | sort | tr '\n' ' '; }
             queued() { grep '^IMPORT' "$calls" | sed 's/^IMPORT //' | sort | tr '\n' '|'; }
 
             # Another app's key is waiting: it stays, ours and the DKMS key join it, one password.
@@ -561,7 +603,8 @@ else
             grep -n "REVOKE\|IMPORT" "$calls" | head -1 | grep -q REVOKE || fail "the waiting request must be replaced before the import"
             grep -q "already waiting for enrollment" <<< "$out" || fail "the carried-over key should be named: $out"
             grep -q "That one password enrolls all of these keys" <<< "$out" || fail "the user should learn one password covers all: $out"
-            [[ "$(wc -l < "$(mok_pending_file)")" == 3 ]] || fail "the app's list should hold three fingerprints"
+            [[ "$(list_fps)" == "$(fps_of "$tmp/other/c.der" "$tmp/dkms/c.der" "$KERNEL_POP_MOK_DIR/signing.der")" ]] || fail "the shared list should hold the three fingerprints: $(cat "$KERNEL_POP_MOK_PENDING")"
+            [[ "$(head -1 "$KERNEL_POP_MOK_PENDING")" == "moknew-size $(stat -c %s "$moknew")" ]] || fail "the shared list should record MokNew's size: $(head -1 "$KERNEL_POP_MOK_PENDING")"
             grep -q "Secret-pw2" "$calls" && fail "the password reached mokutil's argv"
 
             # The DKMS key was already waiting (queued by another tool): listed once.
@@ -582,7 +625,7 @@ else
             out="$(queue_key_enrollment Secret-pw5 2>&1)" || fail "queue with everything enrolled"
             grep -q "nothing to queue" <<< "$out" || fail "should say there is nothing to queue: $out"
             grep -q -- "--import" "$calls" && fail "nothing should be imported when every key is enrolled"
-            [[ -e "$(mok_pending_file)" ]] && fail "the app's list should be removed"
+            [[ -e "$KERNEL_POP_MOK_PENDING" ]] && fail "the shared list should be removed"
 
             # A waiting request with a hash entry cannot be carried over: refused, untouched.
             : > "$calls"; write_moknew sha256 "$tmp/other/c.der"
@@ -592,6 +635,94 @@ else
             # A damaged variable: refused as well.
             printf 'xxxxshort' > "$moknew"
             (queue_key_enrollment Secret-pw7 >/dev/null 2>&1) && fail "a damaged request must not be replaced"
+
+            # Back to the full mokutil stub (the everything-enrolled case replaced it).
+            mokutil() {
+                echo "ARGS: $*" >> "$calls"
+                case "$1" in
+                    --test-key) echo "$2 is not enrolled" ;;
+                    --generate-hash) local a b; IFS= read -r a; IFS= read -r b; echo '$6$salt$hash' ;;
+                    --revoke-import) echo "REVOKE" >> "$calls"; rm -f "$moknew" ;;
+                    --import)
+                        local -a files=(); shift
+                        while [[ "$1" != "--hash-file" ]]; do files+=("$1"); shift; done
+                        if [[ -s "$tmp/import-fails" ]] && (( $(cat "$tmp/import-fails") > 0 )); then
+                            echo $(( $(cat "$tmp/import-fails") - 1 )) > "$tmp/import-fails"
+                            echo "FAILED-IMPORT" >> "$calls"; return 1
+                        fi
+                        for f in "${files[@]}"; do echo "IMPORT $(cert_cn "$f")" >> "$calls"; done
+                        write_moknew x509 "${files[@]}" ;;
+                esac
+            }
+            malformed_moknew() {   # <header size> <list size adjustment>: one x509 list, sizes off
+                perl -e '
+                    my ($hsize, $adj, $f) = @ARGV;
+                    open(my $h, "<:raw", $f) or die; local $/; my $d = <$h>;
+                    my $entry = ("\x11" x 16) . $d;
+                    my $lsize = 28 + length($entry) + $adj;
+                    my $body = $entry . ("\0" x ($adj > 0 ? $adj : 0));
+                    binmode STDOUT;
+                    print pack("V", 7) . pack("H*", "a159c0a5e494a74a87b5ab155c2bf072") . pack("V3", $lsize, $hsize, length $entry) . $body;
+                ' "$1" "$2" "$tmp/other/c.der" > "$moknew"
+            }
+
+            # Several signature lists in the waiting request: every certificate is carried over.
+            : > "$calls"; write_moknew x509 "$tmp/other/c.der" "$tmp/dkms/c.der"
+            out="$(queue_key_enrollment Secret-pw8 2>&1)" || fail "queue with two waiting lists: $out"
+            [[ "$(queued)" == "Kernel Pop kernel signing key|Other app key|Test DKMS key|" ]] || fail "two lists: queued [$(queued)]"
+            [[ "$(grep -c "already waiting for enrollment" <<< "$out")" == 2 ]] || fail "both waiting keys should be named: $out"
+            [[ "$(list_fps)" == "$(fps_of "$tmp/other/c.der" "$tmp/dkms/c.der" "$KERNEL_POP_MOK_DIR/signing.der")" ]] || fail "two lists: shared list $(cat "$KERNEL_POP_MOK_PENDING")"
+
+            # A header that runs past its list, or a list that is not whole
+            # entries: unreadable, left alone, the shared list kept as it was.
+            cp "$KERNEL_POP_MOK_PENDING" "$tmp/list-before"
+            for bad_sizes in "4096 0" "0 5"; do
+                : > "$calls"; malformed_moknew $bad_sizes
+                rc=0; pending_mok_certs "$tmp/malformed-out" 2>/dev/null || rc=$?
+                [[ $rc == 2 ]] || fail "malformed list ($bad_sizes) should read as damaged, got $rc"
+                out="$(queue_key_enrollment Secret-pw9 2>&1)" && fail "a malformed request ($bad_sizes) must not be replaced"
+                grep -q "could not be read" <<< "$out" || fail "malformed request ($bad_sizes): $out"
+                grep -q "REVOKE\|IMPORT" "$calls" && fail "nothing may be revoked or imported for a malformed request ($bad_sizes)"
+                cmp -s "$KERNEL_POP_MOK_PENDING" "$tmp/list-before" || fail "the shared list changed for a malformed request"
+            done
+
+            # A waiting certificate openssl can't read: nothing is revoked, the request stays.
+            printf 'not a certificate' > "$tmp/junk.der"
+            : > "$calls"; write_moknew x509 "$tmp/other/c.der" "$tmp/junk.der"
+            # With errexit on, as in a real run.
+            ( set -e; queue_key_enrollment Secret-pw10 ) > "$tmp/q-out" 2>&1; rc=$?
+            out="$(cat "$tmp/q-out")"
+            (( rc != 0 )) || fail "a request with an unreadable certificate must not be replaced"
+            grep -q "not a readable certificate, so Kernel Pop will not replace it" <<< "$out" || fail "unreadable waiting entry: $out"
+            grep -q "REVOKE\|IMPORT" "$calls" && fail "nothing may be revoked or imported with an unreadable waiting entry"
+            [[ -e "$moknew" ]] || fail "the request with an unreadable entry must be left alone"
+
+            # One of our own certificates unreadable: a hard error, nothing changed.
+            : > "$calls"; write_moknew x509 "$tmp/other/c.der"
+            ( set -e; KERNEL_POP_DKMS_MOK="$tmp/junk.der" queue_key_enrollment Secret-pw11 ) > "$tmp/q-out" 2>&1; rc=$?
+            out="$(cat "$tmp/q-out")"
+            (( rc != 0 )) || fail "an unreadable DKMS certificate must be an error"
+            grep -q "Could not read the certificate $tmp/junk.der" <<< "$out" || fail "unreadable own certificate: $out"
+            grep -q "REVOKE\|IMPORT" "$calls" && fail "nothing may be revoked or imported with an unreadable own certificate"
+
+            # The import fails once after the revoke: retried, and the request is in place.
+            : > "$calls"; write_moknew x509 "$tmp/other/c.der"; echo 1 > "$tmp/import-fails"
+            out="$(queue_key_enrollment Secret-pw12 2>&1)" || fail "one failed import should be retried: $out"
+            [[ "$(grep -c FAILED-IMPORT "$calls")" == 1 ]] || fail "exactly one failed import expected"
+            [[ "$(queued)" == "Kernel Pop kernel signing key|Other app key|Test DKMS key|" ]] || fail "retry: queued [$(queued)]"
+            [[ "$(head -1 "$KERNEL_POP_MOK_PENDING")" == "moknew-size $(stat -c %s "$moknew")" ]] || fail "retry: shared list not rewritten"
+
+            # It fails twice: every key is named with its fingerprint, the shared list goes.
+            : > "$calls"; write_moknew x509 "$tmp/other/c.der"; echo 2 > "$tmp/import-fails"
+            out="$(queue_key_enrollment Secret-pw13 2>&1)" && fail "two failed imports must fail the setup"
+            [[ "$(grep -c FAILED-IMPORT "$calls")" == 2 ]] || fail "the import should be tried exactly twice"
+            grep -q "None of these keys is waiting for enrollment now" <<< "$out" || fail "the lost keys should be announced: $out"
+            for c in "$tmp/other/c.der" "$tmp/dkms/c.der" "$KERNEL_POP_MOK_DIR/signing.der"; do
+                grep -qF "$(cert_cn "$c") (SHA1 $(cert_sha1 "$c"))" <<< "$out" || fail "the lost key $(cert_cn "$c") should be named with its SHA1: $out"
+            done
+            grep -q "Run Set Up Signing again" <<< "$out" || fail "the user should be told to run Set Up Signing again: $out"
+            [[ -e "$KERNEL_POP_MOK_PENDING" ]] && fail "the shared list must be removed when nothing is queued"
+            rm -f "$tmp/import-fails"
             exit "$r"
         ) || bad "enrollment request merging"
     fi

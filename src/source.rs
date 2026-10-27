@@ -169,9 +169,18 @@ pub fn private_dir() -> PathBuf {
 }
 
 /// Copy `t` into `dir` (emptied first; created 0700) and look into the copy.
-/// The copy must hold the same kernel version as the original.
+/// The copy must hold the same kernel version as the original, which may
+/// not be inside `dir` itself (emptying it would delete the original).
 pub fn private_copy_in(t: &Tarball, dir: &Path) -> Result<Tarball> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if let (Ok(src), Ok(d)) = (t.path.canonicalize(), dir.canonicalize()) {
+        if src.starts_with(&d) {
+            bail!(
+                "{} is already Kernel Pop's private copy; choose the original tarball instead",
+                t.path.display()
+            );
+        }
+    }
     if dir.exists() {
         std::fs::remove_dir_all(dir).with_context(|| format!("Could not clear {}", dir.display()))?;
     }
@@ -386,6 +395,20 @@ pub mod tests {
         // Changing the original afterwards does not change what is built.
         std::fs::write(&xz, b"swapped").unwrap();
         assert_eq!(inspect(&c.path).unwrap().version.kernelversion(), "7.2.12");
+        // Copying the private copy into its own directory would delete it
+        // first: refused, and the copy stays.
+        let err = private_copy_in(&c, &dir).unwrap_err().to_string();
+        assert!(err.contains("already Kernel Pop's private copy"), "{err}");
+        assert!(c.path.exists());
+        // Through another spelling of the same directory too.
+        let err = private_copy_in(&c, &d.join("private/../private")).unwrap_err().to_string();
+        assert!(err.contains("private copy"), "{err}");
+        assert!(c.path.exists());
+        // Check Again starts over from the user's file (the origin).
+        std::fs::write(&xz, std::fs::read(&c.path).unwrap()).unwrap();
+        let again = private_copy_in(&inspect(&c.origin).unwrap(), &dir).unwrap();
+        assert_eq!(again.path, c.path);
+        assert!(again.path.exists());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

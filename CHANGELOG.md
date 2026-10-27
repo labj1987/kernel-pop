@@ -4,6 +4,29 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.1.3 — 2026-10-27
+
+**Fixed: keys enrolled at boot still showing as waiting**, and this app and other apps that
+queue keys in the same enrollment request disagreeing about what is waiting.
+
+- The System tab now reads one list of waiting keys shared with those apps, and only while
+  the waiting request is unchanged since it was written. Once the keys are enrolled at the
+  blue MOK Manager screen, the list is ignored, and an enrolled key always shows as enrolled
+  (for the DKMS key too). A key queued with an earlier version shows as not enrolled until
+  you run Set Up Signing again; that keeps everything already waiting in the request.
+- Set Up Signing no longer drops a waiting key it can't read, or a request whose contents
+  don't add up: it leaves the whole request alone and asks you to finish it at the next
+  reboot first. If Kernel Pop's own key or the DKMS key can't be read, setup stops with an
+  error instead of leaving it out.
+- If writing the new request fails, setup tries once more. If that fails too, the log names
+  every key that is no longer waiting, with its fingerprint, and tells you to run Set Up
+  Signing again; the System tab then no longer shows them as waiting.
+- When the EFI variables are not mounted (some chroot tools unmount them on exit), Set Up
+  Signing and installs mount them before they look at the keys, instead of seeing nothing
+  waiting, and the System tab says they are not mounted instead of an unknown state.
+- **Fixed: Check Again on the Build tab always failing.** It now checks the tarball you
+  chose again, as it should.
+
 ## 2.1.2 — 2026-10-25
 
 - The Build tab's configurations are now Match this system, Tuned for this machine and Use

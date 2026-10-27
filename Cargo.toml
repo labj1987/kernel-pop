@@ -1,6 +1,6 @@
 [package]
 name = "kernel-pop"
-version = "2.1.2"
+version = "2.1.3"
 edition = "2021"
 description = "Kernel Pop — GTK4 GUI that builds kernel.org kernels for this machine and installs them"
 authors = ["Linnard Alex Brown Jr."]

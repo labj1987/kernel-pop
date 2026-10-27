@@ -70,7 +70,7 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   exists); disk space; Secure Boot detection; kernel-signing state
   (`KernelSigning`, from the key files in `/var/lib/kernel-pop/mok/` plus
   `mokutil --test-key`, whose "already in the enrollment request" means
-  pending, and `--list-new`); per-kernel `KernelSignature` (Kernel Pop's
+  pending, and the shared list of waiting keys, see Kernel signing); per-kernel `KernelSignature` (Kernel Pop's
   signature from the size/mtime markers in `/var/lib/kernel-pop/signed/`,
   since `/boot/vmlinuz-*` is 0600, or Ubuntu's from the dpkg source
   package); install preflight warnings; which old kernels can be pruned.
@@ -143,11 +143,28 @@ boots once MOK Manager enrolls it.
   already waiting (parsed out of the MokNew EFI variable), Kernel Pop's key
   and the DKMS key (`/var/lib/shim-signed/mok/MOK.der`), minus anything
   already enrolled, under the password just chosen (`--revoke-import`, then
-  one `--import`). A request holding non-certificate entries is left alone.
-  MokNew is root-only, so the app cannot see it with `mokutil --list-new`:
-  the script writes the queued fingerprints to `/var/lib/kernel-pop/mok-pending`
-  (0644) and the app counts a key as pending when MokNew exists and the key
-  is listed there.
+  one `--import`). A request holding non-certificate entries, an entry
+  openssl can't read, or a signature list whose sizes don't add up (perl
+  parser exit 2) is left alone, before anything is revoked; Kernel Pop's
+  own key or the DKMS key unreadable is a hard error. A failed `--import`
+  is retried once with the same hash file; if it fails again, whatever is
+  left in MokNew is revoked, the shared list removed, and every key logged
+  with CN and SHA1 as no longer waiting.
+- `ensure_efivarfs` runs before anything is decided about MokNew (signing
+  setup and `secure_boot_preflight`): with the EFI firmware dir present and
+  efivars on the same filesystem as it (not mounted), it mounts efivarfs
+  (`nosuid,nodev,noexec`) or dies.
+- MokNew is root-only, so the app cannot see it with `mokutil --list-new`.
+  The list of waiting keys is shared with other apps that rebuild the same
+  request: `/var/lib/mok-pending/list` (dir 0755, file 0644, written tmp +
+  mv). First line `moknew-size <bytes>` (`stat -c %s` of MokNew right after
+  the import), then one lowercase SHA1 per line, every key in the request.
+  Rewritten after every successful import, removed when nothing is queued.
+  The app (`parse_pending_list`) trusts it only while MokNew exists with
+  that size; `combine_kernel_signing`/`combine_key_enrollment` let
+  `--test-key`'s Enrolled win over the list, and "EFI variables are not
+  supported" on an EFI machine is `EfiVarsNotMounted`. Keep the format
+  identical in every app that writes it.
 - The script's test overrides (`KERNEL_POP_*`, listed at its top) exist
   only in the script; pkexec clears the environment, so they never reach a
   real run. The script tests sign a copied EFI binary with a throwaway key

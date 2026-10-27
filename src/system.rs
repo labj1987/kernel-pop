@@ -57,6 +57,9 @@ pub enum KernelSigning {
     EnrollmentPending,
     /// In the MOK list: kernels signed with it boot under Secure Boot.
     Enrolled,
+    /// A key exists, but this EFI machine's EFI variables are not mounted,
+    /// so its enrollment state cannot be read.
+    EfiVarsNotMounted,
     /// A key exists but its enrollment state could not be read.
     #[default]
     Unknown,
@@ -315,12 +318,18 @@ pub enum TestKey {
     Pending,
     /// "<file> is not enrolled"
     NotEnrolled,
+    /// "EFI variables are not supported on this system" on a machine that
+    /// booted with EFI (/sys/firmware/efi exists): efivarfs is not mounted.
+    EfiVarsNotMounted,
 }
 
-/// Parse `mokutil --test-key <der>`. None when the output says none of the
-/// three (mokutil missing, no EFI variables, …).
-pub fn parse_mokutil_test_key(text: &str) -> Option<TestKey> {
-    if text.contains("is not enrolled") {
+/// Parse `mokutil --test-key <der>` (stdout and stderr). `efi_firmware` is
+/// whether /sys/firmware/efi exists. None when the output says none of
+/// these (mokutil missing, a machine without EFI, …).
+pub fn parse_mokutil_test_key(text: &str, efi_firmware: bool) -> Option<TestKey> {
+    if text.contains("EFI variables are not supported") {
+        efi_firmware.then_some(TestKey::EfiVarsNotMounted)
+    } else if text.contains("is not enrolled") {
         Some(TestKey::NotEnrolled)
     } else if text.contains("is already in the enrollment request") {
         Some(TestKey::Pending)
@@ -338,6 +347,8 @@ pub enum KeyEnrollment {
     /// Queued; MOK Manager enrolls it at the next boot.
     Pending,
     NotEnrolled,
+    /// The EFI variables are not mounted, so the state cannot be read.
+    EfiVarsNotMounted,
     Unknown,
 }
 
@@ -357,27 +368,40 @@ pub fn parse_openssl_fingerprint(text: &str) -> Option<String> {
     (fp.len() == 40).then_some(fp)
 }
 
-/// Whether the list of keys the last signing setup queued (one SHA1
-/// fingerprint per line, written by the privileged script) includes this
-/// normalized fingerprint. (`mokutil --list-new` cannot tell: the waiting
-/// request, MokNew, is readable by root only.)
-pub fn pending_list_contains(text: &str, fingerprint: &str) -> bool {
-    !fingerprint.is_empty() && text.lines().any(|l| normalize_fingerprint(l) == fingerprint)
+/// The fingerprints in the shared list of waiting keys (written by the
+/// signing setup of this app or another one; `mokutil --list-new` cannot
+/// tell, as the waiting request, MokNew, is readable by root only). The
+/// first line is `moknew-size <bytes>`, MokNew's size right after the setup
+/// queued the keys; `moknew_size` is its size now, `None` when nothing is
+/// waiting. Any other size means the request changed since (enrolled at
+/// boot, revoked, replaced by other means): the list is stale and empty.
+pub fn parse_pending_list(text: &str, moknew_size: Option<u64>) -> Vec<String> {
+    let mut lines = text.lines();
+    let recorded = lines
+        .next()
+        .and_then(|l| l.trim().strip_prefix("moknew-size "))
+        .and_then(|n| n.trim().parse::<u64>().ok());
+    if recorded.is_none() || recorded != moknew_size {
+        return vec![];
+    }
+    lines.map(normalize_fingerprint).filter(|f| f.len() == 40).collect()
 }
 
 /// `pending` is whether the key is waiting in an enrollment request (see
 /// `key_pending`); `--test-key` reports that too, but only when run as root.
+/// Enrolled wins: a key enrolled at boot may still be on a list.
 pub fn combine_kernel_signing(
     key_present: bool,
     test_key: Option<TestKey>,
     pending: bool,
 ) -> KernelSigning {
-    match (key_present, pending, test_key) {
+    match (key_present, test_key, pending) {
         (false, _, _) => KernelSigning::NoKey,
-        (true, true, _) | (true, false, Some(TestKey::Pending)) => KernelSigning::EnrollmentPending,
-        (true, false, Some(TestKey::Enrolled)) => KernelSigning::Enrolled,
-        (true, false, Some(TestKey::NotEnrolled)) => KernelSigning::KeyNotEnrolled,
-        (true, false, None) => KernelSigning::Unknown,
+        (true, Some(TestKey::Enrolled), _) => KernelSigning::Enrolled,
+        (true, _, true) | (true, Some(TestKey::Pending), _) => KernelSigning::EnrollmentPending,
+        (true, Some(TestKey::NotEnrolled), false) => KernelSigning::KeyNotEnrolled,
+        (true, Some(TestKey::EfiVarsNotMounted), false) => KernelSigning::EfiVarsNotMounted,
+        (true, None, false) => KernelSigning::Unknown,
     }
 }
 
@@ -392,10 +416,10 @@ fn stdout_of(cmd: &mut Command) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
 }
 
-/// The enrollment request shim reads at boot, and the list of what the last
-/// signing setup put in it.
+/// The enrollment request shim reads at boot, and the shared list of what
+/// the last signing setup (this app's or another one's) put in it.
 const MOK_NEW: &str = "/sys/firmware/efi/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23";
-const MOK_PENDING_LIST: &str = "/var/lib/kernel-pop/mok-pending";
+const MOK_PENDING_LIST: &str = "/var/lib/mok-pending/list";
 const DKMS_MOK_DER: &str = "/var/lib/shim-signed/mok/MOK.der";
 
 fn cert_fingerprint(der: &Path) -> Option<String> {
@@ -408,19 +432,22 @@ fn cert_fingerprint(der: &Path) -> Option<String> {
 }
 
 /// Whether the certificate is waiting in the enrollment request: a request
-/// exists and the last setup listed it.
+/// exists, unchanged since the last setup, and that setup listed it. (A
+/// plain user can stat MokNew in efivarfs, not read it.)
 fn key_pending(der: &Path) -> bool {
-    if !Path::new(MOK_NEW).exists() {
-        return false;
-    }
+    let Ok(moknew) = std::fs::metadata(MOK_NEW) else { return false };
     match (cert_fingerprint(der), std::fs::read_to_string(MOK_PENDING_LIST)) {
-        (Some(fp), Ok(list)) => pending_list_contains(&list, &fp),
+        (Some(fp), Ok(list)) => parse_pending_list(&list, Some(moknew.len())).contains(&fp),
         _ => false,
     }
 }
 
+/// `mokutil --test-key`; it prints "EFI variables are not supported" on
+/// stderr, so both streams are read.
 fn test_key(der: &Path) -> Option<TestKey> {
-    stdout_of(Command::new("mokutil").arg("--test-key").arg(der)).and_then(|t| parse_mokutil_test_key(&t))
+    let out = Command::new("mokutil").arg("--test-key").arg(der).output().ok()?;
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    parse_mokutil_test_key(&text, Path::new("/sys/firmware/efi").exists())
 }
 
 fn detect_kernel_signing() -> KernelSigning {
@@ -437,6 +464,7 @@ pub fn combine_key_enrollment(test_key: Option<TestKey>, pending: bool) -> KeyEn
         (Some(TestKey::Enrolled), _) => KeyEnrollment::Enrolled,
         (_, true) | (Some(TestKey::Pending), _) => KeyEnrollment::Pending,
         (Some(TestKey::NotEnrolled), false) => KeyEnrollment::NotEnrolled,
+        (Some(TestKey::EfiVarsNotMounted), false) => KeyEnrollment::EfiVarsNotMounted,
         (None, false) => KeyEnrollment::Unknown,
     }
 }
@@ -611,6 +639,11 @@ pub fn install_blocker(info: &SystemInfo) -> Option<&'static str> {
             "Secure Boot is on, but Kernel Pop's signing key is not enrolled, so a kernel \
              signed with it could not boot. Use Set Up Signing on the System tab to queue the \
              enrollment, then confirm it at the next reboot.",
+        ),
+        KernelSigning::EfiVarsNotMounted => Some(
+            "Secure Boot is on, but the EFI variables are not mounted, so Kernel Pop cannot \
+             check that its signing key is enrolled and the new kernel might not boot. Mount \
+             them (sudo mount -t efivarfs efivarfs /sys/firmware/efi/efivars) or reboot.",
         ),
         KernelSigning::Unknown => Some(
             "Secure Boot is on, and Kernel Pop could not confirm that its signing key is \
@@ -822,20 +855,27 @@ mod tests {
         assert_eq!(
             parse_mokutil_test_key(
                 "Failed to access kernel trusted keyring: Required key not available\n\
-                 /var/lib/kernel-pop/mok/signing.der is not enrolled\n"
+                 /var/lib/kernel-pop/mok/signing.der is not enrolled\n",
+                true
             ),
             Some(TestKey::NotEnrolled)
         );
         assert_eq!(
-            parse_mokutil_test_key("/var/lib/kernel-pop/mok/signing.der is already enrolled\n"),
+            parse_mokutil_test_key("/var/lib/kernel-pop/mok/signing.der is already enrolled\n", true),
             Some(TestKey::Enrolled)
         );
         assert_eq!(
-            parse_mokutil_test_key("signing.der is already in the enrollment request\n"),
+            parse_mokutil_test_key("signing.der is already in the enrollment request\n", true),
             Some(TestKey::Pending)
         );
-        assert_eq!(parse_mokutil_test_key("EFI variables are not supported on this system\n"), None);
-        assert_eq!(parse_mokutil_test_key(""), None);
+        // On an EFI machine this means efivarfs is not mounted; without EFI
+        // firmware there is simply nothing to read.
+        assert_eq!(
+            parse_mokutil_test_key("EFI variables are not supported on this system\n", true),
+            Some(TestKey::EfiVarsNotMounted)
+        );
+        assert_eq!(parse_mokutil_test_key("EFI variables are not supported on this system\n", false), None);
+        assert_eq!(parse_mokutil_test_key("", true), None);
     }
 
     #[test]
@@ -852,12 +892,19 @@ mod tests {
         assert_eq!(parse_openssl_fingerprint("Could not open file\n"), None);
         assert_eq!(parse_openssl_fingerprint("SHA1 Fingerprint=AB:CD\n"), None);
 
-        let list = "76a09a007212892f0fa8d2c51eb6d0c8f42ac64d\n43e4f8245b73f134bf13c1dbe63001527c7b0905\n";
-        assert!(pending_list_contains(list, &fp));
-        assert!(pending_list_contains("76:A0:9A:00:72:12:89:2F:0F:A8:D2:C5:1E:B6:D0:C8:F4:2A:C6:4D\n", &fp));
-        assert!(!pending_list_contains(list, "ffffffffffffffffffffffffffffffffffffffff"));
-        assert!(!pending_list_contains("", &fp));
-        assert!(!pending_list_contains(list, ""));
+        let other = "43e4f8245b73f134bf13c1dbe63001527c7b0905".to_string();
+        let list = "moknew-size 2052\n76a09a007212892f0fa8d2c51eb6d0c8f42ac64d\n43E4F8245B73F134BF13C1DBE63001527C7B0905\n";
+        // Valid only while MokNew exists with the size recorded at the import.
+        assert_eq!(parse_pending_list(list, Some(2052)), vec![fp.clone(), other.clone()]);
+        assert!(parse_pending_list(list, Some(2053)).is_empty(), "request changed since: stale");
+        assert!(parse_pending_list(list, None).is_empty(), "no request waiting: stale");
+        // Without the size line (or with a damaged one) a list is never trusted.
+        assert!(parse_pending_list("76a09a007212892f0fa8d2c51eb6d0c8f42ac64d\n", Some(2052)).is_empty());
+        assert!(parse_pending_list("moknew-size x\n76a09a007212892f0fa8d2c51eb6d0c8f42ac64d\n", Some(2052)).is_empty());
+        assert!(parse_pending_list("", Some(0)).is_empty());
+        // Lines that are not fingerprints are skipped.
+        assert_eq!(parse_pending_list("moknew-size 10\nabc\n\n76a09a007212892f0fa8d2c51eb6d0c8f42ac64d\n", Some(10)), vec![fp]);
+        assert_eq!(parse_pending_list("moknew-size 10\n", Some(10)), Vec::<String>::new());
     }
 
     #[test]
@@ -870,6 +917,7 @@ mod tests {
         assert_eq!(combine_key_enrollment(Some(T::NotEnrolled), false), NotEnrolled);
         assert_eq!(combine_key_enrollment(None, false), Unknown);
         assert_eq!(combine_key_enrollment(None, true), Pending);
+        assert_eq!(combine_key_enrollment(Some(T::EfiVarsNotMounted), false), EfiVarsNotMounted);
     }
 
     #[test]
@@ -877,11 +925,14 @@ mod tests {
         use KernelSigning::*;
         use TestKey as T;
         assert_eq!(combine_kernel_signing(false, Some(T::Enrolled), true), NoKey);
-        assert_eq!(combine_kernel_signing(true, Some(T::Enrolled), true), EnrollmentPending);
+        // Enrolled wins over a list entry: the key was enrolled at boot.
+        assert_eq!(combine_kernel_signing(true, Some(T::Enrolled), true), Enrolled);
         assert_eq!(combine_kernel_signing(true, Some(T::NotEnrolled), true), EnrollmentPending);
         assert_eq!(combine_kernel_signing(true, Some(T::Enrolled), false), Enrolled);
         assert_eq!(combine_kernel_signing(true, Some(T::NotEnrolled), false), KeyNotEnrolled);
         assert_eq!(combine_kernel_signing(true, None, false), Unknown);
+        assert_eq!(combine_kernel_signing(true, Some(T::EfiVarsNotMounted), false), EfiVarsNotMounted);
+        assert_eq!(combine_kernel_signing(true, None, true), EnrollmentPending);
         // --test-key alone is enough to see a queued key: with openssl or
         // --list-new failing, a pending key must never read as Enrolled.
         assert_eq!(combine_kernel_signing(true, Some(T::Pending), false), EnrollmentPending);
@@ -995,6 +1046,7 @@ mod tests {
             (KernelSigning::NoKey, true),
             (KernelSigning::KeyNotEnrolled, true),
             (KernelSigning::Unknown, true),
+            (KernelSigning::EfiVarsNotMounted, true),
             (KernelSigning::EnrollmentPending, false),
             (KernelSigning::Enrolled, false),
         ] {
