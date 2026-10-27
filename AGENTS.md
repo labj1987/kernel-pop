@@ -262,6 +262,8 @@ fails clearly if one is missing.
 
 ## Conventions
 
+- Every commit must be rustfmt-clean: run `cargo fmt --all` (settings in `rustfmt.toml`) before committing; CI runs
+  `cargo fmt --all --check`. The formatting-only commit is listed in `.git-blame-ignore-revs`.
 - Don't use `sed`/`awk` to edit files — use direct file writes/edits.
   `tee` is fine for one-off terminal inspection, but Claude Code sessions
   should edit files directly rather than shelling through it.
