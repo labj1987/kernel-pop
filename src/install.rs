@@ -32,8 +32,7 @@ pub fn helper_problem() -> Option<String> {
 fn helper_problem_in(bundle: Option<&Path>, root: &Path) -> Option<String> {
     let under = |base: &Path, abs: &str| base.join(abs.trim_start_matches('/'));
     let Some(bundle) = bundle else {
-        return (!under(root, SCRIPT).exists())
-            .then(|| format!("The privileged helper is not installed at {SCRIPT}."));
+        return (!under(root, SCRIPT).exists()).then(|| format!("The privileged helper is not installed at {SCRIPT}."));
     };
     for file in HELPER_FILES {
         let (bundled, installed) = (under(bundle, file), under(root, file));
@@ -83,9 +82,7 @@ fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String
     let mut cmd = Command::new("pkexec");
     cmd.args(&full).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if secret.is_some() { Stdio::piped() } else { Stdio::null() });
-    let mut child = cmd
-        .spawn()
-        .context("Failed to launch pkexec — is polkit installed?")?;
+    let mut child = cmd.spawn().context("Failed to launch pkexec — is polkit installed?")?;
     if let (Some(secret), Some(mut stdin)) = (secret, child.stdin.take()) {
         // A write error (the script exited early, e.g. on a cancelled
         // authentication) shows up in the exit status below.
@@ -112,17 +109,9 @@ fn describe_failure(code: Option<i32>, stdout: &str, stderr: &str) -> String {
     let with_err = |msg: String| if err.is_empty() { msg } else { format!("{msg}\n{err}") };
     match code {
         Some(126) if !script_ran => "Authentication was cancelled.".to_string(),
-        Some(127) if !script_ran => with_err(
-            "Not authorized, or pkexec could not run the privileged helper.".to_string(),
-        ),
-        Some(c) => with_err(format!(
-            "Script exited with code {c} (see /var/log/kernel-pop.log)\n{}",
-            tail_lines(stdout, ERROR_TAIL_LINES)
-        )),
-        None => with_err(format!(
-            "The privileged helper was killed by a signal (see /var/log/kernel-pop.log)\n{}",
-            tail_lines(stdout, ERROR_TAIL_LINES)
-        )),
+        Some(127) if !script_ran => with_err("Not authorized, or pkexec could not run the privileged helper.".to_string()),
+        Some(c) => with_err(format!("Script exited with code {c} (see /var/log/kernel-pop.log)\n{}", tail_lines(stdout, ERROR_TAIL_LINES))),
+        None => with_err(format!("The privileged helper was killed by a signal (see /var/log/kernel-pop.log)\n{}", tail_lines(stdout, ERROR_TAIL_LINES))),
     }
 }
 
@@ -277,11 +266,7 @@ mod tests {
         assert!(e.starts_with("Not authorized"), "{e}");
         assert!(e.contains("Error executing command"), "{e}");
         // The script ran and itself exited 127 (a missing command): not an auth problem.
-        let e = describe_failure(
-            Some(127),
-            "[kernel-pop] ==== Kernel install started ====\n",
-            "privileged-install.sh: line 9: gpgv: command not found\n",
-        );
+        let e = describe_failure(Some(127), "[kernel-pop] ==== Kernel install started ====\n", "privileged-install.sh: line 9: gpgv: command not found\n");
         assert!(e.starts_with("Script exited with code 127"), "{e}");
         assert!(e.contains("Kernel install started") && e.contains("gpgv: command not found"), "{e}");
         let e = describe_failure(Some(126), "[kernel-pop] started\n", "");

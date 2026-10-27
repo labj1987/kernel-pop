@@ -36,8 +36,24 @@ pub const LOCALVERSION: &str = "-kernelpop";
 /// (module signing key) and gawk (modules.builtin.ranges).
 /// The privileged script's --install-build-deps accepts exactly this list.
 pub const BUILD_DEPS: &[&str] = &[
-    "build-essential", "dpkg-dev", "bc", "bison", "flex", "debhelper", "kmod", "libdw-dev",
-    "libelf-dev", "libssl-dev", "python3", "rsync", "xz-utils", "pahole", "zstd", "cpio", "openssl", "gawk",
+    "build-essential",
+    "dpkg-dev",
+    "bc",
+    "bison",
+    "flex",
+    "debhelper",
+    "kmod",
+    "libdw-dev",
+    "libelf-dev",
+    "libssl-dev",
+    "python3",
+    "rsync",
+    "xz-utils",
+    "pahole",
+    "zstd",
+    "cpio",
+    "openssl",
+    "gawk",
 ];
 
 /// Free space a build needs in ~/.cache, measured (docs/SOURCE_BUILD.md:
@@ -56,32 +72,125 @@ pub const TUNED_BUILD_NEED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// exist in a tree are ignored by localmodconfig.
 pub const TUNED_EXTRA_MODULES: &[&str] = &[
     // storage and card readers
-    "usb_storage", "uas", "sd_mod", "sr_mod", "cdrom", "mmc_block", "sdhci", "sdhci_pci", "sdhci_acpi",
-    "rtsx_pci", "rtsx_pci_sdmmc", "rtsx_usb", "rtsx_usb_sdmmc", "nvme",
+    "usb_storage",
+    "uas",
+    "sd_mod",
+    "sr_mod",
+    "cdrom",
+    "mmc_block",
+    "sdhci",
+    "sdhci_pci",
+    "sdhci_acpi",
+    "rtsx_pci",
+    "rtsx_pci_sdmmc",
+    "rtsx_usb",
+    "rtsx_usb_sdmmc",
+    "nvme",
     // file systems
-    "vfat", "fat", "msdos", "exfat", "ntfs3", "isofs", "udf", "ext4", "btrfs", "xfs", "f2fs", "hfsplus",
-    "fuse", "squashfs", "overlay", "nls_utf8", "nls_cp437", "nls_iso8859_1", "nls_ascii", "cifs", "nfs", "nfsv4",
+    "vfat",
+    "fat",
+    "msdos",
+    "exfat",
+    "ntfs3",
+    "isofs",
+    "udf",
+    "ext4",
+    "btrfs",
+    "xfs",
+    "f2fs",
+    "hfsplus",
+    "fuse",
+    "squashfs",
+    "overlay",
+    "nls_utf8",
+    "nls_cp437",
+    "nls_iso8859_1",
+    "nls_ascii",
+    "cifs",
+    "nfs",
+    "nfsv4",
     // input and game controllers
-    "usbhid", "hid_generic", "hid_multitouch", "hid_logitech_dj", "hid_logitech_hidpp", "hid_sony",
-    "hid_playstation", "hid_nintendo", "hid_microsoft", "hid_apple", "hid_steam", "xpad", "joydev", "uinput",
+    "usbhid",
+    "hid_generic",
+    "hid_multitouch",
+    "hid_logitech_dj",
+    "hid_logitech_hidpp",
+    "hid_sony",
+    "hid_playstation",
+    "hid_nintendo",
+    "hid_microsoft",
+    "hid_apple",
+    "hid_steam",
+    "xpad",
+    "joydev",
+    "uinput",
     "i2c_hid_acpi",
     // audio and video
-    "snd_usb_audio", "uvcvideo",
+    "snd_usb_audio",
+    "uvcvideo",
     // Bluetooth
-    "bluetooth", "btusb", "btintel", "btrtl", "btbcm", "btmtk",
+    "bluetooth",
+    "btusb",
+    "btintel",
+    "btrtl",
+    "btbcm",
+    "btmtk",
     // USB network adapters and phone tethering
-    "usbnet", "cdc_ether", "cdc_ncm", "cdc_mbim", "rndis_host", "r8152", "ax88179_178a", "asix", "ipheth",
+    "usbnet",
+    "cdc_ether",
+    "cdc_ncm",
+    "cdc_mbim",
+    "rndis_host",
+    "r8152",
+    "ax88179_178a",
+    "asix",
+    "ipheth",
     // docks, USB-C and Thunderbolt
-    "thunderbolt", "typec_displayport", "ucsi_acpi", "typec_ucsi",
+    "thunderbolt",
+    "typec_displayport",
+    "ucsi_acpi",
+    "typec_ucsi",
     // printers and serial adapters
-    "usblp", "cdc_acm", "usbserial", "ftdi_sio", "cp210x", "ch341", "pl2303",
+    "usblp",
+    "cdc_acm",
+    "usbserial",
+    "ftdi_sio",
+    "cp210x",
+    "ch341",
+    "pl2303",
     // VPNs, containers and virtual machines
-    "tun", "tap", "wireguard", "veth", "bridge", "br_netfilter", "vxlan", "macvlan", "ipvlan", "nf_tables",
-    "nft_compat", "nft_chain_nat", "nf_nat", "nf_conntrack", "xt_MASQUERADE", "xt_conntrack", "xt_addrtype",
-    "iptable_nat", "iptable_filter", "ip6table_nat", "ip6table_filter", "kvm", "kvm_intel", "kvm_amd",
-    "vhost_net", "vhost_vsock",
+    "tun",
+    "tap",
+    "wireguard",
+    "veth",
+    "bridge",
+    "br_netfilter",
+    "vxlan",
+    "macvlan",
+    "ipvlan",
+    "nf_tables",
+    "nft_compat",
+    "nft_chain_nat",
+    "nf_nat",
+    "nf_conntrack",
+    "xt_MASQUERADE",
+    "xt_conntrack",
+    "xt_addrtype",
+    "iptable_nat",
+    "iptable_filter",
+    "ip6table_nat",
+    "ip6table_filter",
+    "kvm",
+    "kvm_intel",
+    "kvm_amd",
+    "vhost_net",
+    "vhost_vsock",
     // encrypted and image-backed disks, compressed swap, Wine/Proton sync
-    "dm_crypt", "dm_mod", "loop", "zram", "ntsync",
+    "dm_crypt",
+    "dm_mod",
+    "loop",
+    "zram",
+    "ntsync",
 ];
 
 /// The build profile that keeps bindeb-pkg from making a linux-image-*-dbg
@@ -90,14 +199,8 @@ const NO_DBG_PROFILE: &str = "pkg.linux-upstream.nokerneldbg";
 
 /// Config symbols the kernel needs to trust module signatures from the
 /// machine keyring (MOK keys, which DKMS signs with) under Secure Boot.
-const MOK_TRUST_SYMBOLS: &[&str] = &[
-    "MODULE_SIG",
-    "SYSTEM_TRUSTED_KEYRING",
-    "SECONDARY_TRUSTED_KEYRING",
-    "INTEGRITY_PLATFORM_KEYRING",
-    "LOAD_UEFI_KEYS",
-    "INTEGRITY_MACHINE_KEYRING",
-];
+const MOK_TRUST_SYMBOLS: &[&str] =
+    &["MODULE_SIG", "SYSTEM_TRUSTED_KEYRING", "SECONDARY_TRUSTED_KEYRING", "INTEGRITY_PLATFORM_KEYRING", "LOAD_UEFI_KEYS", "INTEGRITY_MACHINE_KEYRING"];
 
 /// Which of `BUILD_DEPS` are not installed, from `dpkg-query` output lines
 /// "<package> <status-abbrev>" (only "ii" counts as installed).
@@ -113,10 +216,7 @@ pub fn missing_from_dpkg_query(output: &str) -> Vec<String> {
 }
 
 pub fn missing_build_deps() -> Vec<String> {
-    let out = Command::new("dpkg-query")
-        .args(["-W", "-f", "${Package} ${db:Status-Abbrev}\n"])
-        .args(BUILD_DEPS)
-        .output();
+    let out = Command::new("dpkg-query").args(["-W", "-f", "${Package} ${db:Status-Abbrev}\n"]).args(BUILD_DEPS).output();
     match out {
         Ok(o) => missing_from_dpkg_query(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => BUILD_DEPS.iter().map(|p| p.to_string()).collect(),
@@ -137,10 +237,7 @@ fn home() -> PathBuf {
 /// build directory. Only one build runs at a time, and anything left in it
 /// from an earlier build is removed when the next one starts.
 pub fn build_root() -> PathBuf {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".cache"));
+    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home().join(".cache"));
     cache.join("kernel-pop").join("build")
 }
 
@@ -188,7 +285,9 @@ impl ConfigMode {
 pub enum SourceTrust {
     Verified(Signer),
     /// Built anyway, on the user's explicit say-so for this tarball.
-    Unverified { reason: String },
+    Unverified {
+        reason: String,
+    },
 }
 
 impl SourceTrust {
@@ -323,10 +422,7 @@ impl Runner {
             return Err(BuildCancelled.into());
         }
         let (reader, writer) = std::io::pipe().context("Could not create a pipe")?;
-        cmd.stdin(Stdio::null())
-            .stdout(writer.try_clone().context("Could not duplicate a pipe")?)
-            .stderr(writer)
-            .process_group(0);
+        cmd.stdin(Stdio::null()).stdout(writer.try_clone().context("Could not duplicate a pipe")?).stderr(writer).process_group(0);
         let mut child = cmd.spawn().with_context(|| format!("Could not start {what}"))?;
         // The Command holds the pipe's write end: drop it, or the read below
         // never sees the end of the output.
@@ -381,10 +477,14 @@ pub fn module_count(config: &str) -> usize {
 fn debug_info_args() -> (Vec<&'static str>, &'static str) {
     (
         vec![
-            "--disable", "DEBUG_INFO_DWARF5",
-            "--disable", "DEBUG_INFO_DWARF4",
-            "--disable", "DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT",
-            "--enable", "DEBUG_INFO_NONE",
+            "--disable",
+            "DEBUG_INFO_DWARF5",
+            "--disable",
+            "DEBUG_INFO_DWARF4",
+            "--disable",
+            "DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT",
+            "--enable",
+            "DEBUG_INFO_NONE",
         ],
         "turned off (half the build time and a sixth of the disk space; this also turns off BTF)",
     )
@@ -498,9 +598,7 @@ pub fn dir_size(path: &Path) -> u64 {
     if !meta.is_dir() {
         return meta.len();
     }
-    std::fs::read_dir(path)
-        .map(|rd| rd.flatten().map(|e| dir_size(&e.path())).sum())
-        .unwrap_or(0)
+    std::fs::read_dir(path).map(|rd| rd.flatten().map(|e| dir_size(&e.path())).sum()).unwrap_or(0)
 }
 
 /// Remove everything in the build root (a failed or cancelled earlier
@@ -583,8 +681,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     }
 
     r.stage(Stage::Configure);
-    std::fs::copy(base_config, tree.join(".config"))
-        .with_context(|| format!("Could not copy {}", base_config.display()))?;
+    std::fs::copy(base_config, tree.join(".config")).with_context(|| format!("Could not copy {}", base_config.display()))?;
     let base = std::fs::read_to_string(tree.join(".config"))?;
     let base_rust = config_value(&base, "RUST").as_deref() == Some("y");
 
@@ -684,19 +781,13 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     if base_rust && config_value(&config, "RUST").is_none() && !fixes.iter().any(|f| f.starts_with("CONFIG_RUST")) {
         notes.push("CONFIG_RUST was turned off by the kernel's own dependency rules during olddefconfig.".into());
     }
-    let off: Vec<&str> = MOK_TRUST_SYMBOLS
-        .iter()
-        .copied()
-        .filter(|s| config_value(&config, s).as_deref() != Some("y"))
-        .collect();
+    let off: Vec<&str> = MOK_TRUST_SYMBOLS.iter().copied().filter(|s| config_value(&config, s).as_deref() != Some("y")).collect();
     if !off.is_empty() {
-        notes.push(format!(
-            "CONFIG_{} is off: under Secure Boot this kernel would not load DKMS modules signed with your MOK key.",
-            off.join(", CONFIG_")
-        ));
+        notes.push(format!("CONFIG_{} is off: under Secure Boot this kernel would not load DKMS modules signed with your MOK key.", off.join(", CONFIG_")));
     }
     if config_value(&config, "INTEGRITY_CA_MACHINE_KEYRING").as_deref() == Some("y") {
-        notes.push("CONFIG_INTEGRITY_CA_MACHINE_KEYRING is on: only CA keys from the MOK list are trusted, so a DKMS key that is not a CA would not be.".into());
+        notes
+            .push("CONFIG_INTEGRITY_CA_MACHINE_KEYRING is on: only CA keys from the MOK list are trusted, so a DKMS key that is not a CA would not be.".into());
     }
 
     let mut c = make(tree, ccache);
@@ -1135,7 +1226,11 @@ mod tests {
             assert!(!valid_release(bad), "{bad}");
         }
         let h = "a".repeat(64);
-        let m = parse_manifest(&format!("{h}  linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb\n{}  linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb\n", "B".repeat(64))).unwrap();
+        let m = parse_manifest(&format!(
+            "{h}  linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb\n{}  linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb\n",
+            "B".repeat(64)
+        ))
+        .unwrap();
         assert_eq!(m.len(), 2);
         assert_eq!(m["linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb"], "b".repeat(64));
         assert_eq!(parse_manifest(&manifest_text(&m)).unwrap(), m);
@@ -1157,7 +1252,15 @@ mod tests {
             ccache: true,
         };
         let t = s.text();
-        for want in ["7.2.12-kernelpop", "Match this system", "/boot/config-7.2.6-070206-generic", "-kernelpop", "LOCALVERSION set", "CONFIG_RUST turned off", "ccache: used"] {
+        for want in [
+            "7.2.12-kernelpop",
+            "Match this system",
+            "/boot/config-7.2.6-070206-generic",
+            "-kernelpop",
+            "LOCALVERSION set",
+            "CONFIG_RUST turned off",
+            "ccache: used",
+        ] {
             assert!(t.contains(want), "{want} missing from {t}");
         }
     }
@@ -1187,7 +1290,10 @@ mod tests {
         std::fs::create_dir_all(&set).unwrap();
         std::fs::write(set.join("linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb"), b"image").unwrap();
         let mut m = BTreeMap::new();
-        m.insert("linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb".to_string(), crate::download::sha256_file(&set.join("linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb")).unwrap());
+        m.insert(
+            "linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb".to_string(),
+            crate::download::sha256_file(&set.join("linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb")).unwrap(),
+        );
         std::fs::write(set.join(MANIFEST), manifest_text(&m)).unwrap();
         std::fs::write(set.join(BUILD_INFO), "kernel: 7.2.12-kernelpop\nsignature: verified: signed by X\n").unwrap();
         // A half-published set (no manifest) and a stray file are not sets.
@@ -1225,7 +1331,8 @@ mod tests {
             modules: 1,
             ccache: false,
         };
-        let request = BuildRequest { tarball, trust: SourceTrust::Unverified { reason: "test".into() }, mode: ConfigMode::MatchSystem, running_kernel: "x".into() };
+        let request =
+            BuildRequest { tarball, trust: SourceTrust::Unverified { reason: "test".into() }, mode: ConfigMode::MatchSystem, running_kernel: "x".into() };
         let p = Prepared { request, tree: tree.clone(), summary, log: log.clone() };
         let runner = Runner { events: Arc::new(|_| {}), log: Mutex::new(std::fs::File::create(d.join("runner.log")).unwrap()), control: BuildControl::new() };
         let out = d.join("linux-7.2.12-kernelpop");

@@ -139,11 +139,7 @@ pub fn health_summary(kernels: &[InstalledKernel]) -> Option<String> {
     if problems.is_empty() {
         return None;
     }
-    let advice = if kernels.iter().any(|k| !k.has_initrd || !k.has_modules) {
-        " — do not reboot into it."
-    } else {
-        "."
-    };
+    let advice = if kernels.iter().any(|k| !k.has_initrd || !k.has_modules) { " — do not reboot into it." } else { "." };
     Some(format!("A kernel in /boot is {}{advice} See System tab.", problems.join(" or ")))
 }
 
@@ -155,7 +151,9 @@ pub fn health_summary(kernels: &[InstalledKernel]) -> Option<String> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bootloader {
     Grub,
-    SystemdBoot { esp: String },
+    SystemdBoot {
+        esp: String,
+    },
     /// Pop!_OS: kernelstub manages systemd-boot with Pop_OS-current.conf
     /// rather than one entry per kernel version.
     Kernelstub,
@@ -183,11 +181,7 @@ pub fn detect_bootloader() -> Bootloader {
 }
 
 fn command_exists(name: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {name}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Command::new("sh").args(["-c", &format!("command -v {name}")]).output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// Which ESP file kernelstub keeps for `version`: it copies only the kernel
@@ -198,10 +192,7 @@ fn command_exists(name: &str) -> bool {
 pub fn kernelstub_slot(version: &str, root: &Path, boot: &Path) -> Option<&'static str> {
     let base = if root.join("vmlinuz").is_symlink() { root } else { boot };
     let points_at = |link: &str| {
-        std::fs::read_link(base.join(link))
-            .ok()
-            .and_then(|t| t.file_name().map(|n| n.to_string_lossy() == format!("vmlinuz-{version}")))
-            .unwrap_or(false)
+        std::fs::read_link(base.join(link)).ok().and_then(|t| t.file_name().map(|n| n.to_string_lossy() == format!("vmlinuz-{version}"))).unwrap_or(false)
     };
     if points_at("vmlinuz") {
         Some("vmlinuz.efi")
@@ -219,12 +210,14 @@ pub fn kernelstub_slot(version: &str, root: &Path, boot: &Path) -> Option<&'stat
 fn kernelstub_entry(version: &str, root: &Path, boot: &Path, efi_dirs: &[&Path]) -> BootEntry {
     let Some(slot) = kernelstub_slot(version, root, boot) else { return BootEntry::NotKept };
     let present = efi_dirs.iter().any(|dir| match std::fs::read_dir(dir) {
-        Ok(entries) => entries.flatten().any(|e| {
-            e.file_name().to_str().is_some_and(|n| n.starts_with("Pop_OS-")) && e.path().join(slot).exists()
-        }),
+        Ok(entries) => entries.flatten().any(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("Pop_OS-")) && e.path().join(slot).exists()),
         Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
     });
-    if present { BootEntry::Present } else { BootEntry::Missing }
+    if present {
+        BootEntry::Present
+    } else {
+        BootEntry::Missing
+    }
 }
 
 /// Whether a systemd-boot entry file belongs to exactly `version`, the same
@@ -232,11 +225,7 @@ fn kernelstub_entry(version: &str, root: &Path, boot: &Path, efi_dirs: &[&Path])
 /// name ("<token>-<version>.conf", "+<tries>" boot counter allowed).
 fn sdboot_entry_matches(name: &str, content: Option<&str>, version: &str) -> bool {
     if let Some(text) = content {
-        if text.lines().any(|l| {
-            l.trim_end_matches('\r')
-                .strip_prefix("version")
-                .is_some_and(|rest| rest.starts_with([' ', '\t']) && rest.trim() == version)
-        }) {
+        if text.lines().any(|l| l.trim_end_matches('\r').strip_prefix("version").is_some_and(|rest| rest.starts_with([' ', '\t']) && rest.trim() == version)) {
             return true;
         }
     }
@@ -264,21 +253,14 @@ fn boot_entry(version: &str, bootloader: &Bootloader) -> BootEntry {
     let present = |yes: bool| if yes { BootEntry::Present } else { BootEntry::Missing };
     match bootloader {
         Bootloader::Unknown => BootEntry::Present,
-        Bootloader::Kernelstub => kernelstub_entry(
-            version,
-            Path::new("/"),
-            Path::new("/boot"),
-            &[Path::new("/boot/efi/EFI"), Path::new("/boot/EFI")],
-        ),
+        Bootloader::Kernelstub => kernelstub_entry(version, Path::new("/"), Path::new("/boot"), &[Path::new("/boot/efi/EFI"), Path::new("/boot/EFI")]),
         Bootloader::Grub => present(grub_cfg_mentions(version)),
         Bootloader::SystemdBoot { esp } => {
             let entries_dir = format!("{esp}/loader/entries");
             present(match std::fs::read_dir(&entries_dir) {
                 Ok(entries) => entries.flatten().any(|e| {
                     let content = std::fs::read_to_string(e.path()).ok();
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| sdboot_entry_matches(n, content.as_deref(), version))
+                    e.file_name().to_str().is_some_and(|n| sdboot_entry_matches(n, content.as_deref(), version))
                 }),
                 // The ESP is often mounted readable by root only.
                 Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
@@ -354,10 +336,7 @@ pub enum KeyEnrollment {
 
 /// Lowercase hex digits only: "AB:cd:01" -> "abcd01".
 fn normalize_fingerprint(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
+    s.chars().filter(|c| c.is_ascii_hexdigit()).map(|c| c.to_ascii_lowercase()).collect()
 }
 
 /// Parse `openssl x509 -noout -fingerprint -sha1` ("SHA1 Fingerprint=AB:CD:…"
@@ -377,10 +356,7 @@ pub fn parse_openssl_fingerprint(text: &str) -> Option<String> {
 /// boot, revoked, replaced by other means): the list is stale and empty.
 pub fn parse_pending_list(text: &str, moknew_size: Option<u64>) -> Vec<String> {
     let mut lines = text.lines();
-    let recorded = lines
-        .next()
-        .and_then(|l| l.trim().strip_prefix("moknew-size "))
-        .and_then(|n| n.trim().parse::<u64>().ok());
+    let recorded = lines.next().and_then(|l| l.trim().strip_prefix("moknew-size ")).and_then(|n| n.trim().parse::<u64>().ok());
     if recorded.is_none() || recorded != moknew_size {
         return vec![];
     }
@@ -390,11 +366,7 @@ pub fn parse_pending_list(text: &str, moknew_size: Option<u64>) -> Vec<String> {
 /// `pending` is whether the key is waiting in an enrollment request (see
 /// `key_pending`); `--test-key` reports that too, but only when run as root.
 /// Enrolled wins: a key enrolled at boot may still be on a list.
-pub fn combine_kernel_signing(
-    key_present: bool,
-    test_key: Option<TestKey>,
-    pending: bool,
-) -> KernelSigning {
+pub fn combine_kernel_signing(key_present: bool, test_key: Option<TestKey>, pending: bool) -> KernelSigning {
     match (key_present, test_key, pending) {
         (false, _, _) => KernelSigning::NoKey,
         (true, Some(TestKey::Enrolled), _) => KernelSigning::Enrolled,
@@ -411,9 +383,7 @@ fn key_files_present(dir: &Path) -> bool {
 }
 
 fn stdout_of(cmd: &mut Command) -> Option<String> {
-    cmd.output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string())
 }
 
 /// The enrollment request shim reads at boot, and the shared list of what
@@ -423,12 +393,8 @@ const MOK_PENDING_LIST: &str = "/var/lib/mok-pending/list";
 const DKMS_MOK_DER: &str = "/var/lib/shim-signed/mok/MOK.der";
 
 fn cert_fingerprint(der: &Path) -> Option<String> {
-    stdout_of(
-        Command::new("openssl")
-            .args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"])
-            .arg(der),
-    )
-    .and_then(|t| parse_openssl_fingerprint(&t))
+    stdout_of(Command::new("openssl").args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"]).arg(der))
+        .and_then(|t| parse_openssl_fingerprint(&t))
 }
 
 /// Whether the certificate is waiting in the enrollment request: a request
@@ -513,14 +479,9 @@ pub fn parse_distro_signed(text: &str) -> HashSet<String> {
 }
 
 fn distro_signed_kernels() -> HashSet<String> {
-    stdout_of(Command::new("dpkg-query").args([
-        "-W",
-        "-f",
-        "${db:Status-Abbrev}\t${Package}\t${source:Package}\n",
-        "linux-image-*",
-    ]))
-    .map(|t| parse_distro_signed(&t))
-    .unwrap_or_default()
+    stdout_of(Command::new("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${source:Package}\n", "linux-image-*"]))
+        .map(|t| parse_distro_signed(&t))
+        .unwrap_or_default()
 }
 
 /// Kernel Pop's own signature wins (it is what the Sign button is about);
@@ -576,20 +537,12 @@ fn detect_secure_boot() -> SecureBoot {
     }
     let efi = std::fs::read_dir("/sys/firmware/efi/efivars")
         .ok()
-        .and_then(|entries| {
-            entries.flatten().find(|e| {
-                e.file_name().to_str().is_some_and(|n| n.starts_with("SecureBoot-"))
-            })
-        })
+        .and_then(|entries| entries.flatten().find(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("SecureBoot-"))))
         .and_then(|e| std::fs::read(e.path()).ok())
         .map(|raw| parse_secureboot_efivar(&raw))
         .unwrap_or(SecureBoot::Unknown);
     // mokutil may be missing; that is fine.
-    let mokutil = Command::new("mokutil")
-        .arg("--sb-state")
-        .output()
-        .ok()
-        .map(|o| parse_mokutil_sb_state(&String::from_utf8_lossy(&o.stdout)));
+    let mokutil = Command::new("mokutil").arg("--sb-state").output().ok().map(|o| parse_mokutil_sb_state(&String::from_utf8_lossy(&o.stdout)));
     combine_secure_boot(efi, mokutil)
 }
 
@@ -690,10 +643,7 @@ pub fn install_warnings(info: &SystemInfo) -> Vec<String> {
 
 /// Leading numeric components of a version string, for newest-first sorting.
 fn version_key(version: &str) -> Vec<u32> {
-    version
-        .split(|c: char| !c.is_ascii_digit())
-        .filter_map(|s| s.parse().ok())
-        .collect()
+    version.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse().ok()).collect()
 }
 
 /// Kernels that can be removed to keep only the newest `keep` (at least 1).
@@ -701,30 +651,17 @@ fn version_key(version: &str) -> Vec<u32> {
 pub fn prune_candidates(kernels: &[InstalledKernel], keep: usize) -> Vec<String> {
     let mut sorted: Vec<&InstalledKernel> = kernels.iter().collect();
     sorted.sort_by_key(|k| std::cmp::Reverse(version_key(&k.version)));
-    sorted
-        .iter()
-        .skip(keep.max(1))
-        .filter(|k| !k.running)
-        .map(|k| k.version.clone())
-        .collect()
+    sorted.iter().skip(keep.max(1)).filter(|k| !k.running).map(|k| k.version.clone()).collect()
 }
 
 /// uname -r
 fn get_running_kernel() -> String {
-    Command::new("uname")
-        .arg("-r")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+    Command::new("uname").arg("-r").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Every vmlinuz-* in /boot, with initrd and modules presence checks.
 /// Sorted newest-looking first, with the running kernel pinned to the top.
-fn get_installed_kernels(
-    running: &str,
-    bootloader: &Bootloader,
-    signing_key_present: bool,
-) -> Vec<InstalledKernel> {
+fn get_installed_kernels(running: &str, bootloader: &Bootloader, signing_key_present: bool) -> Vec<InstalledKernel> {
     let mut kernels = vec![];
     let distro_signed = if signing_key_present { distro_signed_kernels() } else { HashSet::new() };
 
@@ -743,33 +680,20 @@ fn get_installed_kernels(
             has_modules,
             boot_entry: boot_entry(version, bootloader),
             running: version == running,
-            signed: signing_key_present.then(|| {
-                classify_signature(
-                    signed_by_kernel_pop(Path::new(SIGNED_DIR), Path::new("/boot"), version),
-                    distro_signed.contains(version),
-                )
-            }),
+            signed: signing_key_present
+                .then(|| classify_signature(signed_by_kernel_pop(Path::new(SIGNED_DIR), Path::new("/boot"), version), distro_signed.contains(version))),
         });
     }
 
-    kernels.sort_by(|a, b| {
-        b.running
-            .cmp(&a.running)
-            .then_with(|| version_key(&b.version).cmp(&version_key(&a.version)))
-    });
+    kernels.sort_by(|a, b| b.running.cmp(&a.running).then_with(|| version_key(&b.version).cmp(&version_key(&a.version))));
     kernels
 }
 
 /// Free space at a mount point via df -B1.
 fn get_free_disk(path: &str) -> Option<u64> {
-    let out = Command::new("df")
-        .args(["-B1", "--output=avail", path])
-        .output()
-        .ok()?;
+    let out = Command::new("df").args(["-B1", "--output=avail", path]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .nth(1)
-        .and_then(|l| l.trim().parse::<u64>().ok())
+    text.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok())
 }
 
 /// Free space / should have for a kernel install (bytes).
@@ -792,32 +716,35 @@ pub fn format_bytes(b: u64) -> String {
 /// string like "7.1.3". Returns Newer/Same/Older from the candidate's
 /// point of view, for the version badge.
 #[derive(PartialEq)]
-pub enum VersionRelation { Newer, Same, Older, Unknown }
+pub enum VersionRelation {
+    Newer,
+    Same,
+    Older,
+    Unknown,
+}
 
 pub fn compare_to_running(running: &str, candidate: &str) -> VersionRelation {
     // Running looks like "7.1.3-070103-generic" or "7.0.0-27-generic";
     // candidate may be a plain "7.1.3" or an RC like "7.2-rc1" — either way
     // the leading dotted-numeric part is what's comparable.
-    let head = |s: &str| -> String {
-        s.chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect()
-    };
-    let parse = |s: &str| -> Vec<u32> {
-        s.split('.').filter_map(|x| x.parse().ok()).collect()
-    };
+    let head = |s: &str| -> String { s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect() };
+    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|x| x.parse().ok()).collect() };
     let mut rv = parse(&head(running));
     let mut cv = parse(&head(candidate));
     if rv.is_empty() || cv.is_empty() {
         return VersionRelation::Unknown;
     }
     // Normalize lengths so "7.1" and "7.1.0" compare as equal.
-    while rv.len() < 3 { rv.push(0); }
-    while cv.len() < 3 { cv.push(0); }
+    while rv.len() < 3 {
+        rv.push(0);
+    }
+    while cv.len() < 3 {
+        cv.push(0);
+    }
     match cv.cmp(&rv) {
         std::cmp::Ordering::Greater => VersionRelation::Newer,
-        std::cmp::Ordering::Equal   => VersionRelation::Same,
-        std::cmp::Ordering::Less    => VersionRelation::Older,
+        std::cmp::Ordering::Equal => VersionRelation::Same,
+        std::cmp::Ordering::Less => VersionRelation::Older,
     }
 }
 
@@ -840,14 +767,7 @@ mod tests {
     }
 
     fn kernel(version: &str, running: bool) -> InstalledKernel {
-        InstalledKernel {
-            version: version.into(),
-            has_initrd: true,
-            has_modules: true,
-            boot_entry: BootEntry::Present,
-            running,
-            signed: None,
-        }
+        InstalledKernel { version: version.into(), has_initrd: true, has_modules: true, boot_entry: BootEntry::Present, running, signed: None }
     }
 
     #[test]
@@ -860,35 +780,20 @@ mod tests {
             ),
             Some(TestKey::NotEnrolled)
         );
-        assert_eq!(
-            parse_mokutil_test_key("/var/lib/kernel-pop/mok/signing.der is already enrolled\n", true),
-            Some(TestKey::Enrolled)
-        );
-        assert_eq!(
-            parse_mokutil_test_key("signing.der is already in the enrollment request\n", true),
-            Some(TestKey::Pending)
-        );
+        assert_eq!(parse_mokutil_test_key("/var/lib/kernel-pop/mok/signing.der is already enrolled\n", true), Some(TestKey::Enrolled));
+        assert_eq!(parse_mokutil_test_key("signing.der is already in the enrollment request\n", true), Some(TestKey::Pending));
         // On an EFI machine this means efivarfs is not mounted; without EFI
         // firmware there is simply nothing to read.
-        assert_eq!(
-            parse_mokutil_test_key("EFI variables are not supported on this system\n", true),
-            Some(TestKey::EfiVarsNotMounted)
-        );
+        assert_eq!(parse_mokutil_test_key("EFI variables are not supported on this system\n", true), Some(TestKey::EfiVarsNotMounted));
         assert_eq!(parse_mokutil_test_key("EFI variables are not supported on this system\n", false), None);
         assert_eq!(parse_mokutil_test_key("", true), None);
     }
 
     #[test]
     fn fingerprint_and_pending_list_parsing() {
-        let fp = parse_openssl_fingerprint(
-            "SHA1 Fingerprint=76:A0:9A:00:72:12:89:2F:0F:A8:D2:C5:1E:B6:D0:C8:F4:2A:C6:4D\n",
-        )
-        .unwrap();
+        let fp = parse_openssl_fingerprint("SHA1 Fingerprint=76:A0:9A:00:72:12:89:2F:0F:A8:D2:C5:1E:B6:D0:C8:F4:2A:C6:4D\n").unwrap();
         assert_eq!(fp, "76a09a007212892f0fa8d2c51eb6d0c8f42ac64d");
-        assert_eq!(
-            parse_openssl_fingerprint("sha1 Fingerprint=76:a0:9a:00:72:12:89:2f:0f:a8:d2:c5:1e:b6:d0:c8:f4:2a:c6:4d"),
-            Some(fp.clone())
-        );
+        assert_eq!(parse_openssl_fingerprint("sha1 Fingerprint=76:a0:9a:00:72:12:89:2f:0f:a8:d2:c5:1e:b6:d0:c8:f4:2a:c6:4d"), Some(fp.clone()));
         assert_eq!(parse_openssl_fingerprint("Could not open file\n"), None);
         assert_eq!(parse_openssl_fingerprint("SHA1 Fingerprint=AB:CD\n"), None);
 
@@ -1114,14 +1019,8 @@ mod tests {
     fn mokutil_parsing() {
         assert_eq!(parse_mokutil_sb_state("SecureBoot enabled\n"), SecureBoot::Enabled);
         assert_eq!(parse_mokutil_sb_state("SecureBoot disabled\n"), SecureBoot::Disabled);
-        assert_eq!(
-            parse_mokutil_sb_state("SecureBoot enabled\nSecureBoot validation is disabled in shim\n"),
-            SecureBoot::Disabled
-        );
-        assert_eq!(
-            parse_mokutil_sb_state("This system doesn't support Secure Boot\n"),
-            SecureBoot::Unknown
-        );
+        assert_eq!(parse_mokutil_sb_state("SecureBoot enabled\nSecureBoot validation is disabled in shim\n"), SecureBoot::Disabled);
+        assert_eq!(parse_mokutil_sb_state("This system doesn't support Secure Boot\n"), SecureBoot::Unknown);
         assert_eq!(parse_mokutil_sb_state(""), SecureBoot::Unknown);
     }
 
@@ -1158,12 +1057,8 @@ mod tests {
 
     #[test]
     fn prune_keeps_newest_and_running() {
-        let ks = vec![
-            kernel("6.8.0-45-generic", true),
-            kernel("7.1.3-070103-generic", false),
-            kernel("6.10.0-9-generic", false),
-            kernel("6.5.0-1-generic", false),
-        ];
+        let ks =
+            vec![kernel("6.8.0-45-generic", true), kernel("7.1.3-070103-generic", false), kernel("6.10.0-9-generic", false), kernel("6.5.0-1-generic", false)];
         // keep 2: newest two are 7.1.3 and 6.10.0; running 6.8.0 is spared
         assert_eq!(prune_candidates(&ks, 2), vec!["6.5.0-1-generic".to_string()]);
         // keep 1: only the newest is kept besides the running kernel

@@ -95,12 +95,7 @@ pub fn parse_makefile(text: &str) -> Result<SourceVersion> {
     if !extraversion.chars().all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c)) {
         bail!("the Makefile's EXTRAVERSION '{extraversion}' has characters a kernel version cannot use");
     }
-    Ok(SourceVersion {
-        version: number("VERSION")?,
-        patchlevel: number("PATCHLEVEL")?,
-        sublevel: number("SUBLEVEL")?,
-        extraversion,
-    })
+    Ok(SourceVersion { version: number("VERSION")?, patchlevel: number("PATCHLEVEL")?, sublevel: number("SUBLEVEL")?, extraversion })
 }
 
 /// A kernel source tarball that has been looked into.
@@ -140,8 +135,7 @@ pub fn inspect(path: &Path) -> Result<Tarball> {
     let mut head = [0u8; 6];
     let mut f = std::fs::File::open(path).with_context(|| format!("Could not open {}", path.display()))?;
     let n = f.read(&mut head).with_context(|| format!("Could not read {}", path.display()))?;
-    let compression = Compression::from_magic(&head[..n])
-        .with_context(|| format!("{} is not an xz or gzip compressed tarball", path.display()))?;
+    let compression = Compression::from_magic(&head[..n]).with_context(|| format!("{} is not an xz or gzip compressed tarball", path.display()))?;
     drop(f);
 
     let mut child = compression
@@ -175,20 +169,13 @@ pub fn private_copy_in(t: &Tarball, dir: &Path) -> Result<Tarball> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if let (Ok(src), Ok(d)) = (t.path.canonicalize(), dir.canonicalize()) {
         if src.starts_with(&d) {
-            bail!(
-                "{} is already Kernel Pop's private copy; choose the original tarball instead",
-                t.path.display()
-            );
+            bail!("{} is already Kernel Pop's private copy; choose the original tarball instead", t.path.display());
         }
     }
     if dir.exists() {
         std::fs::remove_dir_all(dir).with_context(|| format!("Could not clear {}", dir.display()))?;
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("Could not create {}", dir.display()))?;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("Could not create {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let name = t.origin.file_name().context("the tarball has no file name")?;
     let copy = dir.join(name);
@@ -209,12 +196,7 @@ pub fn private_copy(t: &Tarball) -> Result<Tarball> {
 /// Check that every member of the tarball is under its one top-level
 /// directory (the extraction strips that directory), by listing it in full.
 pub fn check_single_top_dir(t: &Tarball) -> Result<()> {
-    let out = Command::new("tar")
-        .arg("-tf")
-        .arg(&t.path)
-        .stderr(Stdio::null())
-        .output()
-        .context("Could not run tar to list the tarball")?;
+    let out = Command::new("tar").arg("-tf").arg(&t.path).stderr(Stdio::null()).output().context("Could not run tar to list the tarball")?;
     if !out.status.success() {
         bail!("tar could not list {}", t.path.display());
     }
@@ -334,12 +316,7 @@ pub mod tests {
     /// Write `tar` compressed with `prog` (xz or gzip) to `path`.
     pub fn compress_to(prog: &str, tar: &[u8], path: &Path) {
         use std::io::Write;
-        let mut c = Command::new(prog)
-            .arg("-c")
-            .stdin(Stdio::piped())
-            .stdout(std::fs::File::create(path).unwrap())
-            .spawn()
-            .unwrap();
+        let mut c = Command::new(prog).arg("-c").stdin(Stdio::piped()).stdout(std::fs::File::create(path).unwrap()).spawn().unwrap();
         c.stdin.take().unwrap().write_all(tar).unwrap();
         assert!(c.wait().unwrap().success());
     }

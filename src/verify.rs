@@ -41,12 +41,7 @@ pub struct Signer {
 impl Signer {
     /// The fingerprint in groups of four, as signature.html prints them.
     pub fn grouped_fingerprint(&self) -> String {
-        self.fingerprint
-            .as_bytes()
-            .chunks(4)
-            .map(|c| String::from_utf8_lossy(c).into_owned())
-            .collect::<Vec<_>>()
-            .join(" ")
+        self.fingerprint.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -119,20 +114,9 @@ impl ScratchDir {
         use std::os::unix::fs::DirBuilderExt;
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-            nanos
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .with_context(|| format!("Could not create {}", path.display()))?;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed), nanos));
+        std::fs::DirBuilder::new().mode(0o700).create(&path).with_context(|| format!("Could not create {}", path.display()))?;
         Ok(ScratchDir(path))
     }
 
@@ -167,8 +151,7 @@ impl GnupgHome {
     fn locate_keys(&self, addresses: &[&str]) -> Result<String> {
         let mut cmd = self.gpg();
         cmd.args(["--auto-key-locate", "clear,nodefault,wkd", "--locate-keys", "--"]).args(addresses);
-        let out = output_with_timeout(cmd, WKD_TIMEOUT)
-            .context("Could not fetch the kernel.org signing keys (is gnupg installed and the network up?)")?;
+        let out = output_with_timeout(cmd, WKD_TIMEOUT).context("Could not fetch the kernel.org signing keys (is gnupg installed and the network up?)")?;
         Ok(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 
@@ -184,11 +167,7 @@ impl GnupgHome {
     /// The first user ID of the key with this primary fingerprint.
     fn uid_of(&self, fpr: &str) -> Option<String> {
         let out = self.gpg().args(["--with-colons", "--list-keys", fpr]).output().ok()?;
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find(|l| l.starts_with("uid:"))
-            .and_then(|l| l.split(':').nth(9))
-            .map(|s| s.to_string())
+        String::from_utf8_lossy(&out.stdout).lines().find(|l| l.starts_with("uid:")).and_then(|l| l.split(':').nth(9)).map(|s| s.to_string())
     }
 
     fn signer_uid(&self, sig: &Path) -> Option<String> {
@@ -199,13 +178,7 @@ impl GnupgHome {
 
 impl Drop for GnupgHome {
     fn drop(&mut self) {
-        let _ = Command::new("gpgconf")
-            .arg("--homedir")
-            .arg(self.dir.path())
-            .args(["--kill", "all"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = Command::new("gpgconf").arg("--homedir").arg(self.dir.path()).args(["--kill", "all"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 }
 
@@ -274,12 +247,7 @@ pub fn gpgv_tarball(tarball: &Tarball, sig: &Path, keyring: &Path) -> Result<Gpg
     if dec.status.signal() == Some(libc::SIGPIPE) && !matches!(verdict, GpgvVerdict::Good { .. }) {
         return Ok(verdict);
     }
-    Ok(GpgvVerdict::Bad {
-        reason: format!(
-            "the tarball is damaged and could not be decompressed ({})",
-            String::from_utf8_lossy(&dec.stderr).trim()
-        ),
-    })
+    Ok(GpgvVerdict::Bad { reason: format!("the tarball is damaged and could not be decompressed ({})", String::from_utf8_lossy(&dec.stderr).trim()) })
 }
 
 /// Verify a kernel.org tarball against its `.tar.sign`, fetching the
@@ -319,10 +287,9 @@ pub fn verify_tarball(tarball: &Tarball, sig: &Path, log: &dyn Fn(String)) -> Re
             }
             Ok(signer)
         }
-        GpgvVerdict::MissingKey { keyid } => bail!(
-            "The signature was made by key {keyid}, which is not the key kernel.org publishes for {}",
-            SIGNER_ADDRESSES.join(" or ")
-        ),
+        GpgvVerdict::MissingKey { keyid } => {
+            bail!("The signature was made by key {keyid}, which is not the key kernel.org publishes for {}", SIGNER_ADDRESSES.join(" or "))
+        }
         GpgvVerdict::Bad { reason } => bail!("The signature check failed: {reason}"),
     }
 }
@@ -380,13 +347,7 @@ mod tests {
         fn new() -> Self {
             let home = ScratchDir::new("kernel-pop-test-gpg").unwrap();
             let gpg = |args: &[&str]| {
-                let out = Command::new("gpg")
-                    .arg("--homedir")
-                    .arg(home.path())
-                    .args(["--batch", "--no-tty"])
-                    .args(args)
-                    .output()
-                    .unwrap();
+                let out = Command::new("gpg").arg("--homedir").arg(home.path()).args(["--batch", "--no-tty"]).args(args).output().unwrap();
                 assert!(out.status.success(), "gpg {args:?}: {}", String::from_utf8_lossy(&out.stderr));
                 out.stdout
             };
