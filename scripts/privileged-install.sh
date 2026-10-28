@@ -1271,6 +1271,21 @@ shim_sdboot_entries() {
     done < <(efibootmgr 2>/dev/null)
 }
 
+# Copy <src> to <dst> on the ESP unless it is there already. The copy is
+# written next to <dst> and renamed over it, so a full ESP never leaves a
+# truncated loader where a working one was. Non-zero, with a SIGN WARNING,
+# when it failed: nothing that relies on the copy may happen then.
+esp_install() {
+    local src="$1" dst="$2"
+    cmp -s "$src" "$dst" && return 0
+    if mkdir -p "$(dirname "$dst")" && install -p -m 0644 "$src" "$dst.kernel-pop-new" && mv -f "$dst.kernel-pop-new" "$dst"; then
+        return 0
+    fi
+    rm -f "$dst.kernel-pop-new"
+    log "SIGN WARNING: could not copy $src to $dst (is the ESP full?)"
+    return 1
+}
+
 # bootctl (run by every systemd-boot upgrade) re-adds "Linux Boot Manager"
 # and "Fallback Linux Boot Manager", which start systemd-boot without shim
 # and fail with Secure Boot on. Removed only while a shim entry exists.
@@ -1301,8 +1316,8 @@ sign_boot_loader() {
         || ! sbverify --cert "$d/signing.pem" "$src.signed" >/dev/null 2>&1; then
         tmp="$(mktemp "$src.signed.XXXXXX")" || { log "SIGN WARNING: could not create a temp file next to $src"; return 1; }
         if sbsign --key "$d/signing.key" --cert "$d/signing.pem" --output "$tmp" "$src" >>"$LOGFILE" 2>&1 \
-            && sbverify --cert "$d/signing.pem" "$tmp" >/dev/null 2>&1; then
-            chmod 0644 "$tmp" && mv -f "$tmp" "$src.signed"
+            && sbverify --cert "$d/signing.pem" "$tmp" >/dev/null 2>&1 \
+            && chmod 0644 "$tmp" && mv -f "$tmp" "$src.signed"; then
             echo "$want" > "$(sdboot_stamp)"
             log "Signed systemd-boot: $src.signed"
         else
@@ -1314,8 +1329,8 @@ sign_boot_loader() {
     bootctl update --graceful --no-variables >>"$LOGFILE" 2>&1 || true
     # bootctl skips a copy of the same version, so check the one on the ESP.
     if ! sbverify --cert "$d/signing.pem" "$esp/EFI/systemd/systemd-bootx64.efi" >/dev/null 2>&1; then
-        install -D -m 0644 "$src.signed" "$esp/EFI/systemd/systemd-bootx64.efi" \
-            && log "Installed the signed systemd-boot on the ESP"
+        esp_install "$src.signed" "$esp/EFI/systemd/systemd-bootx64.efi" || return 1
+        log "Installed the signed systemd-boot on the ESP"
     fi
     prune_direct_sdboot_entries
 }
@@ -1403,24 +1418,24 @@ setup_shim_chain() {
         fi
     done
     sign_boot_loader || return 1
+    # Every copy must be in place before a firmware entry points at it or the
+    # direct systemd-boot entries go.
     for f in shim fb mm; do
         [[ -f "$lib/${f}x64.efi.signed" ]] || continue
-        cmp -s "$lib/${f}x64.efi.signed" "$esp/EFI/$vendor/${f}x64.efi" \
-            || install -p -D -m 0644 "$lib/${f}x64.efi.signed" "$esp/EFI/$vendor/${f}x64.efi"
+        esp_install "$lib/${f}x64.efi.signed" "$esp/EFI/$vendor/${f}x64.efi" || return 1
     done
     # The fallback path: shim there, and fbx64 recreates the firmware entry
     # from the CSV after a firmware reset. GRUB's CSV passes nothing, which
     # would point shim at GRUB.
-    cmp -s "$lib/shimx64.efi.signed" "$esp/EFI/BOOT/BOOTX64.EFI" \
-        || install -p -D -m 0644 "$lib/shimx64.efi.signed" "$esp/EFI/BOOT/BOOTX64.EFI"
+    esp_install "$lib/shimx64.efi.signed" "$esp/EFI/BOOT/BOOTX64.EFI" || return 1
     if [[ -f "$lib/fbx64.efi.signed" ]]; then
-        cmp -s "$lib/fbx64.efi.signed" "$esp/EFI/BOOT/fbx64.efi" \
-            || install -p -D -m 0644 "$lib/fbx64.efi.signed" "$esp/EFI/BOOT/fbx64.efi"
+        esp_install "$lib/fbx64.efi.signed" "$esp/EFI/BOOT/fbx64.efi" || return 1
     fi
     csv="$esp/EFI/$vendor/BOOTX64.CSV"
     if ! iconv -f UCS-2LE -t UTF-8 "$csv" 2>/dev/null | grep -q 'systemd-bootx64\.efi'; then
         printf 'shimx64.efi,%s,\\EFI\\systemd\\systemd-bootx64.efi \\0,This is the boot entry for %s\n' "$V" "$V" \
-            | iconv -t UCS-2LE > "$csv"
+            | iconv -t UCS-2LE > "$csv" \
+            || { log "SIGN WARNING: could not write $csv"; return 1; }
     fi
     if [[ -z "$(shim_sdboot_entries)" ]]; then
         src="$(findmnt -nvo SOURCE "$esp" 2>/dev/null)"
