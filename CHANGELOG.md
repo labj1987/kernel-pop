@@ -4,6 +4,13 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.1 — 2026-10-28
+
+**Fixed: the firmware entry for shim that Set Up Signing creates had a relative path**
+(`EFI\\ubuntu\\shimx64.efi`, without the leading backslash), which not every firmware boots,
+and setup then reported it could not create the entry. It now uses the full path
+`\\EFI\\ubuntu\\shimx64.efi`, and an entry made with either form is recognized.
+
 ## 2.2.0 — 2026-10-28
 
 **Fixed: machines that boot systemd-boot directly not booting with Secure Boot on.** The

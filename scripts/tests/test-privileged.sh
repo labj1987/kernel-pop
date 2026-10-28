@@ -1048,7 +1048,11 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     # --create adds one, -b N -B removes one.
     efibootmgr() {
         case "$*" in
-            *--create*) echo "create $*" >> "$tmp/fw-calls"; printf 'Boot0007* Ubuntu\tHD(1,GPT,x,0x800,0x219800)/\\EFI\\ubuntu\\shimx64.efi%s\n' "$hex" >> "$st" ;;
+            *--create*)
+                # Like efibootmgr: the loader path as given, "/" turned into "\"
+                echo "create $*" >> "$tmp/fw-calls"
+                local l; l="$(sed -nE 's/.*--loader ([^ ]+).*/\1/p' <<<"$*")"
+                printf 'Boot0007* Ubuntu\tHD(1,GPT,x,0x800,0x219800)/%s%s\n' "${l//\//\\}" "$hex" >> "$st" ;;
             *-B*) local n="${*:3:1}"; echo "delete $n" >> "$tmp/fw-calls"; sed -i "/^Boot$n/d" "$st" ;;
             *) printf 'BootCurrent: 0001\nBootOrder: 0001\n'; cat "$st" ;;
         esac
@@ -1063,6 +1067,9 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     [[ ! -s "$tmp/fw-calls" ]] || bad "Linux Boot Manager must stay while no shim entry exists: $(cat "$tmp/fw-calls")"
     printf 'Boot0005* Ubuntu\tHD(1,GPT,x)/\\EFI\\ubuntu\\shimx64.efi\\EFI\\systemd\\systemd-bootx64.efi \\0\n' >> "$st"
     [[ "$(shim_sdboot_entries)" == 0005 ]] || bad "shim_sdboot_entries should find the text form: [$(shim_sdboot_entries)]"
+    # An entry made with a relative path, as install_shim makes it
+    printf 'Boot0006* Ubuntu\tHD(1,GPT,x)/EFI\\ubuntu\\shimx64.efi%s\n' "$hex" > "$tmp/fw-rel"
+    [[ "$(st="$tmp/fw-rel" shim_sdboot_entries)" == 0006 ]] || bad "shim_sdboot_entries should find a relative path: [$(st="$tmp/fw-rel" shim_sdboot_entries)]"
     prune_direct_sdboot_entries >/dev/null
     [[ "$(cat "$tmp/fw-calls")" == $'delete 0001\ndelete 0002' ]] || bad "prune got [$(cat "$tmp/fw-calls")]"
     grep -q "Windows Boot Manager" "$st" || bad "prune removed another entry"
@@ -1095,7 +1102,7 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     sbverify x "$cesp/EFI/systemd/systemd-bootx64.efi" || bad "the ESP systemd-boot is not signed"
     sbverify x "$KERNEL_POP_SDBOOT.signed" || bad "no signed systemd-boot for bootctl"
     [[ "$(cat "$KERNEL_POP_SDBOOT_STAMP")" == "$(sha256sum "$KERNEL_POP_SDBOOT" | cut -d' ' -f1)" ]] || bad "the stamp does not name the signed binary"
-    grep -qF 'create -q --create --disk /dev/fake --part 1 --loader EFI/ubuntu/shimx64.efi --label Ubuntu --unicode \EFI\systemd\systemd-bootx64.efi \0' "$tmp/fw-calls" \
+    grep -qF 'create -q --create --disk /dev/fake --part 1 --loader \EFI\ubuntu\shimx64.efi --label Ubuntu --unicode \EFI\systemd\systemd-bootx64.efi \0' "$tmp/fw-calls" \
         || bad "efibootmgr --create got [$(cat "$tmp/fw-calls")]"
     grep -q "delete 0001" "$tmp/fw-calls" || bad "the direct systemd-boot entry should go once shim's exists"
     grep -q "apt-get" "$tmp/fw-calls" && bad "apt-get ran although shim-signed is installed"

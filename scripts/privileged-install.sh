@@ -1263,7 +1263,9 @@ shim_sdboot_entries() {
     while IFS= read -r line; do
         [[ "$line" =~ ^Boot([0-9A-Fa-f]{4})\*?[[:space:]] ]] || continue
         lc="${line,,}"
-        [[ "$lc" == *'\efi\'*'\shimx64.efi'* ]] || continue
+        # "\EFI\<vendor>\shimx64.efi", or "EFI\<vendor>\..." from an entry
+        # created with a relative path (Ubuntu's install_shim does that)
+        [[ "$lc" == *'efi\'*'\shimx64.efi'* ]] || continue
         [[ "$lc" == *'systemd-bootx64.efi'* || "$lc" == *"$SDBOOT_HEX"* ]] || continue
         echo "${BASH_REMATCH[1]}"
     done < <(efibootmgr 2>/dev/null)
@@ -1428,7 +1430,9 @@ setup_shim_chain() {
             log "SIGN WARNING: could not tell which disk and partition the ESP ($src) is"
             return 1
         fi
-        efibootmgr -q --create --disk "/dev/$disk" --part "$part" --loader "EFI/$vendor/shimx64.efi" \
+        # An absolute path: a relative one ("EFI/...") is stored without the
+        # leading backslash, which not every firmware boots.
+        efibootmgr -q --create --disk "/dev/$disk" --part "$part" --loader "\\EFI\\$vendor\\shimx64.efi" \
             --label "$V" --unicode '\EFI\systemd\systemd-bootx64.efi \0' >>"$LOGFILE" 2>&1
         [[ -n "$(shim_sdboot_entries)" ]] || { log "SIGN WARNING: could not create the firmware entry for shim"; return 1; }
         log "Created firmware entry \"$V\": shim, which starts systemd-boot (first in the boot order)"
