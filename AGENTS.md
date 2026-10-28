@@ -180,7 +180,13 @@ boots once MOK Manager enrolls it.
   failure stops before any firmware entry change). `sign_boot_loader`
   leaves a `.signed` systemd-boot alone when a package owns it and it
   carries a signature that is not ours (distribution-signed: shim trusts it
-  without enrollment), and only keeps it on the ESP.
+  without enrollment), and only keeps it on the ESP. Set Up Signing first
+  runs `restore_distribution_sdboot` (from `setup_shim_chain`, so after the
+  keys are queued): a `.signed` copy signed with Kernel Pop's key that
+  differs from the md5sum its package recorded (signed over by a release
+  before 2.2.3) gets its package reinstalled, which puts the
+  distribution's copy back. A failed reinstall only logs. Never from the
+  apt hook, which runs inside dpkg.
 - `sync_signed_to_esp` returns non-zero when the ESP copy is not known to
   be signed; `do_install` then calls `esp_copy_unsigned`, which rolls the
   install back with Secure Boot enforcing (a warning with it off), like a

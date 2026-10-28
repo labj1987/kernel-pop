@@ -1236,6 +1236,51 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     cmp -s "$KERNEL_POP_SDBOOT.signed" "$cesp/EFI/systemd/systemd-bootx64.efi" || bad "the ESP does not hold the distribution's signed systemd-boot"
     unset -f dpkg-query
 
+    # An earlier Set Up Signing signed the distribution's .signed copy over
+    # with the Kernel Pop key: the package is reinstalled, which puts the
+    # distribution's copy back, and sign_boot_loader keeps that one.
+    sdpkg=systemd-boot-efi-amd64-signed
+    mkdir -p "$KERNEL_POP_DPKG_ADMIN/info"
+    printf '%s  %s\n' "$(echo distro-signed | md5sum | cut -d' ' -f1)" "${KERNEL_POP_SDBOOT#/}.signed" > "$KERNEL_POP_DPKG_ADMIN/info/$sdpkg.md5sums"
+    printf 'sdboot-distro\nSIGNED\n' > "$KERNEL_POP_SDBOOT.signed"
+    dpkg-query() { [[ "$1" == -S && "$2" == "$KERNEL_POP_SDBOOT.signed" ]] && echo "$sdpkg: $2"; }
+    apt-get() { echo "$*" >> "$tmp/reinstall-calls"; [[ "$*" == *"--reinstall $sdpkg" ]] && echo distro-signed > "$KERNEL_POP_SDBOOT.signed"; }
+    : > "$tmp/reinstall-calls"
+    out="$(restore_distribution_sdboot 2>&1)" || bad "restore_distribution_sdboot failed: $out"
+    grep -qF -- "install -y --reinstall $sdpkg" "$tmp/reinstall-calls" || bad "the package was not reinstalled: [$(cat "$tmp/reinstall-calls")]"
+    [[ "$(cat "$KERNEL_POP_SDBOOT.signed")" == distro-signed ]] || bad "the distribution's signed systemd-boot was not put back"
+    out="$(sign_boot_loader 2>&1)" || bad "sign_boot_loader failed after the reinstall: $out"
+    [[ "$(cat "$KERNEL_POP_SDBOOT.signed")" == distro-signed ]] || bad "sign_boot_loader signed over the reinstalled copy"
+    cmp -s "$KERNEL_POP_SDBOOT.signed" "$cesp/EFI/systemd/systemd-bootx64.efi" || bad "the ESP does not hold the reinstalled systemd-boot"
+    # As the package shipped it, or owned by no package: nothing is reinstalled
+    : > "$tmp/reinstall-calls"
+    restore_distribution_sdboot >/dev/null 2>&1
+    printf 'sdboot-distro\nSIGNED\n' > "$KERNEL_POP_SDBOOT.signed"
+    md5s="$KERNEL_POP_DPKG_ADMIN/info/$sdpkg.md5sums"; cp "$md5s" "$md5s.orig"
+    printf '%s  %s\n' "$(md5sum < "$KERNEL_POP_SDBOOT.signed" | cut -d' ' -f1)" "${KERNEL_POP_SDBOOT#/}.signed" > "$md5s"
+    restore_distribution_sdboot >/dev/null 2>&1
+    mv "$md5s.orig" "$md5s"
+    dpkg-query() { return 1; }
+    restore_distribution_sdboot >/dev/null 2>&1
+    [[ ! -s "$tmp/reinstall-calls" ]] || bad "reinstalled without a modified package copy: [$(cat "$tmp/reinstall-calls")]"
+    # The reinstall fails (no network): Kernel Pop's copy stays, setup goes on
+    dpkg-query() { [[ "$1" == -S && "$2" == "$KERNEL_POP_SDBOOT.signed" ]] && echo "$sdpkg: $2"; }
+    apt-get() { return 100; }
+    out="$(restore_distribution_sdboot 2>&1)" || bad "a failed reinstall failed the setup: $out"
+    grep -q "Could not reinstall $sdpkg" <<<"$out" || bad "a failed reinstall was not reported: $out"
+    [[ "$(tail -1 "$KERNEL_POP_SDBOOT.signed")" == SIGNED ]] || bad "a failed reinstall lost the signed systemd-boot"
+    # setup_shim_chain puts the distribution's copy back before it signs
+    : > "$tmp/chain-order"
+    (
+        restore_distribution_sdboot() { echo restore >> "$tmp/chain-order"; }
+        sign_boot_loader() { echo sign >> "$tmp/chain-order"; return 1; }
+        setup_shim_chain "$cesp" >/dev/null 2>&1
+    )
+    [[ "$(cat "$tmp/chain-order")" == $'restore\nsign' ]] || bad "setup_shim_chain order: [$(cat "$tmp/chain-order")]"
+    unset -f dpkg-query
+    apt-get() { echo "apt-get $*" >> "$tmp/fw-calls"; return 1; }
+    echo distro-signed > "$KERNEL_POP_SDBOOT.signed"
+
     # The hooks setup writes
     install_signing_hooks systemd-boot
     grep -q -- "--sign-boot-loader" "$KERNEL_POP_APT_HOOK" || bad "no apt hook for systemd-boot"
