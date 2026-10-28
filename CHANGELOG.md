@@ -4,6 +4,16 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.4 — 2026-10-28
+
+**Fixed: a systemd-boot signed over by an earlier version stayed that way.** Before 2.2.3, Set
+Up Signing replaced the systemd-boot the distribution ships already signed with a copy signed
+only with Kernel Pop's key, so with Secure Boot on the machine booted only once that key was
+enrolled. Set Up Signing now reinstalls the package that ships it, which puts the distribution's
+signed copy back. If you set up signing on systemd-boot with an earlier version, run Set Up
+Signing once more. If the package cannot be reinstalled (no network, say), setup says so and
+goes on as before.
+
 ## 2.2.3 — 2026-10-28
 
 **Fixed: DKMS modules still not signed after Set Up Signing.** The rebuild put DKMS's stored

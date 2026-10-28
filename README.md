@@ -221,7 +221,8 @@ absent:
 - signs systemd-boot with Kernel Pop's key (the `.signed` copy `bootctl`
   installs, and the copy on the ESP). A `.signed` copy the distribution
   ships and signed itself is left as it is: shim trusts it without the
-  enrollment
+  enrollment. One an earlier version signed over with Kernel Pop's key is
+  put back by reinstalling the package that ships it
 - copies shim, MOK Manager and the fallback loader to the ESP, puts shim at
   the fallback path `EFI/BOOT/BOOTX64.EFI`, and writes the `BOOTX64.CSV`
   that restores the entry after a firmware reset
