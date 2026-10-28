@@ -644,7 +644,8 @@ sign_kernel() {
 # After a kernel in /boot was signed, refresh the copy the boot loader really
 # loads. GRUB reads /boot directly. systemd-boot and kernelstub got the
 # unsigned image copied to the ESP by the dpkg postinst hook, so re-run the
-# sync and check the ESP copy. Best effort: problems are SIGN WARNINGs only.
+# sync and check the ESP copy. Problems are SIGN WARNINGs; returns non-zero
+# when the copy the boot loader loads is not known to be signed.
 #
 # kernelstub only keeps the current and the previous kernel on the ESP, so a
 # kernel that is neither has no ESP copy: nothing to refresh or check. Bare
@@ -657,7 +658,7 @@ sync_signed_to_esp() {
         systemd-boot)
             if ! command -v kernel-install >/dev/null 2>&1; then
                 log "SIGN WARNING: kernel-install not found — the ESP copy of $kver was not refreshed and is still unsigned"
-                return 0
+                return 1
             fi
             # The initrd is passed explicitly: on initramfs-tools systems
             # kernel-install does not find it itself, and the refreshed entry
@@ -666,7 +667,7 @@ sync_signed_to_esp() {
             [[ -f "$boot/initrd.img-$kver" ]] && initrd=("$boot/initrd.img-$kver")
             if ! kernel-install add "$kver" "$boot/vmlinuz-$kver" "${initrd[@]}" >>"$LOGFILE" 2>&1; then
                 log "SIGN WARNING: kernel-install add failed for $kver — the ESP copy may still be unsigned"
-                return 0
+                return 1
             fi
             ;;
         kernelstub)
@@ -677,7 +678,7 @@ sync_signed_to_esp() {
             fi
             if ! kernelstub >>"$LOGFILE" 2>&1; then
                 log "SIGN WARNING: kernelstub failed — the ESP copy of $kver ($slot) may still be unsigned"
-                return 0
+                return 1
             fi
             ;;
         *)
@@ -687,10 +688,12 @@ sync_signed_to_esp() {
     img="$(esp_image_for_kver "$bl" "$esp" "$kver")"
     if [[ -z "$img" || ! -f "$img" ]]; then
         log "SIGN WARNING: could not find the ESP kernel image for $kver to check its signature"
+        return 1
     elif sbverify --cert "$(mok_dir)/signing.pem" "$img" >/dev/null 2>&1; then
         log "Verified: ESP copy $img is signed"
     else
         log "SIGN WARNING: the ESP copy $img does not carry the Kernel Pop signature"
+        return 1
     fi
     return 0
 }
@@ -760,6 +763,21 @@ rollback_install() {
     done
     log "Removing the just-installed packages again: ${pkgs[*]}"
     apt_get purge -y "${pkgs[@]}" >>"$LOGFILE" 2>&1
+}
+
+# The kernel in /boot is signed but the copy the boot loader loads from the
+# ESP is not known to be. With Secure Boot enforcing it could not boot, so the
+# install is undone like a failed signing; with it off it is a warning.
+esp_copy_unsigned() {
+    local dir="$1" kver="$2"
+    if secure_boot_enforcing; then
+        if rollback_install "$dir"; then
+            die "$kver was signed, but the copy on the ESP the boot loader starts is not (see the SIGN WARNING above). With Secure Boot enforcing it could not boot, so it was removed again. Nothing is left installed."
+        fi
+        die "$kver's ESP copy is not signed and it could not be removed again — it will NOT boot while Secure Boot is enforcing. Remove it on the System tab before rebooting."
+    fi
+    SIGN_FAILED=$((SIGN_FAILED + 1))
+    log "$kver is installed, but its ESP copy is not signed: it boots only while Secure Boot is off"
 }
 
 # MOK Manager takes 8-16 characters, typed on a US keyboard layout at boot.
@@ -1040,7 +1058,7 @@ do_install() {
                 efi_img="$(esp_image_for_kver kernelstub "$esp" "$kver")"
                 [[ -n "$efi_img" ]] || die "No EFI/Pop_OS-*/$slot under $esp after install — kernelstub did not sync. Try 'kernelstub -p' — DO NOT reboot expecting the new kernel"
                 log "Verified: kernelstub image $efi_img exists"
-                if (( signed_now )); then sync_signed_to_esp "$kver"; fi
+                if (( signed_now )) && ! sync_signed_to_esp "$kver"; then esp_copy_unsigned "$dir" "$kver"; fi
             fi
             ;;
         systemd-boot)
@@ -1053,7 +1071,7 @@ do_install() {
             entry="$(sdboot_entry_for_kver "$esp" "$kver")"
             [[ -n "$entry" ]] || die "No systemd-boot entry appeared for $kver in $esp/loader/entries — DO NOT reboot expecting it in the menu"
             log "Verified: boot menu entry $entry exists"
-            if (( signed_now )); then sync_signed_to_esp "$kver"; fi
+            if (( signed_now )) && ! sync_signed_to_esp "$kver"; then esp_copy_unsigned "$dir" "$kver"; fi
             ;;
         grub)
             log "Updating GRUB…"
@@ -1311,6 +1329,18 @@ sign_boot_loader() {
     [[ -f "$src" ]] || { log "SIGN WARNING: $src not found — systemd-boot was not signed"; return 1; }
     esp="$(bootctl --print-esp-path 2>/dev/null)" || esp=""
     [[ -n "$esp" ]] || { log "SIGN WARNING: no ESP found — systemd-boot was not signed"; return 1; }
+    # A .signed copy that a package ships, signed by the distribution: shim
+    # trusts it through its vendor key, with no enrollment. Re-signing the
+    # unsigned binary would make the boot depend on Kernel Pop's key, so it
+    # is left as it is and only kept on the ESP.
+    if [[ -f "$src.signed" ]] && ! sbverify --cert "$d/signing.pem" "$src.signed" >/dev/null 2>&1 \
+        && dpkg-query -S "$src.signed" >/dev/null 2>&1 \
+        && sbverify --list "$src.signed" 2>/dev/null | grep -q '^signature [0-9]'; then
+        bootctl update --graceful --no-variables >>"$LOGFILE" 2>&1 || true
+        esp_install "$src.signed" "$esp/EFI/systemd/systemd-bootx64.efi" || return 1
+        prune_direct_sdboot_entries
+        return 0
+    fi
     want="$(sha256sum "$src" | cut -d' ' -f1)"
     if [[ "$(cat "$(sdboot_stamp)" 2>/dev/null)" != "$want" ]] \
         || ! sbverify --cert "$d/signing.pem" "$src.signed" >/dev/null 2>&1; then
@@ -1398,11 +1428,9 @@ HOOK
 # Put shim in front of systemd-boot on <esp>: shim-signed, the files and the
 # firmware entry systemd-boot's install_shim makes, systemd-boot signed.
 # Returns non-zero when the machine still has no shim entry.
-setup_shim_chain() {
-    local esp="$1" lib vendor V f csv src disk part
+install_shim_packages() {
+    local lib f
     lib="$(shim_lib_dir)"
-    vendor="$(esp_vendor)"
-    V="${vendor^}"
     if [[ ! -f "$lib/shimx64.efi.signed" ]]; then
         if ! dpkg-query -W -f='${Status}' grub-efi-amd64-signed 2>/dev/null | grep -q "install ok installed"; then
             install_shim_placeholder || return 1
@@ -1417,6 +1445,17 @@ setup_shim_chain() {
             ln -s "${f}x64.efi" "$lib/${f}x64.efi.signed"
         fi
     done
+}
+
+# The ESP and firmware side, after install_shim_packages and after the key
+# is queued for enrollment: systemd-boot signed, shim's files, the firmware
+# entry. Returns non-zero when the machine still has no shim entry.
+setup_shim_chain() {
+    local esp="$1" lib vendor V f csv src disk part
+    lib="$(shim_lib_dir)"
+    vendor="$(esp_vendor)"
+    V="${vendor^}"
+    [[ -f "$lib/shimx64.efi.signed" ]] || { log "SIGN WARNING: shim-signed is not installed"; return 1; }
     sign_boot_loader || return 1
     # Every copy must be in place before a firmware entry points at it or the
     # direct systemd-boot entries go.
@@ -1481,8 +1520,14 @@ setup_dkms_key() {
         valid_kver "$k" || continue
         dkms_package_signed "$m" "$v" "$k" "$ids" && continue
         log "Rebuilding $m $v for $k, signed with the DKMS key…"
-        dkms install --force -m "$m" -v "$v" -k "$k" >>"$LOGFILE" 2>&1 \
-            || log "SIGN WARNING: rebuilding $m $v for $k failed — it stays as it was"
+        # install --force alone puts the stored build back unchanged; the
+        # build is what DKMS signs.
+        if ! { dkms build --force -m "$m" -v "$v" -k "$k" >>"$LOGFILE" 2>&1 \
+            && dkms install --force -m "$m" -v "$v" -k "$k" >>"$LOGFILE" 2>&1; }; then
+            log "SIGN WARNING: rebuilding $m $v for $k failed — run 'sudo dkms install --force -m $m -v $v -k $k' before booting $k"
+        elif ! dkms_package_signed "$m" "$v" "$k" "$ids"; then
+            log "SIGN WARNING: $m $v for $k was rebuilt but is still not signed with the DKMS key"
+        fi
     done < <(dkms status 2>/dev/null)
 }
 
@@ -1772,16 +1817,15 @@ do_setup_signing() {
 
     generate_signing_key || die "Could not create the signing key"
 
+    # shim-signed first: it also brings update-secureboot-policy, which makes
+    # the DKMS key. Nothing on the ESP or in the firmware entries changes
+    # before the keys are queued for enrollment.
     read -r bl esp <<< "$(detect_bootloader)"
+    local chain_ok=1
     if [[ "$bl" == systemd-boot ]]; then
-        if setup_shim_chain "$esp"; then
-            log "Boot path: firmware -> shim -> systemd-boot, signed with the Kernel Pop key"
-        else
-            log "SIGN WARNING: shim could not be put in front of systemd-boot (see above). With Secure Boot on, the firmware would refuse systemd-boot and this machine would not boot."
-        fi
+        install_shim_packages || chain_ok=0
     fi
     setup_dkms_key
-    install_signing_hooks "$bl"
 
     while IFS= read -r v; do
         [[ -n "$v" ]] || continue
@@ -1794,7 +1838,7 @@ do_setup_signing() {
             log "Already signed: $v"
             already=$((already + 1))
         elif sign_kernel "$v"; then
-            sync_signed_to_esp "$v"
+            sync_signed_to_esp "$v" || true
             signed=$((signed + 1))
         else
             log "$v could not be signed (see the SIGN WARNING above) — continuing with the rest"
@@ -1804,6 +1848,15 @@ do_setup_signing() {
     log "Kernels: $signed signed now, $already already signed, $failed failed"
 
     queue_key_enrollment "$pw"
+
+    if [[ "$bl" == systemd-boot ]]; then
+        if (( chain_ok )) && setup_shim_chain "$esp"; then
+            log "Boot path: firmware -> shim -> systemd-boot, signed with the Kernel Pop key"
+        else
+            log "SIGN WARNING: shim could not be put in front of systemd-boot (see above). With Secure Boot on, the firmware would refuse systemd-boot and this machine would not boot."
+        fi
+    fi
+    install_signing_hooks "$bl"
     log "==== Kernel signing setup done ===="
 }
 
@@ -1815,7 +1868,7 @@ do_sign() {
     [[ -f "$boot/vmlinuz-$kver" ]] || die "Kernel $kver is not installed (no $boot/vmlinuz-$kver)"
     signing_key_present || die "Kernel signing is not set up — run the signing setup first"
     sign_kernel "$kver" || die "Signing $kver failed — the kernel image was left unchanged"
-    sync_signed_to_esp "$kver"
+    sync_signed_to_esp "$kver" || die "$kver is signed in /boot, but the copy on the ESP that the boot loader starts is not (see the SIGN WARNING above)"
     log "==== Done. Kernel $kver is signed. ===="
 }
 

@@ -172,6 +172,19 @@ boots once MOK Manager enrolls it.
   real modes on a dev machine. CI sets
   `KERNEL_POP_REQUIRE_ALL_TESTS=1`, which turns a skipped test group into
   a failure.
+- Set Up Signing order on systemd-boot: `install_shim_packages`
+  (shim-signed, placeholder, fb/mm links), `setup_dkms_key`, sign kernels,
+  `queue_key_enrollment`, and only then `setup_shim_chain` (ESP and
+  firmware entries) and the hooks: a failed enrollment changes nothing on
+  the ESP. Every ESP copy goes through `esp_install` (temp name + rename;
+  failure stops before any firmware entry change). `sign_boot_loader`
+  leaves a `.signed` systemd-boot alone when a package owns it and it
+  carries a signature that is not ours (distribution-signed: shim trusts it
+  without enrollment), and only keeps it on the ESP.
+- `sync_signed_to_esp` returns non-zero when the ESP copy is not known to
+  be signed; `do_install` then calls `esp_copy_unsigned`, which rolls the
+  install back with Secure Boot enforcing (a warning with it off), like a
+  failed signing.
 - shim in front of systemd-boot (`setup_shim_chain`, from
   `do_setup_signing` when `detect_bootloader` says systemd-boot): the
   layout of Ubuntu's systemd-boot postinst `install_shim` (shim/fb/mm in
@@ -201,7 +214,9 @@ boots once MOK Manager enrolls it.
   --new-key` (installing shim-signed also makes it). Then every installed
   package whose modules (its dkms.conf `BUILT_MODULE_NAME`s under
   `updates/dkms/`) are not signed with that key gets `dkms install
-  --force` (Ubuntu's DKMS signs with it at build time). The check compares
+  --force`, preceded by `dkms build --force` (Ubuntu's DKMS signs with it
+  at build time; `install --force` alone puts the stored, unsigned build
+  back). The check compares
   modinfo's `sig_key` with the cert's serial and subject key identifier,
   never the signer name: `update-secureboot-policy` reuses the same CN for
   every key it makes.

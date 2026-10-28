@@ -838,7 +838,13 @@ EOF2
             else
                 dkms() { return 0; }
             fi
-            detect_bootloader() { echo "grub"; }
+            if [[ -n "${SDBOOT:-}" ]]; then
+                detect_bootloader() { echo "systemd-boot $root/esp"; }
+                sdboot_entry_for_kver() { echo "$root/esp/loader/entries/$2.conf"; }
+                sync_signed_to_esp() { [[ -z "${ESP_UNSIGNED:-}" ]] || { log "SIGN WARNING: the ESP copy of $1 does not carry the Kernel Pop signature"; return 1; }; }
+            else
+                detect_bootloader() { echo "grub"; }
+            fi
             update-grub() { :; }
             grub-editenv() { echo "saved_entry=$(cat "$root/saved")"; }
             grub-set-default() { echo "$1" > "$root/saved"; }
@@ -902,6 +908,20 @@ EOF2
         || bad "the rollback should purge exactly the installed packages, got [$(cat "$root/apt-args" 2>/dev/null)]"
     grep -q "removed again. Nothing is left installed" <<< "$out" || bad "the rollback should be reported: $out"
     [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "a rolled-back install changed the default"
+
+    # systemd-boot, signed in /boot but the ESP copy is not, Secure Boot on:
+    # undone like a failed signing
+    out="$(SDBOOT=1 ESP_UNSIGNED=1 SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled run_install espunsigned)" \
+        && bad "do_install should fail when the ESP copy is unsigned under Secure Boot"
+    [[ "$(cat "$tmp/inst-espunsigned/apt-args" 2>/dev/null)" == "$APT_OPTS purge -y linux-headers-$kv linux-image-$kv" ]] \
+        || bad "an unsigned ESP copy under Secure Boot should be rolled back, got [$(cat "$tmp/inst-espunsigned/apt-args" 2>/dev/null)]"
+    grep -q "copy on the ESP the boot loader starts is not" <<< "$out" || bad "the rollback should say the ESP copy is unsigned: $out"
+    # The same with Secure Boot off: installed, one SIGN WARNING
+    out="$(SDBOOT=1 ESP_UNSIGNED=1 WITH_KEY=1 SIGN_OK=1 run_install espunsigned-off)" || bad "Secure Boot off: an unsigned ESP copy must not fail the install: $out"
+    [[ -e "$tmp/inst-espunsigned-off/apt-args" ]] && bad "Secure Boot off: an unsigned ESP copy must not be rolled back"
+    [[ "$(count 'SIGN WARNING:' "$out")" == 1 ]] || bad "Secure Boot off: one SIGN WARNING for the ESP copy"
+    # Signed in /boot and on the ESP: installed
+    out="$(SDBOOT=1 SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled run_install espsigned)" || bad "a signed ESP copy should install: $out"
 
     # Signing fails with Secure Boot off: kept, one SIGN WARNING, summary not counted
     out="$(WITH_KEY=1 run_install signfail-off)" || bad "do_install (sign fails, Secure Boot off) failed: $out"
@@ -1091,6 +1111,7 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     findmnt() { echo /dev/fake1; }
     lsblk() { case "$*" in *PKNAME*) echo fake ;; *PARTN*) echo " 1" ;; esac; }
     apt-get() { echo "apt-get $*" >> "$tmp/fw-calls"; return 1; }
+    install_shim_packages >/dev/null || bad "install_shim_packages failed"
     out="$(setup_shim_chain "$cesp" 2>&1)" || bad "setup_shim_chain failed: $out"
     for f in shim fb mm; do
         cmp -s "$cesp/EFI/ubuntu/${f}x64.efi" "$lib/${f}x64.efi.signed" || bad "EFI/ubuntu/${f}x64.efi is not shim-signed's"
@@ -1166,16 +1187,21 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     dkms() {
         case "$1" in
             status) printf "nvidia/615.71.09, 7.2.6-070206-generic, x86_64: installed\ngpu-unlock/1.0.0, 7.2.6-070206-generic, x86_64: installed (WARNING! Diff between built and installed module!)\nold/1, 6.1.0-1-generic, x86_64: built\n" ;;
+            # Like DKMS: build signs with the key, install puts the last
+            # build in place (unchanged when nothing was built since)
+            build) echo "dkms $*" >> "$tmp/dkms-calls"; touch "$tmp/dkms-built-$4" ;;
             install)
                 echo "dkms $*" >> "$tmp/dkms-calls"
+                [[ -e "$tmp/dkms-built-$4" ]] || return 0
                 local n; for n in $(sed -nE 's/^BUILT_MODULE_NAME\[[0-9]+\]="?([^"]+)"?$/\1/p' "$KERNEL_POP_DKMS_TREE/$4/$6/source/dkms.conf"); do
                     echo "9B:1B:75:AD" > "$kd/$n.ko.zst"
-                done ;;
+                done
+                rm -f "$tmp/dkms-built-$4" ;;
         esac
     }
     update-secureboot-policy() { [[ "$1" == --new-key ]] && mkdir -p "$tmp/dkms-mok" && touch "$KERNEL_POP_DKMS_MOK"; }
     setup_dkms_key >/dev/null
-    [[ "$(cat "$tmp/dkms-calls")" == $'dkms install --force -m nvidia -v 615.71.09 -k 7.2.6-070206-generic\ndkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
+    [[ "$(cat "$tmp/dkms-calls")" == $'dkms build --force -m nvidia -v 615.71.09 -k 7.2.6-070206-generic\ndkms install --force -m nvidia -v 615.71.09 -k 7.2.6-070206-generic\ndkms build --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic\ndkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
         || bad "DKMS rebuilds got [$(cat "$tmp/dkms-calls")]"
     # All signed with the key now: nothing is rebuilt
     : > "$tmp/dkms-calls"; setup_dkms_key >/dev/null
@@ -1184,10 +1210,31 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     # before it: only that package is rebuilt
     : > "$kd/gpu_unlock.ko.zst"
     : > "$tmp/dkms-calls"; setup_dkms_key >/dev/null
-    [[ "$(cat "$tmp/dkms-calls")" == 'dkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
+    [[ "$(cat "$tmp/dkms-calls")" == $'dkms build --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic\ndkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
         || bad "an unsigned module with an existing key: [$(cat "$tmp/dkms-calls")]"
+    # A rebuild that comes out unsigned anyway is reported
+    : > "$kd/gpu_unlock.ko.zst"
+    dkms() { [[ "$1" == status ]] && echo "gpu-unlock/1.0.0, 7.2.6-070206-generic, x86_64: installed"; return 0; }
+    out="$(setup_dkms_key 2>&1)"
+    grep -q "SIGN WARNING: gpu-unlock 1.0.0 for 7.2.6-070206-generic was rebuilt but is still not signed" <<<"$out" || bad "an unsigned rebuild was not reported: $out"
     export KERNEL_POP_MODULES="$saved_modules"
     unset -f modinfo cert_key_ids
+
+    # A systemd-boot .signed shipped and signed by the distribution: left as
+    # it is (no Kernel Pop signature over it), and that is what goes on the ESP
+    echo distro-signed > "$KERNEL_POP_SDBOOT.signed"
+    echo sdboot-distro > "$KERNEL_POP_SDBOOT"
+    dpkg-query() { [[ "$1" == -S && "$2" == "$KERNEL_POP_SDBOOT.signed" ]]; }
+    sbverify() {
+        case "$1" in
+            --list) [[ "$2" == "$KERNEL_POP_SDBOOT.signed" ]] && echo "signature 1" ;;
+            *) [[ -f "${*: -1}" && "$(tail -1 "${*: -1}")" == SIGNED ]] ;;
+        esac
+    }
+    out="$(sign_boot_loader 2>&1)" || bad "sign_boot_loader failed on a distribution-signed systemd-boot: $out"
+    [[ "$(cat "$KERNEL_POP_SDBOOT.signed")" == distro-signed ]] || bad "the distribution's signed systemd-boot was replaced"
+    cmp -s "$KERNEL_POP_SDBOOT.signed" "$cesp/EFI/systemd/systemd-bootx64.efi" || bad "the ESP does not hold the distribution's signed systemd-boot"
+    unset -f dpkg-query
 
     # The hooks setup writes
     install_signing_hooks systemd-boot
@@ -1196,6 +1243,30 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     sh -n "$KERNEL_POP_KERNEL_HOOK" || bad "the kernel hook is not valid sh"
     exit "$fails"
 ) || { echo "FAIL: shim chain group"; fails=$((fails + 1)); }
+
+# ── Set Up Signing on systemd-boot: keys are queued before the ESP changes ─
+(
+    fails=0
+    order="$tmp/setup-order"; : > "$order"
+    ensure_efivarfs() { :; }
+    missing_signing_packages() { :; }
+    generate_signing_key() { :; }
+    installed_kvers() { :; }
+    detect_bootloader() { echo "systemd-boot $tmp/order-esp"; }
+    install_shim_packages() { echo packages >> "$order"; }
+    setup_dkms_key() { echo dkms >> "$order"; }
+    queue_key_enrollment() { echo queue >> "$order"; }
+    setup_shim_chain() { echo "chain $1" >> "$order"; }
+    install_signing_hooks() { echo "hooks $1" >> "$order"; }
+    printf 'Secret-pw1\n' | do_setup_signing >/dev/null 2>&1 || bad "do_setup_signing failed"
+    [[ "$(tr '\n' '|' < "$order")" == "packages|dkms|queue|chain $tmp/order-esp|hooks systemd-boot|" ]] || bad "setup order got [$(tr '\n' '|' < "$order")]"
+    # A failed enrollment leaves the ESP and the firmware entries alone
+    : > "$order"
+    queue_key_enrollment() { echo queue >> "$order"; die "import failed"; }
+    (printf 'Secret-pw1\n' | do_setup_signing >/dev/null 2>&1) && bad "setup should fail when the enrollment fails"
+    grep -q chain "$order" && bad "the shim chain was set up although the enrollment failed"
+    exit "$fails"
+) || { echo "FAIL: setup order group"; fails=$((fails + 1)); }
 
 # Optional: a real finished build (debs + SHA256SUMS) in
 # $KERNEL_POP_TEST_REAL_DEBS is staged and verified.

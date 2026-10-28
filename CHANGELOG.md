@@ -4,6 +4,30 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.3 — 2026-10-28
+
+**Fixed: DKMS modules still not signed after Set Up Signing.** The rebuild put DKMS's stored
+build back instead of building again, and DKMS signs a module only when it builds it. Setup now
+builds each module again before installing it, checks the result, and says which module is
+still unsigned if a rebuild does not take.
+
+**Fixed: a full ESP could leave a machine without a working boot entry.** When a copy of shim,
+MOK Manager or systemd-boot to the ESP failed, Set Up Signing still created the firmware entry
+and removed the old one. Every copy is now written under a temporary name and renamed, and setup
+stops before changing any firmware entry when one fails.
+
+**Fixed: Set Up Signing changed the boot path before the keys were queued.** If queuing the
+keys for enrollment failed, systemd-boot was already signed with a key that would never be
+enrolled. Setup now queues the keys first and only then changes the ESP and the firmware entries.
+
+**Fixed: a systemd-boot signed by the distribution was signed over.** When the distribution
+ships systemd-boot already signed, shim trusts it without any enrollment; setup now leaves it
+as it is instead of replacing it with a copy that needs Kernel Pop's key.
+
+**Fixed: a kernel whose ESP copy is unsigned is no longer kept with Secure Boot on.** If the
+kernel is signed in /boot but the copy systemd-boot or kernelstub starts from the ESP is not,
+the install is undone, as when signing fails, because that kernel could not boot.
+
 ## 2.2.2 — 2026-10-28
 
 **Fixed: DKMS modules left unsigned by Set Up Signing.** Installing shim creates the DKMS

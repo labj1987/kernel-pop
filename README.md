@@ -199,7 +199,8 @@ refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
    NVIDIA driver is signed with) and any key another app already queued:
    shim keeps one request with one password, so they all go in one request
    under the password you chose here. On a machine with DKMS modules and no
-   DKMS key yet, it creates one and rebuilds the modules signed with it.
+   DKMS key yet, it creates one, and every DKMS module not signed with the
+   DKMS key is rebuilt signed with it.
    On systemd-boot it also puts shim in front of systemd-boot (below).
 2. Reboot. A blue MOK Manager screen appears: choose Enroll MOK, Continue,
    Yes, and type the password once. It enrolls all the keys.
@@ -218,13 +219,18 @@ absent:
   placeholder package, `shim-without-grub`, stands in for the GRUB packages
   shim-signed depends on, so GRUB stays off the machine
 - signs systemd-boot with Kernel Pop's key (the `.signed` copy `bootctl`
-  installs, and the copy on the ESP)
+  installs, and the copy on the ESP). A `.signed` copy the distribution
+  ships and signed itself is left as it is: shim trusts it without the
+  enrollment
 - copies shim, MOK Manager and the fallback loader to the ESP, puts shim at
   the fallback path `EFI/BOOT/BOOTX64.EFI`, and writes the `BOOTX64.CSV`
   that restores the entry after a firmware reset
 - adds a firmware entry named after the distribution that starts shim with
   systemd-boot as what it loads, then removes the "Linux Boot Manager"
-  entries `bootctl` adds, which skip shim
+  entries `bootctl` adds, which skip shim. Every copy to the ESP must
+  succeed first (each is written under a temporary name and renamed), and
+  none of this happens before the keys are queued for enrollment, so a
+  failure leaves the old boot path in place
 - installs `/etc/apt/apt.conf.d/99kernel-pop-boot-loader`, which signs
   systemd-boot again after every package change that replaced it
 
@@ -260,8 +266,10 @@ signed with a key that is enrolled or waiting for enrollment:
 - Without the signing setup, or with a key that is neither enrolled nor
   queued (or whose state mokutil cannot report), the install is refused
   before anything changes, and the app points you to Set Up Signing.
-- If signing the new kernel fails, its packages are removed again, so no
-  kernel that shim would refuse is left in the boot menu.
+- If signing the new kernel fails, or the copy on the ESP that systemd-boot
+  or kernelstub starts does not carry the signature, its packages are
+  removed again, so no kernel that shim would refuse is left in the boot
+  menu.
 - If the key is still waiting for enrollment, the kernel is installed and
   signed, and the install reminds you to confirm the enrollment at the MOK
   Manager screen on the next reboot; skip that and it will not boot.
