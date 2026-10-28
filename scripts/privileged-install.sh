@@ -1573,6 +1573,7 @@ setup_shim_chain() {
 # creates it too), or signed with an older key under the same name.
 setup_dkms_key() {
     local der ids line m v k
+    local -A rebuilt=()
     der="$(dkms_mok_der)"
     command -v dkms >/dev/null 2>&1 || return 0
     [[ -n "$(dkms status 2>/dev/null)" ]] || return 0
@@ -1599,7 +1600,40 @@ setup_dkms_key() {
         elif ! dkms_package_signed "$m" "$v" "$k" "$ids"; then
             log "SIGN WARNING: $m $v for $k was rebuilt but is still not signed with the DKMS key"
         fi
+        rebuilt[$k]=1
     done < <(dkms status 2>/dev/null)
+    # A module the initramfs carries (gpu_unlock via dracut force_drivers,
+    # say) is loaded from there at boot: the initramfs still holds the old,
+    # unsigned copy until it is generated again, and lockdown refuses that.
+    for k in "${!rebuilt[@]}"; do
+        [[ -f "$(boot_dir)/initrd.img-$k" ]] || continue
+        log "Generating the initramfs for $k again, with the signed modules…"
+        if generate_initramfs "$k"; then
+            refresh_esp_copy "$k"
+        else
+            log "SIGN WARNING: the initramfs for $k could not be generated again — it may still hold unsigned modules"
+        fi
+    done
+}
+
+# Copy /boot's kernel and initramfs for <kver> to the ESP again where the
+# boot loader loads them from there (systemd-boot, kernelstub). GRUB reads
+# /boot itself.
+refresh_esp_copy() {
+    local kver="$1" bl esp boot initrd=()
+    boot="$(boot_dir)"
+    read -r bl esp <<< "$(detect_bootloader)"
+    case "$bl" in
+        systemd-boot)
+            [[ -f "$boot/initrd.img-$kver" ]] && initrd=("$boot/initrd.img-$kver")
+            kernel-install add "$kver" "$boot/vmlinuz-$kver" "${initrd[@]}" >>"$LOGFILE" 2>&1 \
+                || log "SIGN WARNING: kernel-install add failed for $kver — the ESP copy of its initramfs is the old one"
+            ;;
+        kernelstub)
+            kernelstub >>"$LOGFILE" 2>&1 || log "SIGN WARNING: kernelstub failed — the ESP copy of $kver may be the old one"
+            ;;
+    esac
+    return 0
 }
 
 # A certificate's serial number and subject key identifier, the forms a

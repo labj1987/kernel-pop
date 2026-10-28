@@ -4,6 +4,14 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.6 — 2026-10-28
+
+**Fixed: a DKMS module loaded from the initramfs still refused with Secure Boot on.** When Set
+Up Signing rebuilt DKMS modules signed with the DKMS key, the initramfs kept the old, unsigned
+copy, so a module that loads from there early in boot (a GPU helper module, for example) was
+refused by kernel lockdown. Setup now generates the initramfs again for every kernel whose
+modules it rebuilt, and copies it to the ESP.
+
 ## 2.2.5 — 2026-10-28
 
 **Fixed: installing the build tools (or a kernel) failing after an interrupted update.** When

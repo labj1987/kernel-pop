@@ -225,7 +225,9 @@ boots once MOK Manager enrolls it.
   back). The check compares
   modinfo's `sig_key` with the cert's serial and subject key identifier,
   never the signer name: `update-secureboot-policy` reuses the same CN for
-  every key it makes.
+  every key it makes. Every kernel it rebuilt modules for then gets its
+  initramfs generated again and copied to the ESP (`refresh_esp_copy`):
+  dracut `force_drivers` and the like keep the old unsigned module there.
 - The System tab's Boot path row (`system::parse_boot_path`) classifies the
   efibootmgr entry BootCurrent names: shim, systemd-boot started directly
   (Set Up Signing is offered), another loader without shim, or unknown (the

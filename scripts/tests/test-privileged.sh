@@ -1234,12 +1234,20 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
         esac
     }
     update-secureboot-policy() { [[ "$1" == --new-key ]] && mkdir -p "$tmp/dkms-mok" && touch "$KERNEL_POP_DKMS_MOK"; }
+    # Each rebuilt kernel's initramfs is generated again and copied to the ESP
+    saved_boot="${KERNEL_POP_BOOT:-}"; export KERNEL_POP_BOOT="$tmp/dkms-boot"; mkdir -p "$KERNEL_POP_BOOT"
+    touch "$KERNEL_POP_BOOT/initrd.img-7.2.6-070206-generic"
+    generate_initramfs() { echo "initramfs $1" >> "$tmp/ir-calls"; }
+    refresh_esp_copy() { echo "esp $1" >> "$tmp/ir-calls"; }
+    rm -f "$tmp/ir-calls"
     setup_dkms_key >/dev/null
+    [[ "$(cat "$tmp/ir-calls")" == $'initramfs 7.2.6-070206-generic\nesp 7.2.6-070206-generic' ]] || bad "initramfs after the DKMS rebuild: [$(cat "$tmp/ir-calls" 2>/dev/null)]"
     [[ "$(cat "$tmp/dkms-calls")" == $'dkms build --force -m nvidia -v 615.71.09 -k 7.2.6-070206-generic\ndkms install --force -m nvidia -v 615.71.09 -k 7.2.6-070206-generic\ndkms build --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic\ndkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
         || bad "DKMS rebuilds got [$(cat "$tmp/dkms-calls")]"
     # All signed with the key now: nothing is rebuilt
-    : > "$tmp/dkms-calls"; setup_dkms_key >/dev/null
+    : > "$tmp/dkms-calls"; rm -f "$tmp/ir-calls"; setup_dkms_key >/dev/null
     [[ ! -s "$tmp/dkms-calls" ]] || bad "modules signed with the DKMS key were rebuilt: [$(cat "$tmp/dkms-calls")]"
+    [[ -e "$tmp/ir-calls" ]] && bad "the initramfs was generated again with nothing rebuilt"
     # The key exists already (shim-signed made it) but one module was built
     # before it: only that package is rebuilt
     : > "$kd/gpu_unlock.ko.zst"
@@ -1251,8 +1259,8 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     dkms() { [[ "$1" == status ]] && echo "gpu-unlock/1.0.0, 7.2.6-070206-generic, x86_64: installed"; return 0; }
     out="$(setup_dkms_key 2>&1)"
     grep -q "SIGN WARNING: gpu-unlock 1.0.0 for 7.2.6-070206-generic was rebuilt but is still not signed" <<<"$out" || bad "an unsigned rebuild was not reported: $out"
-    export KERNEL_POP_MODULES="$saved_modules"
-    unset -f modinfo cert_key_ids
+    export KERNEL_POP_MODULES="$saved_modules" KERNEL_POP_BOOT="$saved_boot"
+    unset -f modinfo cert_key_ids generate_initramfs refresh_esp_copy
 
     # A systemd-boot .signed shipped and signed by the distribution: left as
     # it is (no Kernel Pop signature over it), and that is what goes on the ESP
