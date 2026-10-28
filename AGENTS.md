@@ -172,6 +172,38 @@ boots once MOK Manager enrolls it.
   real modes on a dev machine. CI sets
   `KERNEL_POP_REQUIRE_ALL_TESTS=1`, which turns a skipped test group into
   a failure.
+- shim in front of systemd-boot (`setup_shim_chain`, from
+  `do_setup_signing` when `detect_bootloader` says systemd-boot): the
+  layout of Ubuntu's systemd-boot postinst `install_shim` (shim/fb/mm in
+  `EFI/<os-release ID>/`, shim at `EFI/BOOT/BOOTX64.EFI`, UCS-2LE
+  `BOOTX64.CSV` byte-identical to install_shim's, firmware entry
+  `<Vendor>` = `EFI/<vendor>/shimx64.efi` with load option
+  `\EFI\systemd\systemd-bootx64.efi \0`), done by the script itself so it
+  also works while GRUB's packages are installed (install_shim returns
+  early then). Ubuntu ships `fbx64.efi`/`mmx64.efi` without the `.signed`
+  names install_shim reads; setup links them. `shim-without-grub`
+  (Provides grub-efi-amd64-signed, grub2-common = 999) is built with
+  dpkg-deb only when GRUB's signed package is not installed. "Linux Boot
+  Manager" entries are pruned only while `shim_sdboot_entries` finds a
+  shim entry (efibootmgr prints the load option as UTF-16LE hex), so a
+  machine is never left without a Linux entry. `sign_boot_loader` re-signs
+  `systemd-bootx64.efi.signed` when the sha256 in
+  `/var/lib/kernel-pop/systemd-boot-signed-from` no longer matches, then
+  `bootctl update` and a direct ESP copy when bootctl skipped it.
+- Hooks setup installs: `/etc/apt/apt.conf.d/99kernel-pop-boot-loader`
+  (systemd-boot only, runs `--sign-boot-loader`) and
+  `/etc/kernel/postinst.d/zzz-kernel-pop-sign` (runs `--sign-new-kernel`
+  after `zz-systemd-boot` copied the kernel to the ESP; signs only an image
+  with no signature at all, then `sync_signed_to_esp`). Both call the
+  installed helper path and never fail the apt/dpkg run.
+- `setup_dkms_key`: DKMS modules installed and no
+  `/var/lib/shim-signed/mok/MOK.der` → `update-secureboot-policy
+  --new-key`, then `dkms install --force` per installed module and kernel
+  (Ubuntu's DKMS signs with that key at build time).
+- The System tab's Boot path row (`system::parse_boot_path`) classifies the
+  efibootmgr entry BootCurrent names: shim, systemd-boot started directly
+  (Set Up Signing is offered), another loader without shim, or unknown (the
+  `EFI\BOOT\BOOTX64.EFI` fallback path can hold either).
 - Every package operation in the script goes through `apt_get` or
   `dpkg_install`, never `apt-get`/`dpkg -i` directly: they wait for a
   software updater holding dpkg's locks (`package_lock_holder` reads

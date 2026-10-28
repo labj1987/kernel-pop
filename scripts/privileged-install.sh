@@ -23,6 +23,9 @@
 #   privileged-install.sh --boot-once <kernel-version-string>
 #   privileged-install.sh --setup-signing        (enrollment password on stdin)
 #   privileged-install.sh --sign <kernel-version-string>
+#   privileged-install.sh --sign-boot-loader     (the apt hook Set Up Signing installs)
+#   privileged-install.sh --sign-new-kernel <kernel-version-string>  (the kernel
+#                                                     postinst hook it installs)
 #   privileged-install.sh --install-build-deps <package>...  (only names from
 #                                                     BUILD_DEPS_ALLOWED below)
 #
@@ -55,7 +58,9 @@ ARG="${2:-}"
 # KERNEL_POP_EFI, KERNEL_POP_EFIVARS, KERNEL_POP_MOK_PENDING, KERNEL_POP_DKMS_MOK,
 # KERNEL_POP_GRUB_CFG, KERNEL_POP_GRUB_DEFAULTS, KERNEL_POP_DKMS_TREE,
 # KERNEL_POP_DPKG_ADMIN, KERNEL_POP_PROC, KERNEL_POP_LOCK_WAIT,
-# KERNEL_POP_LOCK_POLL.
+# KERNEL_POP_LOCK_POLL, KERNEL_POP_SDBOOT, KERNEL_POP_SHIM_LIB,
+# KERNEL_POP_SDBOOT_STAMP, KERNEL_POP_APT_HOOK, KERNEL_POP_KERNEL_HOOK,
+# KERNEL_POP_OS_RELEASE.
 boot_dir()    { echo "${KERNEL_POP_BOOT:-/boot}"; }
 modules_dir() { echo "${KERNEL_POP_MODULES:-/lib/modules}"; }
 
@@ -1221,6 +1226,266 @@ do_remove() {
     log "==== Done. Kernel $kver removed. ===="
 }
 
+# ── shim in front of systemd-boot ───────────────────────────────────────
+# With Secure Boot on, the firmware starts only what its db trusts: the
+# Microsoft-signed shim, never systemd-boot itself. shim trusts the MOK list,
+# where Kernel Pop's key is enrolled. So on a systemd-boot machine the chain
+# is: firmware entry "<Vendor>" -> EFI/<vendor>/shimx64.efi, given
+# \EFI\systemd\systemd-bootx64.efi as its load option -> systemd-boot signed
+# with Kernel Pop's key -> kernels signed with it. Without shim in front, the
+# key can never be enrolled either: MOK Manager is started by shim. The
+# layout is the one Ubuntu's systemd-boot package makes itself when GRUB is
+# absent (install_shim in its postinst), so its own updates keep it.
+sdboot_efi()     { echo "${KERNEL_POP_SDBOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}"; }
+shim_lib_dir()   { echo "${KERNEL_POP_SHIM_LIB:-/usr/lib/shim}"; }
+sdboot_stamp()   { echo "${KERNEL_POP_SDBOOT_STAMP:-/var/lib/kernel-pop/systemd-boot-signed-from}"; }
+apt_hook_file()  { echo "${KERNEL_POP_APT_HOOK:-/etc/apt/apt.conf.d/99kernel-pop-boot-loader}"; }
+kernel_hook_file() { echo "${KERNEL_POP_KERNEL_HOOK:-/etc/kernel/postinst.d/zzz-kernel-pop-sign}"; }
+HELPER_PATH="/usr/lib/kernel-pop/privileged-install.sh"
+# "systemd-boot" in UTF-16LE: efibootmgr prints a load option as hex.
+SDBOOT_HEX="730079007300740065006d0064002d0062006f006f007400"
+
+# The ESP directory shim lives in: the distribution's ID, as systemd-boot's
+# install_shim uses it.
+esp_vendor() {
+    (
+        ID=""
+        # shellcheck disable=SC1090,SC1091
+        . "${KERNEL_POP_OS_RELEASE:-/etc/os-release}" 2>/dev/null || true
+        echo "${ID:-debian}"
+    )
+}
+
+# Numbers of the firmware entries that start shim with systemd-boot as its
+# load option, one per line.
+shim_sdboot_entries() {
+    local line lc
+    while IFS= read -r line; do
+        [[ "$line" =~ ^Boot([0-9A-Fa-f]{4})\*?[[:space:]] ]] || continue
+        lc="${line,,}"
+        [[ "$lc" == *'\efi\'*'\shimx64.efi'* ]] || continue
+        [[ "$lc" == *'systemd-bootx64.efi'* || "$lc" == *"$SDBOOT_HEX"* ]] || continue
+        echo "${BASH_REMATCH[1]}"
+    done < <(efibootmgr 2>/dev/null)
+}
+
+# bootctl (run by every systemd-boot upgrade) re-adds "Linux Boot Manager"
+# and "Fallback Linux Boot Manager", which start systemd-boot without shim
+# and fail with Secure Boot on. Removed only while a shim entry exists.
+prune_direct_sdboot_entries() {
+    local n
+    [[ -n "$(shim_sdboot_entries)" ]] || return 0
+    for n in $(efibootmgr 2>/dev/null | sed -nE 's/^Boot([0-9A-Fa-f]{4})\*? (Fallback )?Linux Boot Manager[[:space:]].*/\1/p'); do
+        efibootmgr -q -b "$n" -B >>"$LOGFILE" 2>&1 \
+            && log "Removed firmware entry Boot$n (Linux Boot Manager starts systemd-boot without shim)"
+    done
+    return 0
+}
+
+# Keep systemd-boot signed with Kernel Pop's key: the .signed copy that
+# bootctl installs, and the copy on the ESP. Signs again only when the
+# package shipped a new binary since the last signing. Run by Set Up Signing
+# and, through the apt hook, after every package change.
+sign_boot_loader() {
+    local src d esp want tmp
+    src="$(sdboot_efi)"
+    d="$(mok_dir)"
+    signing_key_present || return 0
+    [[ -f "$src" ]] || { log "SIGN WARNING: $src not found — systemd-boot was not signed"; return 1; }
+    esp="$(bootctl --print-esp-path 2>/dev/null)" || esp=""
+    [[ -n "$esp" ]] || { log "SIGN WARNING: no ESP found — systemd-boot was not signed"; return 1; }
+    want="$(sha256sum "$src" | cut -d' ' -f1)"
+    if [[ "$(cat "$(sdboot_stamp)" 2>/dev/null)" != "$want" ]] \
+        || ! sbverify --cert "$d/signing.pem" "$src.signed" >/dev/null 2>&1; then
+        tmp="$(mktemp "$src.signed.XXXXXX")" || { log "SIGN WARNING: could not create a temp file next to $src"; return 1; }
+        if sbsign --key "$d/signing.key" --cert "$d/signing.pem" --output "$tmp" "$src" >>"$LOGFILE" 2>&1 \
+            && sbverify --cert "$d/signing.pem" "$tmp" >/dev/null 2>&1; then
+            chmod 0644 "$tmp" && mv -f "$tmp" "$src.signed"
+            echo "$want" > "$(sdboot_stamp)"
+            log "Signed systemd-boot: $src.signed"
+        else
+            rm -f "$tmp"
+            log "SIGN WARNING: could not sign $src"
+            return 1
+        fi
+    fi
+    bootctl update --graceful --no-variables >>"$LOGFILE" 2>&1 || true
+    # bootctl skips a copy of the same version, so check the one on the ESP.
+    if ! sbverify --cert "$d/signing.pem" "$esp/EFI/systemd/systemd-bootx64.efi" >/dev/null 2>&1; then
+        install -D -m 0644 "$src.signed" "$esp/EFI/systemd/systemd-bootx64.efi" \
+            && log "Installed the signed systemd-boot on the ESP"
+    fi
+    prune_direct_sdboot_entries
+}
+
+# shim-signed depends on GRUB's signed package. Where GRUB is not installed,
+# this placeholder provides it, so shim gets Ubuntu's updates and GRUB stays
+# off the machine.
+install_shim_placeholder() {
+    local w rc=0
+    w="$(mktemp -d)" || return 1
+    mkdir -p "$w/pkg/DEBIAN" "$w/pkg/usr/share/doc/shim-without-grub"
+    cat > "$w/pkg/DEBIAN/control" <<CTRL
+Package: shim-without-grub
+Version: 1.0
+Section: admin
+Priority: optional
+Architecture: all
+Maintainer: Kernel Pop <root@localhost>
+Provides: grub-efi-amd64-signed (= 999), grub2-common (= 999)
+Description: Lets shim-signed stay installed without GRUB
+ shim-signed declares dependencies on GRUB packages, but on this machine shim
+ starts systemd-boot, not GRUB. This placeholder provides those dependencies so
+ the Microsoft-signed shim keeps receiving updates while GRUB is gone.
+CTRL
+    echo "Installed by Kernel Pop's Set Up Signing: shim starts systemd-boot here." \
+        > "$w/pkg/usr/share/doc/shim-without-grub/README"
+    if dpkg-deb --root-owner-group -b "$w/pkg" "$w/shim-without-grub_1.0_all.deb" >>"$LOGFILE" 2>&1; then
+        apt_get install -y "$w/shim-without-grub_1.0_all.deb" >>"$LOGFILE" 2>&1 || rc=1
+    else
+        rc=1
+    fi
+    rm -rf "$w"
+    (( rc == 0 )) || log "SIGN WARNING: could not install the shim-without-grub placeholder"
+    return "$rc"
+}
+
+# The hooks that keep this working after setup: apt re-signs systemd-boot
+# after every package change, and a newly installed kernel is signed at once.
+install_signing_hooks() {
+    local apt_hook kernel_hook
+    apt_hook="$(apt_hook_file)"
+    kernel_hook="$(kernel_hook_file)"
+    if [[ "${1:-}" == systemd-boot ]]; then
+        mkdir -p "$(dirname "$apt_hook")"
+        cat > "$apt_hook" <<HOOK
+// Kernel Pop (Set Up Signing): keep systemd-boot signed with Kernel Pop's key
+// after package changes. Remove this file to stop it.
+DPkg::Post-Invoke { "if [ -x $HELPER_PATH ]; then $HELPER_PATH --sign-boot-loader >/dev/null 2>&1 || true; fi"; };
+HOOK
+        chmod 0644 "$apt_hook"
+    fi
+    mkdir -p "$(dirname "$kernel_hook")"
+    cat > "$kernel_hook" <<HOOK
+#!/bin/sh
+# Kernel Pop (Set Up Signing): sign a newly installed kernel that carries no
+# signature with Kernel Pop's key, so it boots with Secure Boot on. Kernels
+# signed by the distribution are left alone. Remove this file to stop it.
+[ -x $HELPER_PATH ] || exit 0
+$HELPER_PATH --sign-new-kernel "\$1" >/dev/null 2>&1 || true
+exit 0
+HOOK
+    chmod 0755 "$kernel_hook"
+}
+
+# Put shim in front of systemd-boot on <esp>: shim-signed, the files and the
+# firmware entry systemd-boot's install_shim makes, systemd-boot signed.
+# Returns non-zero when the machine still has no shim entry.
+setup_shim_chain() {
+    local esp="$1" lib vendor V f csv src disk part
+    lib="$(shim_lib_dir)"
+    vendor="$(esp_vendor)"
+    V="${vendor^}"
+    if [[ ! -f "$lib/shimx64.efi.signed" ]]; then
+        if ! dpkg-query -W -f='${Status}' grub-efi-amd64-signed 2>/dev/null | grep -q "install ok installed"; then
+            install_shim_placeholder || return 1
+        fi
+        log "Installing shim-signed (the Microsoft-signed shim and MOK Manager)"
+        apt_get install -y shim-signed >>"$LOGFILE" 2>&1 || { log "SIGN WARNING: could not install shim-signed"; return 1; }
+    fi
+    # Ubuntu ships fbx64.efi and mmx64.efi; install_shim reads them by
+    # Debian's .signed names.
+    for f in fb mm; do
+        if [[ -f "$lib/${f}x64.efi" && ! -e "$lib/${f}x64.efi.signed" ]]; then
+            ln -s "${f}x64.efi" "$lib/${f}x64.efi.signed"
+        fi
+    done
+    sign_boot_loader || return 1
+    for f in shim fb mm; do
+        [[ -f "$lib/${f}x64.efi.signed" ]] || continue
+        cmp -s "$lib/${f}x64.efi.signed" "$esp/EFI/$vendor/${f}x64.efi" \
+            || install -p -D -m 0644 "$lib/${f}x64.efi.signed" "$esp/EFI/$vendor/${f}x64.efi"
+    done
+    # The fallback path: shim there, and fbx64 recreates the firmware entry
+    # from the CSV after a firmware reset. GRUB's CSV passes nothing, which
+    # would point shim at GRUB.
+    cmp -s "$lib/shimx64.efi.signed" "$esp/EFI/BOOT/BOOTX64.EFI" \
+        || install -p -D -m 0644 "$lib/shimx64.efi.signed" "$esp/EFI/BOOT/BOOTX64.EFI"
+    if [[ -f "$lib/fbx64.efi.signed" ]]; then
+        cmp -s "$lib/fbx64.efi.signed" "$esp/EFI/BOOT/fbx64.efi" \
+            || install -p -D -m 0644 "$lib/fbx64.efi.signed" "$esp/EFI/BOOT/fbx64.efi"
+    fi
+    csv="$esp/EFI/$vendor/BOOTX64.CSV"
+    if ! iconv -f UCS-2LE -t UTF-8 "$csv" 2>/dev/null | grep -q 'systemd-bootx64\.efi'; then
+        printf 'shimx64.efi,%s,\\EFI\\systemd\\systemd-bootx64.efi \\0,This is the boot entry for %s\n' "$V" "$V" \
+            | iconv -t UCS-2LE > "$csv"
+    fi
+    if [[ -z "$(shim_sdboot_entries)" ]]; then
+        src="$(findmnt -nvo SOURCE "$esp" 2>/dev/null)"
+        disk="$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)"
+        part="$(lsblk -no PARTN "$src" 2>/dev/null | tr -d '[:space:]')"
+        if [[ -z "$disk" || -z "$part" ]]; then
+            log "SIGN WARNING: could not tell which disk and partition the ESP ($src) is"
+            return 1
+        fi
+        efibootmgr -q --create --disk "/dev/$disk" --part "$part" --loader "EFI/$vendor/shimx64.efi" \
+            --label "$V" --unicode '\EFI\systemd\systemd-bootx64.efi \0' >>"$LOGFILE" 2>&1
+        [[ -n "$(shim_sdboot_entries)" ]] || { log "SIGN WARNING: could not create the firmware entry for shim"; return 1; }
+        log "Created firmware entry \"$V\": shim, which starts systemd-boot (first in the boot order)"
+    fi
+    prune_direct_sdboot_entries
+}
+
+# Out-of-tree modules (the NVIDIA driver, for one) load with Secure Boot on
+# only when they are signed with an enrolled key. Ubuntu's DKMS signs them
+# with /var/lib/shim-signed/mok/MOK.priv when it exists, so a machine with
+# DKMS modules and no such key gets one, and its modules are rebuilt signed.
+setup_dkms_key() {
+    local der line m v k
+    der="$(dkms_mok_der)"
+    command -v dkms >/dev/null 2>&1 || return 0
+    [[ -f "$der" ]] && return 0
+    [[ -n "$(dkms status 2>/dev/null)" ]] || return 0
+    command -v update-secureboot-policy >/dev/null 2>&1 || { log "SIGN WARNING: update-secureboot-policy (shim-signed) not found — DKMS modules stay unsigned"; return 0; }
+    log "Creating the DKMS module-signing key (DKMS modules are installed and none exists)"
+    update-secureboot-policy --new-key </dev/null >>"$LOGFILE" 2>&1 || true
+    [[ -f "$der" ]] || { log "SIGN WARNING: the DKMS key was not created — DKMS modules stay unsigned"; return 0; }
+    while IFS= read -r line; do
+        # "name/version, kernel, arch: installed"
+        [[ "$line" =~ ^([^/,]+)/([^,]+),[[:space:]]*([^,]+),[[:space:]]*[^:]+:[[:space:]]*installed ]] || continue
+        m="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}" k="${BASH_REMATCH[3]}"
+        valid_kver "$k" || continue
+        log "Rebuilding $m $v for $k, signed with the DKMS key…"
+        dkms install --force -m "$m" -v "$v" -k "$k" >>"$LOGFILE" 2>&1 \
+            || log "SIGN WARNING: rebuilding $m $v for $k failed — it stays unsigned"
+    done < <(dkms status 2>/dev/null)
+}
+
+# The apt hook: keep systemd-boot signed. Quiet unless something changes.
+do_sign_boot_loader() {
+    local bl esp
+    read -r bl esp <<< "$(detect_bootloader)"
+    [[ "$bl" == systemd-boot ]] || return 0
+    signing_key_present || return 0
+    sign_boot_loader || true
+}
+
+# The kernel hook: sign a new kernel that carries no signature at all.
+do_sign_new_kernel() {
+    local kver="$1" img
+    valid_kver "$kver" || die "Invalid kernel version string: '$kver'"
+    signing_key_present || return 0
+    img="$(boot_dir)/vmlinuz-$kver"
+    [[ -f "$img" ]] || return 0
+    if sbverify --list "$img" 2>/dev/null | grep -q '^signature [0-9]'; then
+        kernel_signed "$kver" && write_signed_marker "$kver"
+        return 0
+    fi
+    log "==== New kernel $kver: signing it with the Kernel Pop key ===="
+    sign_kernel "$kver" && sync_signed_to_esp "$kver"
+    return 0
+}
+
 # ── Signing setup and on-demand signing ─────────────────────────────────
 # Names of the apt packages that provide the signing tools not yet installed.
 missing_signing_packages() {
@@ -1230,6 +1495,10 @@ missing_signing_packages() {
     fi
     command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
     command -v mokutil >/dev/null 2>&1 || pkgs+=(mokutil)
+    # systemd-boot gets a firmware entry for shim
+    if [[ "$(detect_bootloader)" == systemd-boot* ]] && ! command -v efibootmgr >/dev/null 2>&1; then
+        pkgs+=(efibootmgr)
+    fi
     echo "${pkgs[*]}"
 }
 
@@ -1437,7 +1706,7 @@ queue_key_enrollment() {
 # One-time setup: tools, key, sign every installed kernel, queue enrollment.
 # The enrollment password is the first line of stdin.
 do_setup_signing() {
-    local pw="" missing v signed=0 already=0 failed=0
+    local pw="" missing v bl esp signed=0 already=0 failed=0
     IFS= read -r pw || true
     valid_mok_password "$pw" || die "The enrollment password must be 8 to 16 printable ASCII characters without spaces"
     ensure_efivarfs
@@ -1451,6 +1720,17 @@ do_setup_signing() {
     fi
 
     generate_signing_key || die "Could not create the signing key"
+
+    read -r bl esp <<< "$(detect_bootloader)"
+    if [[ "$bl" == systemd-boot ]]; then
+        if setup_shim_chain "$esp"; then
+            log "Boot path: firmware -> shim -> systemd-boot, signed with the Kernel Pop key"
+        else
+            log "SIGN WARNING: shim could not be put in front of systemd-boot (see above). With Secure Boot on, the firmware would refuse systemd-boot and this machine would not boot."
+        fi
+    fi
+    setup_dkms_key
+    install_signing_hooks "$bl"
 
     while IFS= read -r v; do
         [[ -n "$v" ]] || continue
@@ -1558,8 +1838,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         --boot-once)   do_boot_once "$ARG" ;;
         --setup-signing) do_setup_signing ;;
         --sign)        do_sign "$ARG" ;;
+        --sign-boot-loader) do_sign_boot_loader ;;
+        --sign-new-kernel)  do_sign_new_kernel "$ARG" ;;
         --install-build-deps) shift; do_install_build_deps "$@" ;;
-        *) die "Usage: $0 --install <build-dir> | --remove <kernel-version> | --remove-many <kernel-version>... | --boot-once <kernel-version> | --setup-signing (password on stdin) | --sign <kernel-version> | --install-build-deps <package>..." ;;
+        *) die "Usage: $0 --install <build-dir> | --remove <kernel-version> | --remove-many <kernel-version>... | --boot-once <kernel-version> | --setup-signing (password on stdin) | --sign <kernel-version> | --sign-boot-loader | --sign-new-kernel <kernel-version> | --install-build-deps <package>..." ;;
     esac
     exit 0
 fi

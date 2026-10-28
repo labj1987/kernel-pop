@@ -10,7 +10,7 @@ use crate::install::{
 use crate::kernelorg::{fetch_releases, fetch_signature, url_file_name, Moniker, Release};
 use crate::source::{inspect, private_copy, Tarball};
 use crate::system::{
-    compare_to_running, format_bytes, health_summary, install_blocker, install_warnings, prune_candidates, query_system, BootEntry, KernelSignature,
+    compare_to_running, format_bytes, health_summary, install_blocker, install_warnings, prune_candidates, query_system, BootEntry, BootPath, KernelSignature,
     KernelSigning, KeyEnrollment, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
 use crate::verify::{verify_tarball, Signer};
@@ -176,6 +176,18 @@ fn secure_boot_subtitle(sb: SecureBoot, signing: KernelSigning) -> &'static str 
     }
 }
 
+/// Boot path row subtitle; None hides the row.
+fn boot_path_subtitle(path: &BootPath) -> Option<String> {
+    match path {
+        BootPath::Shim => Some("shim starts the boot loader, so Secure Boot trusts it through your enrolled key".to_string()),
+        BootPath::DirectSystemdBoot => Some(
+            "The firmware starts systemd-boot without shim: with Secure Boot on it refuses it and the machine does not boot, and the signing key cannot be enrolled. Set Up Signing puts shim in front of it".to_string(),
+        ),
+        BootPath::Other(name) => Some(format!("The firmware starts {name} without shim, so Secure Boot cannot use your enrolled key")),
+        BootPath::Unknown => None,
+    }
+}
+
 fn signing_subtitle(signing: KernelSigning) -> &'static str {
     match signing {
         KernelSigning::NoKey => "Not set up — kernels are installed unsigned",
@@ -299,10 +311,14 @@ pub fn build_ui(app: &Application) {
     let safety_group = PreferencesGroup::builder().title("Boot Safety").build();
     let secure_boot_row = ActionRow::builder().title("Secure Boot").subtitle("Checking…").build();
     safety_group.add(&secure_boot_row);
+    let boot_path_row = ActionRow::builder().title("Boot path").visible(false).build();
+    safety_group.add(&boot_path_row);
     let signing_row = ActionRow::builder().title("Kernel signing").subtitle("Checking…").build();
     let setup_signing_btn = Button::builder()
         .label("Set Up Signing")
-        .tooltip_text("Create a signing key, sign the installed kernels and queue the key for enrollment")
+        .tooltip_text(
+            "Create a signing key, put shim in front of systemd-boot where it is missing, sign the installed kernels and queue the key for enrollment",
+        )
         .valign(Align::Center)
         .visible(false)
         .build();
@@ -801,6 +817,7 @@ pub fn build_ui(app: &Application) {
         let boot_row = boot_row.clone();
         let root_row = root_row.clone();
         let secure_boot_row = secure_boot_row.clone();
+        let boot_path_row = boot_path_row.clone();
         let signing_row = signing_row.clone();
         let setup_signing_btn = setup_signing_btn.clone();
         let health_banner = health_banner.clone();
@@ -827,6 +844,7 @@ pub fn build_ui(app: &Application) {
             let boot_row = boot_row.clone();
             let root_row = root_row.clone();
             let secure_boot_row = secure_boot_row.clone();
+            let boot_path_row = boot_path_row.clone();
             let signing_row = signing_row.clone();
             let setup_signing_btn = setup_signing_btn.clone();
             let health_banner = health_banner.clone();
@@ -845,6 +863,13 @@ pub fn build_ui(app: &Application) {
 
                 // Boot safety rows
                 secure_boot_row.set_subtitle(secure_boot_subtitle(info.secure_boot, info.kernel_signing));
+                match boot_path_subtitle(&info.boot_path) {
+                    Some(text) => {
+                        boot_path_row.set_subtitle(&text);
+                        boot_path_row.set_visible(true);
+                    }
+                    None => boot_path_row.set_visible(false),
+                }
                 let dkms_note = match info.dkms_key {
                     Some(KeyEnrollment::NotEnrolled) => {
                         " The DKMS key (NVIDIA driver and other out-of-tree modules) is not enrolled; Set Up Signing enrolls it too."
@@ -856,7 +881,9 @@ pub fn build_ui(app: &Application) {
                 let sep = if dkms_note.is_empty() || base.ends_with('.') { "" } else { "." };
                 signing_row.set_subtitle(&format!("{base}{sep}{dkms_note}"));
                 setup_signing_btn.set_visible(
-                    matches!(info.kernel_signing, KernelSigning::NoKey | KernelSigning::KeyNotEnrolled) || info.dkms_key == Some(KeyEnrollment::NotEnrolled),
+                    matches!(info.kernel_signing, KernelSigning::NoKey | KernelSigning::KeyNotEnrolled)
+                        || info.dkms_key == Some(KeyEnrollment::NotEnrolled)
+                        || info.boot_path == BootPath::DirectSystemdBoot,
                 );
 
                 // Disk rows

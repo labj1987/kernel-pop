@@ -72,8 +72,9 @@ VFS-panics on boot. This app is built around not letting that happen:
   the install is refused until signing is set up, and a kernel whose
   signing fails is removed again
 - Optional kernel signing: a one-time Set Up Signing step creates Kernel
-  Pop's own signing key, signs the installed kernels and queues the key for
-  MOK enrollment; from then on every kernel it installs is signed
+  Pop's own signing key, signs the installed kernels, puts shim in front of
+  systemd-boot where the firmware starts it directly, and queues the key
+  for MOK enrollment; from then on every kernel it installs is signed
   automatically, with a Signed / Signed by Ubuntu / Unsigned badge per
   kernel
 - DKMS modules (such as NVIDIA) are built for the new kernel and reported
@@ -116,6 +117,7 @@ Delete the AppImage, then the files Kernel Pop put on the system:
 
     sudo rm -rf /usr/lib/kernel-pop
     sudo rm -f /usr/share/polkit-1/actions/io.github.labj1987.KernelPop.policy /var/log/kernel-pop.log
+    sudo rm -f /etc/apt/apt.conf.d/99kernel-pop-boot-loader /etc/kernel/postinst.d/zzz-kernel-pop-sign
     rm -rf ~/.cache/kernel-pop ~/Downloads/kernel-pop
 
 `/var/lib/kernel-pop/` holds the signing key (`mok/`) and signing state.
@@ -125,7 +127,9 @@ the file to sign new ones. Remove it with `sudo rm -rf /var/lib/kernel-pop`
 once you no longer use Kernel Pop's kernels. `/var/lib/mok-pending/` is
 shared with other apps that queue Secure Boot keys; remove it only if none
 is left. Kernels it installed are
-ordinary packages: remove them on the System tab first, or with apt.
+ordinary packages: remove them on the System tab first, or with apt. On
+systemd-boot, keep shim, the `shim-without-grub` placeholder and the signed
+systemd-boot while Secure Boot is on: the machine boots through them.
 
 ## Using it
 
@@ -194,11 +198,41 @@ refuses to boot an unsigned kernel, so they need Kernel Pop's signing setup
    key for enrollment, together with the DKMS module-signing key (what the
    NVIDIA driver is signed with) and any key another app already queued:
    shim keeps one request with one password, so they all go in one request
-   under the password you chose here.
+   under the password you chose here. On a machine with DKMS modules and no
+   DKMS key yet, it creates one and rebuilds the modules signed with it.
+   On systemd-boot it also puts shim in front of systemd-boot (below).
 2. Reboot. A blue MOK Manager screen appears: choose Enroll MOK, Continue,
    Yes, and type the password once. It enrolls all the keys.
 3. Back in Linux, check that the System tab shows the keys as enrolled,
    and only then turn Secure Boot on.
+
+With Secure Boot on, the firmware starts only the Microsoft-signed shim,
+and shim trusts the enrolled keys and shows MOK Manager. A machine whose
+firmware starts systemd-boot directly would not boot, and could never
+enroll the key. The System tab's Boot path row shows which it is, and Set
+Up Signing on systemd-boot sets up the chain firmware → shim → systemd-boot
+→ kernel, the same layout Ubuntu's systemd-boot package makes when GRUB is
+absent:
+
+- installs `shim-signed` if needed. Where GRUB is not installed, a
+  placeholder package, `shim-without-grub`, stands in for the GRUB packages
+  shim-signed depends on, so GRUB stays off the machine
+- signs systemd-boot with Kernel Pop's key (the `.signed` copy `bootctl`
+  installs, and the copy on the ESP)
+- copies shim, MOK Manager and the fallback loader to the ESP, puts shim at
+  the fallback path `EFI/BOOT/BOOTX64.EFI`, and writes the `BOOTX64.CSV`
+  that restores the entry after a firmware reset
+- adds a firmware entry named after the distribution that starts shim with
+  systemd-boot as what it loads, then removes the "Linux Boot Manager"
+  entries `bootctl` adds, which skip shim
+- installs `/etc/apt/apt.conf.d/99kernel-pop-boot-loader`, which signs
+  systemd-boot again after every package change that replaced it
+
+On every boot loader, setup also installs
+`/etc/kernel/postinst.d/zzz-kernel-pop-sign`: any kernel installed later
+without a signature (a mainline kernel installed with apt or dpkg, say) is
+signed with Kernel Pop's key at once, so it boots with Secure Boot on.
+Kernels signed by the distribution are left alone.
 
 Only root can read the waiting request, so setup writes the keys it queued
 to `/var/lib/mok-pending/list`, a list shared with other apps that queue

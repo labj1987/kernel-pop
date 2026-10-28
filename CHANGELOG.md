@@ -4,6 +4,34 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.0 — 2026-10-28
+
+**Fixed: machines that boot systemd-boot directly not booting with Secure Boot on.** The
+firmware starts only the Microsoft-signed shim with Secure Boot on, and shim is also what shows
+MOK Manager, so on such a machine Set Up Signing queued a key that could never be enrolled and
+the machine stopped booting once Secure Boot was turned on. Set Up Signing on systemd-boot now
+puts shim in front of it, the same way Ubuntu's systemd-boot package does when GRUB is absent:
+
+- It installs shim if needed (with a small placeholder package where GRUB is not installed,
+  so GRUB stays off), signs systemd-boot with Kernel Pop's key, copies shim and MOK Manager to
+  the ESP and puts shim at the fallback path.
+- It adds a firmware entry that starts shim, which starts systemd-boot, and removes the
+  "Linux Boot Manager" entries that skip shim.
+- systemd-boot is signed again after every update that replaces it.
+
+**New: the System tab shows the boot path**, whether shim starts the boot loader or the
+firmware starts it without shim, and offers Set Up Signing when systemd-boot is started
+directly.
+
+**New: kernels installed later are signed automatically.** After Set Up Signing, a kernel
+installed any other way without a signature (a mainline kernel installed with apt or dpkg, for
+example) is signed with Kernel Pop's key as it is installed. Kernels signed by the distribution
+are left alone.
+
+**New: a DKMS key for out-of-tree modules.** On a machine with DKMS modules (such as the
+NVIDIA driver) and no DKMS signing key, Set Up Signing creates one, rebuilds the modules signed
+with it and queues it for enrollment with Kernel Pop's key, so they load with Secure Boot on.
+
 ## 2.1.4 — 2026-10-28
 
 **Fixed: installing the build tools failing when a software update was running.** When

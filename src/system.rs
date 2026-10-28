@@ -22,6 +22,8 @@ pub struct SystemInfo {
     /// when there is none. Not enrolled means they do not load with Secure
     /// Boot on.
     pub dkms_key: Option<KeyEnrollment>,
+    /// What the firmware started this boot with.
+    pub boot_path: BootPath,
     /// Roughly what one more kernel needs in /boot: the largest existing
     /// kernel image plus twice the largest existing initramfs (the margin
     /// covers update-initramfs briefly needing more than the final size).
@@ -43,6 +45,54 @@ pub enum SecureBoot {
     Disabled,
     #[default]
     Unknown,
+}
+
+/// What the firmware started this boot with, read from efibootmgr. With
+/// Secure Boot on, the firmware starts only what its db trusts (shim, signed
+/// by Microsoft); shim then trusts the MOK list, where Kernel Pop's key is
+/// enrolled, and starts MOK Manager to enroll it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum BootPath {
+    /// shim started the boot loader.
+    Shim,
+    /// The firmware started systemd-boot itself: refused with Secure Boot
+    /// on, and the signing key can never be enrolled. Set Up Signing puts
+    /// shim in front of it.
+    DirectSystemdBoot,
+    /// Another loader started without shim, named by its firmware entry.
+    Other(String),
+    /// Not an EFI boot, efibootmgr missing, or a fallback path
+    /// (\EFI\BOOT\BOOTX64.EFI) that can hold either.
+    #[default]
+    Unknown,
+}
+
+pub fn detect_boot_path() -> BootPath {
+    match Command::new("efibootmgr").output() {
+        Ok(o) if o.status.success() => parse_boot_path(&String::from_utf8_lossy(&o.stdout)),
+        _ => BootPath::Unknown,
+    }
+}
+
+/// The firmware entry efibootmgr's BootCurrent names, classified.
+pub fn parse_boot_path(out: &str) -> BootPath {
+    let Some(current) = out.lines().find_map(|l| l.strip_prefix("BootCurrent:")).map(str::trim) else {
+        return BootPath::Unknown;
+    };
+    let Some(entry) = out.lines().find(|l| l.strip_prefix("Boot").and_then(|r| r.get(..4)).is_some_and(|n| n.eq_ignore_ascii_case(current))) else {
+        return BootPath::Unknown;
+    };
+    let lc = entry.to_lowercase();
+    if lc.contains("\\shimx64.efi") {
+        BootPath::Shim
+    } else if lc.contains("\\efi\\boot\\bootx64.efi") {
+        BootPath::Unknown
+    } else if lc.contains("\\systemd-bootx64.efi") || lc.contains("linux boot manager") {
+        BootPath::DirectSystemdBoot
+    } else {
+        let name = entry.get(8..).unwrap_or("").trim_start_matches(['*', ' ']).split('\t').next().unwrap_or("").trim();
+        BootPath::Other(if name.is_empty() { "its boot loader".to_string() } else { name.to_string() })
+    }
 }
 
 /// State of Kernel Pop's own kernel-signing key (set up once with the
@@ -281,6 +331,7 @@ pub fn query_system() -> SystemInfo {
         secure_boot: detect_secure_boot(),
         kernel_signing,
         dkms_key: detect_dkms_key(),
+        boot_path: detect_boot_path(),
         boot_needed_bytes: boot_needed_bytes(),
     }
 }
@@ -750,6 +801,21 @@ pub fn compare_to_running(running: &str, candidate: &str) -> VersionRelation {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn boot_path_from_efibootmgr() {
+        let direct = "BootCurrent: 0006\nTimeout: 2 seconds\nBootOrder: 0006,0000\nBoot0000* UEFI PC SN530 NVMe WDC 512GB\tHD(1,GPT,1b97,0x800,0x219800)/\\EFI\\Boot\\BootX64.efi{auto_created_boot_option}\nBoot0006* Linux Boot Manager\tHD(1,GPT,1b97,0x800,0x219800)/\\EFI\\systemd\\systemd-bootx64.efi\n";
+        assert_eq!(parse_boot_path(direct), BootPath::DirectSystemdBoot);
+        let shim = "BootCurrent: 0003\nBootOrder: 0003,0000\nBoot0003* Ubuntu\tHD(1,GPT,1b97,0x800,0x219800)/\\EFI\\ubuntu\\shimx64.efi5c004500460049005c00\n";
+        assert_eq!(parse_boot_path(shim), BootPath::Shim);
+        let fallback = direct.replace("BootCurrent: 0006", "BootCurrent: 0000");
+        assert_eq!(parse_boot_path(&fallback), BootPath::Unknown);
+        let grub = "BootCurrent: 0001\nBoot0001* ubuntu-grub\tHD(1,GPT,x)/\\EFI\\ubuntu\\grubx64.efi\n";
+        assert_eq!(parse_boot_path(grub), BootPath::Other("ubuntu-grub".to_string()));
+        assert_eq!(parse_boot_path("BootOrder: 0001\n"), BootPath::Unknown);
+        assert_eq!(parse_boot_path("BootCurrent: 0009\nBoot0001* x\tHD()/\\EFI\\x.efi\n"), BootPath::Unknown);
+    }
+
     use super::*;
 
     #[test]

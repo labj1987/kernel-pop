@@ -39,6 +39,11 @@ export KERNEL_POP_EFI="$tmp/no-efi" KERNEL_POP_MOK_PENDING="$tmp/mok-pending/lis
 mkdir -p "$tmp/proc" "$tmp/dpkg"; : > "$tmp/proc/locks"
 export KERNEL_POP_PROC="$tmp/proc" KERNEL_POP_DPKG_ADMIN="$tmp/dpkg"
 APT_OPTS="-o DPkg::Lock::Timeout=300"
+# Hooks and systemd-boot files Set Up Signing writes go to $tmp, never /etc.
+export KERNEL_POP_APT_HOOK="$tmp/hooks/apt-hook" KERNEL_POP_KERNEL_HOOK="$tmp/hooks/kernel-hook" \
+    KERNEL_POP_SDBOOT="$tmp/sdboot/systemd-bootx64.efi" KERNEL_POP_SDBOOT_STAMP="$tmp/sdboot/stamp" \
+    KERNEL_POP_SHIM_LIB="$tmp/shim-lib" KERNEL_POP_OS_RELEASE="$tmp/os-release"
+printf 'ID=ubuntu\n' > "$tmp/os-release"
 
 deb_allowed "$tmp/linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb"   || bad "deb_allowed image"
 deb_allowed "$tmp/linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb" || bad "deb_allowed headers"
@@ -518,6 +523,8 @@ else
                 esac
             }
             apt-get() { echo "apt-get should not run: tools are installed" >> "$calls"; return 1; }
+            # No DKMS modules: only "dkms status" may run
+            dkms() { [[ "$1" == status ]] && return 0; echo "dkms should not run: no DKMS modules here" >> "$calls"; }
             detect_bootloader() { echo "grub"; }
             rm -rf "$KERNEL_POP_SIGNED_DIR"
             cp "$pe" "$KERNEL_POP_BOOT/vmlinuz-9.9.6-setup"
@@ -535,6 +542,10 @@ else
             grep -qF '$6$teststalt$fakehash' "$calls" || { echo "FAIL: the hash file did not hold the hash"; r=1; }
             [[ -e "$(cat "$tmp/hashfile-path")" ]] && { echo "FAIL: the hash file was left behind"; r=1; }
             grep -q "apt-get should not run" "$calls" && { echo "FAIL: apt-get ran with every tool installed"; r=1; }
+            grep -q "dkms should not run" "$calls" && { echo "FAIL: dkms ran without DKMS modules"; r=1; }
+            [[ -x "$KERNEL_POP_KERNEL_HOOK" ]] && grep -q -- "--sign-new-kernel \"\$1\"" "$KERNEL_POP_KERNEL_HOOK" \
+                || { echo "FAIL: setup did not install the kernel hook"; r=1; }
+            [[ -e "$KERNEL_POP_APT_HOOK" ]] && { echo "FAIL: the systemd-boot apt hook was installed on GRUB"; r=1; }
             kernel_signed 9.9.6-setup || { echo "FAIL: setup did not sign 9.9.6-setup"; r=1; }
             [[ -f "$KERNEL_POP_SIGNED_DIR/$k" && -f "$KERNEL_POP_SIGNED_DIR/9.9.6-setup" ]] || { echo "FAIL: setup markers"; r=1; }
             [[ -e "$KERNEL_POP_SIGNED_DIR/9.9.5-broken" ]] && { echo "FAIL: marker for a kernel that failed"; r=1; }
@@ -1027,6 +1038,112 @@ EOF2
     exit "$fails"
 ) || { echo "FAIL: package lock group"; fails=$((fails + 1)); }
 rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
+
+# ── shim in front of systemd-boot ────────────────────────────────────────
+(
+    fails=0
+    st="$tmp/fw-entries"
+    hex='5c004500460049005c00730079007300740065006d0064005c00730079007300740065006d0064002d0062006f006f0074007800360034002e00650066006900'
+    # A small model of the firmware's boot entries: efibootmgr lists them,
+    # --create adds one, -b N -B removes one.
+    efibootmgr() {
+        case "$*" in
+            *--create*) echo "create $*" >> "$tmp/fw-calls"; printf 'Boot0007* Ubuntu\tHD(1,GPT,x,0x800,0x219800)/\\EFI\\ubuntu\\shimx64.efi%s\n' "$hex" >> "$st" ;;
+            *-B*) local n="${*:3:1}"; echo "delete $n" >> "$tmp/fw-calls"; sed -i "/^Boot$n/d" "$st" ;;
+            *) printf 'BootCurrent: 0001\nBootOrder: 0001\n'; cat "$st" ;;
+        esac
+    }
+    printf 'Boot0001* Linux Boot Manager\tHD(1,GPT,x,0x800,0x219800)/\\EFI\\systemd\\systemd-bootx64.efi\n' > "$st"
+    printf 'Boot0002* Fallback Linux Boot Manager\tHD(1,GPT,x)/\\EFI\\BOOT\\BOOTX64.EFI\n' >> "$st"
+    printf 'Boot0003* Ubuntu\tHD(1,GPT,x)/\\EFI\\ubuntu\\shimx64.efi\n' >> "$st"
+    printf 'Boot0004* Windows Boot Manager\tHD(1,GPT,y)/\\EFI\\Microsoft\\Boot\\bootmgfw.efi\n' >> "$st"
+    : > "$tmp/fw-calls"
+    [[ -z "$(shim_sdboot_entries)" ]] || bad "a shim entry without systemd-boot (GRUB's) is not a systemd-boot entry: [$(shim_sdboot_entries)]"
+    prune_direct_sdboot_entries
+    [[ ! -s "$tmp/fw-calls" ]] || bad "Linux Boot Manager must stay while no shim entry exists: $(cat "$tmp/fw-calls")"
+    printf 'Boot0005* Ubuntu\tHD(1,GPT,x)/\\EFI\\ubuntu\\shimx64.efi\\EFI\\systemd\\systemd-bootx64.efi \\0\n' >> "$st"
+    [[ "$(shim_sdboot_entries)" == 0005 ]] || bad "shim_sdboot_entries should find the text form: [$(shim_sdboot_entries)]"
+    prune_direct_sdboot_entries >/dev/null
+    [[ "$(cat "$tmp/fw-calls")" == $'delete 0001\ndelete 0002' ]] || bad "prune got [$(cat "$tmp/fw-calls")]"
+    grep -q "Windows Boot Manager" "$st" || bad "prune removed another entry"
+
+    # setup_shim_chain from a machine where the firmware starts systemd-boot
+    # directly: shim-signed's files are there, nothing is on the ESP yet.
+    cesp="$tmp/chain-esp"; lib="$KERNEL_POP_SHIM_LIB"
+    mkdir -p "$cesp/EFI/systemd" "$lib" "$(dirname "$KERNEL_POP_SDBOOT")" "$cesp/EFI/ubuntu"
+    echo shim > "$lib/shimx64.efi.signed"; echo fb > "$lib/fbx64.efi"; echo mm > "$lib/mmx64.efi"
+    echo sdboot > "$KERNEL_POP_SDBOOT"; cp "$KERNEL_POP_SDBOOT" "$cesp/EFI/systemd/systemd-bootx64.efi"
+    # GRUB's CSV: shim with nothing to load but GRUB
+    printf 'shimx64.efi,Ubuntu,,This is the boot entry for Ubuntu\n' | iconv -t UCS-2LE > "$cesp/EFI/ubuntu/BOOTX64.CSV"
+    printf 'Boot0001* Linux Boot Manager\tHD(1,GPT,x,0x800,0x219800)/\\EFI\\systemd\\systemd-bootx64.efi\n' > "$st"
+    : > "$tmp/fw-calls"
+    signing_key_present() { return 0; }
+    sbsign() { local o i; while (( $# )); do case "$1" in --output) o="$2"; shift 2 ;; --key|--cert) shift 2 ;; *) i="$1"; shift ;; esac; done; { cat "$i"; echo SIGNED; } > "$o"; }
+    sbverify() { [[ -f "${*: -1}" ]] && [[ "$(tail -1 "${*: -1}")" == SIGNED ]]; }
+    bootctl() { [[ "$1" == --print-esp-path ]] && echo "$cesp"; return 0; }
+    findmnt() { echo /dev/fake1; }
+    lsblk() { case "$*" in *PKNAME*) echo fake ;; *PARTN*) echo " 1" ;; esac; }
+    apt-get() { echo "apt-get $*" >> "$tmp/fw-calls"; return 1; }
+    out="$(setup_shim_chain "$cesp" 2>&1)" || bad "setup_shim_chain failed: $out"
+    for f in shim fb mm; do
+        cmp -s "$cesp/EFI/ubuntu/${f}x64.efi" "$lib/${f}x64.efi.signed" || bad "EFI/ubuntu/${f}x64.efi is not shim-signed's"
+    done
+    cmp -s "$cesp/EFI/BOOT/BOOTX64.EFI" "$lib/shimx64.efi.signed" || bad "the fallback loader is not shim"
+    cmp -s "$cesp/EFI/BOOT/fbx64.efi" "$lib/fbx64.efi" || bad "the fallback has no fbx64"
+    [[ "$(iconv -f UCS-2LE -t UTF-8 "$cesp/EFI/ubuntu/BOOTX64.CSV")" == 'shimx64.efi,Ubuntu,\EFI\systemd\systemd-bootx64.efi \0,This is the boot entry for Ubuntu' ]] \
+        || bad "BOOTX64.CSV got [$(iconv -f UCS-2LE -t UTF-8 "$cesp/EFI/ubuntu/BOOTX64.CSV")]"
+    sbverify x "$cesp/EFI/systemd/systemd-bootx64.efi" || bad "the ESP systemd-boot is not signed"
+    sbverify x "$KERNEL_POP_SDBOOT.signed" || bad "no signed systemd-boot for bootctl"
+    [[ "$(cat "$KERNEL_POP_SDBOOT_STAMP")" == "$(sha256sum "$KERNEL_POP_SDBOOT" | cut -d' ' -f1)" ]] || bad "the stamp does not name the signed binary"
+    grep -qF 'create -q --create --disk /dev/fake --part 1 --loader EFI/ubuntu/shimx64.efi --label Ubuntu --unicode \EFI\systemd\systemd-bootx64.efi \0' "$tmp/fw-calls" \
+        || bad "efibootmgr --create got [$(cat "$tmp/fw-calls")]"
+    grep -q "delete 0001" "$tmp/fw-calls" || bad "the direct systemd-boot entry should go once shim's exists"
+    grep -q "apt-get" "$tmp/fw-calls" && bad "apt-get ran although shim-signed is installed"
+    [[ "$(shim_sdboot_entries)" == 0007 ]] || bad "no shim entry after setup: [$(shim_sdboot_entries)]"
+    # Again: nothing new is created or signed
+    : > "$tmp/fw-calls"
+    out="$(setup_shim_chain "$cesp" 2>&1)" || bad "a second setup_shim_chain failed: $out"
+    [[ ! -s "$tmp/fw-calls" ]] || bad "a second run changed firmware entries: $(cat "$tmp/fw-calls")"
+    grep -q "Signed systemd-boot" <<<"$out" && bad "a second run signed systemd-boot again"
+    # A systemd-boot update: signed again, and the ESP copy follows
+    echo sdboot-new > "$KERNEL_POP_SDBOOT"
+    out="$(sign_boot_loader 2>&1)"
+    grep -q "Signed systemd-boot" <<<"$out" || bad "a new systemd-boot was not signed: $out"
+    [[ "$(head -1 "$KERNEL_POP_SDBOOT.signed")" == sdboot-new ]] || bad "the .signed copy is the old binary"
+
+    # The kernel hook signs only a kernel without any signature
+    mkdir -p "$tmp/newk"; KERNEL_POP_BOOT="$tmp/newk"
+    echo img > "$tmp/newk/vmlinuz-9.9.8-new"; echo img > "$tmp/newk/vmlinuz-9.9.7-distro"
+    sbverify() { [[ "$1" == --list ]] || return 1; [[ "$2" == *distro ]] && echo "signature 1"; return 0; }
+    sign_kernel() { echo "sign $1" >> "$tmp/newk/calls"; }
+    sync_signed_to_esp() { echo "sync $1" >> "$tmp/newk/calls"; }
+    do_sign_new_kernel 9.9.7-distro >/dev/null 2>&1
+    do_sign_new_kernel 9.9.8-new >/dev/null 2>&1
+    [[ "$(cat "$tmp/newk/calls")" == $'sign 9.9.8-new\nsync 9.9.8-new' ]] || bad "kernel hook calls [$(cat "$tmp/newk/calls")]"
+    (do_sign_new_kernel '../x' >/dev/null 2>&1) && bad "the kernel hook took an odd version"
+
+    # DKMS modules and no DKMS key: a key is made and each module rebuilt
+    export KERNEL_POP_DKMS_MOK="$tmp/dkms-mok/MOK.der"
+    dkms() {
+        case "$1" in
+            status) printf "nvidia/615.71.09, 7.2.6-070206-generic, x86_64: installed\ngpu-unlock/1.0.0, 7.2.6-070206-generic, x86_64: installed (WARNING! Diff between built and installed module!)\nold/1, 6.1.0-1-generic, x86_64: built\n" ;;
+            *) echo "dkms $*" >> "$tmp/dkms-calls" ;;
+        esac
+    }
+    update-secureboot-policy() { [[ "$1" == --new-key ]] && mkdir -p "$tmp/dkms-mok" && touch "$KERNEL_POP_DKMS_MOK"; }
+    setup_dkms_key >/dev/null
+    [[ "$(cat "$tmp/dkms-calls")" == $'dkms install --force -m nvidia -v 615.71.09 -k 7.2.6-070206-generic\ndkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
+        || bad "DKMS rebuilds got [$(cat "$tmp/dkms-calls")]"
+    : > "$tmp/dkms-calls"; setup_dkms_key >/dev/null
+    [[ ! -s "$tmp/dkms-calls" ]] || bad "an existing DKMS key still rebuilt modules"
+
+    # The hooks setup writes
+    install_signing_hooks systemd-boot
+    grep -q -- "--sign-boot-loader" "$KERNEL_POP_APT_HOOK" || bad "no apt hook for systemd-boot"
+    [[ "$(stat -c %a "$KERNEL_POP_KERNEL_HOOK")" == 755 ]] || bad "the kernel hook is not executable"
+    sh -n "$KERNEL_POP_KERNEL_HOOK" || bad "the kernel hook is not valid sh"
+    exit "$fails"
+) || { echo "FAIL: shim chain group"; fails=$((fails + 1)); }
 
 # Optional: a real finished build (debs + SHA256SUMS) in
 # $KERNEL_POP_TEST_REAL_DEBS is staged and verified.
