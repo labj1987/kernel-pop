@@ -1442,27 +1442,59 @@ setup_shim_chain() {
 
 # Out-of-tree modules (the NVIDIA driver, for one) load with Secure Boot on
 # only when they are signed with an enrolled key. Ubuntu's DKMS signs them
-# with /var/lib/shim-signed/mok/MOK.priv when it exists, so a machine with
-# DKMS modules and no such key gets one, and its modules are rebuilt signed.
+# with /var/lib/shim-signed/mok/MOK.priv when it exists. A machine with DKMS
+# modules and no such key gets one, and every module not signed with that
+# key is rebuilt: one built before the key existed (installing shim-signed
+# creates it too), or signed with an older key under the same name.
 setup_dkms_key() {
-    local der line m v k
+    local der ids line m v k
     der="$(dkms_mok_der)"
     command -v dkms >/dev/null 2>&1 || return 0
-    [[ -f "$der" ]] && return 0
     [[ -n "$(dkms status 2>/dev/null)" ]] || return 0
-    command -v update-secureboot-policy >/dev/null 2>&1 || { log "SIGN WARNING: update-secureboot-policy (shim-signed) not found — DKMS modules stay unsigned"; return 0; }
-    log "Creating the DKMS module-signing key (DKMS modules are installed and none exists)"
-    update-secureboot-policy --new-key </dev/null >>"$LOGFILE" 2>&1 || true
-    [[ -f "$der" ]] || { log "SIGN WARNING: the DKMS key was not created — DKMS modules stay unsigned"; return 0; }
+    if [[ ! -f "$der" ]]; then
+        command -v update-secureboot-policy >/dev/null 2>&1 \
+            || { log "SIGN WARNING: update-secureboot-policy (shim-signed) not found — DKMS modules stay unsigned"; return 0; }
+        log "Creating the DKMS module-signing key (DKMS modules are installed and none exists)"
+        update-secureboot-policy --new-key </dev/null >>"$LOGFILE" 2>&1 || true
+        [[ -f "$der" ]] || { log "SIGN WARNING: the DKMS key was not created — DKMS modules stay unsigned"; return 0; }
+    fi
+    ids="$(cert_key_ids "$der")"
     while IFS= read -r line; do
         # "name/version, kernel, arch: installed"
         [[ "$line" =~ ^([^/,]+)/([^,]+),[[:space:]]*([^,]+),[[:space:]]*[^:]+:[[:space:]]*installed ]] || continue
         m="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}" k="${BASH_REMATCH[3]}"
         valid_kver "$k" || continue
+        dkms_package_signed "$m" "$v" "$k" "$ids" && continue
         log "Rebuilding $m $v for $k, signed with the DKMS key…"
         dkms install --force -m "$m" -v "$v" -k "$k" >>"$LOGFILE" 2>&1 \
-            || log "SIGN WARNING: rebuilding $m $v for $k failed — it stays unsigned"
+            || log "SIGN WARNING: rebuilding $m $v for $k failed — it stays as it was"
     done < <(dkms status 2>/dev/null)
+}
+
+# A certificate's serial number and subject key identifier, the forms a
+# module signature names its key by (modinfo's sig_key): one per line,
+# uppercase hex without colons or leading zeros.
+cert_key_ids() {
+    {
+        openssl x509 -inform DER -in "$1" -noout -serial 2>/dev/null | sed 's/^serial=//'
+        openssl x509 -inform DER -in "$1" -noout -ext subjectKeyIdentifier 2>/dev/null | sed -n '2p'
+    } | tr -d ': ' | tr 'a-f' 'A-F' | sed 's/^0*//'
+}
+
+# Whether every module DKMS package <m>/<v> installed for <kver> is signed
+# with one of <ids> (cert_key_ids). Its dkms.conf names the modules.
+dkms_package_signed() {
+    local m="$1" v="$2" k="$3" ids="$4" conf name f id found=0
+    conf="${KERNEL_POP_DKMS_TREE:-/var/lib/dkms}/$m/$v/source/dkms.conf"
+    while IFS= read -r name; do
+        for f in "$(modules_dir)/$k/updates/dkms/$name".ko*; do
+            [[ -f "$f" ]] || continue
+            found=1
+            id="$(modinfo -F sig_key "$f" 2>/dev/null | tr -d ': ' | tr 'a-f' 'A-F' | sed 's/^0*//')"
+            [[ -n "$id" ]] && grep -qxF "$id" <<< "$ids" || return 1
+        done
+    done < <(sed -nE 's/^[[:space:]]*BUILT_MODULE_NAME\[[0-9]+\]="?([^"[:space:]]+)"?.*/\1/p' "$conf" 2>/dev/null)
+    (( found ))
 }
 
 # The apt hook: keep systemd-boot signed. Quiet unless something changes.

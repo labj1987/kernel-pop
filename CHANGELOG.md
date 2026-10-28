@@ -4,6 +4,14 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.2 — 2026-10-28
+
+**Fixed: DKMS modules left unsigned by Set Up Signing.** Installing shim creates the DKMS
+signing key itself, so setup found a key already there and rebuilt nothing, leaving the NVIDIA
+driver and other DKMS modules unsigned or signed with an older key of the same name. Setup now
+checks every DKMS module's signature against the DKMS key and rebuilds each package that is not
+signed with it.
+
 ## 2.2.1 — 2026-10-28
 
 **Fixed: the firmware entry for shim that Set Up Signing creates had a relative path**

@@ -198,8 +198,13 @@ boots once MOK Manager enrolls it.
   installed helper path and never fail the apt/dpkg run.
 - `setup_dkms_key`: DKMS modules installed and no
   `/var/lib/shim-signed/mok/MOK.der` → `update-secureboot-policy
-  --new-key`, then `dkms install --force` per installed module and kernel
-  (Ubuntu's DKMS signs with that key at build time).
+  --new-key` (installing shim-signed also makes it). Then every installed
+  package whose modules (its dkms.conf `BUILT_MODULE_NAME`s under
+  `updates/dkms/`) are not signed with that key gets `dkms install
+  --force` (Ubuntu's DKMS signs with it at build time). The check compares
+  modinfo's `sig_key` with the cert's serial and subject key identifier,
+  never the signer name: `update-secureboot-policy` reuses the same CN for
+  every key it makes.
 - The System tab's Boot path row (`system::parse_boot_path`) classifies the
   efibootmgr entry BootCurrent names: shim, systemd-boot started directly
   (Set Up Signing is offered), another loader without shim, or unknown (the

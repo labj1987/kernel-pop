@@ -1129,20 +1129,43 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     [[ "$(cat "$tmp/newk/calls")" == $'sign 9.9.8-new\nsync 9.9.8-new' ]] || bad "kernel hook calls [$(cat "$tmp/newk/calls")]"
     (do_sign_new_kernel '../x' >/dev/null 2>&1) && bad "the kernel hook took an odd version"
 
-    # DKMS modules and no DKMS key: a key is made and each module rebuilt
-    export KERNEL_POP_DKMS_MOK="$tmp/dkms-mok/MOK.der"
+    # DKMS modules and no DKMS key: a key is made and every module not
+    # signed with it is rebuilt
+    export KERNEL_POP_DKMS_MOK="$tmp/dkms-mok/MOK.der" KERNEL_POP_DKMS_TREE="$tmp/dkms-tree"
+    saved_modules="${KERNEL_POP_MODULES:-}"; export KERNEL_POP_MODULES="$tmp/dkms-mods"
+    kd="$KERNEL_POP_MODULES/7.2.6-070206-generic/updates/dkms"; mkdir -p "$kd"
+    mkdir -p "$KERNEL_POP_DKMS_TREE/nvidia/615.71.09/source" "$KERNEL_POP_DKMS_TREE/gpu-unlock/1.0.0/source"
+    printf 'PACKAGE_NAME="nvidia"\nBUILT_MODULE_NAME[0]="nvidia"\nBUILT_MODULE_NAME[1]="nvidia-uvm"\n' > "$KERNEL_POP_DKMS_TREE/nvidia/615.71.09/source/dkms.conf"
+    printf 'PACKAGE_NAME="gpu-unlock"\nBUILT_MODULE_NAME[0]=gpu_unlock\n' > "$KERNEL_POP_DKMS_TREE/gpu-unlock/1.0.0/source/dkms.conf"
+    # Each fake module file holds the key id it is "signed" with
+    echo "5B:E0:2A:3B" > "$kd/nvidia.ko.zst"; echo "5B:E0:2A:3B" > "$kd/nvidia-uvm.ko.zst"; : > "$kd/gpu_unlock.ko.zst"
+    modinfo() { [[ "$1 $2" == "-F sig_key" ]] && cat "$3"; }
+    cert_key_ids() { printf '7FE0F67A\n9B1B75AD\n'; }
     dkms() {
         case "$1" in
             status) printf "nvidia/615.71.09, 7.2.6-070206-generic, x86_64: installed\ngpu-unlock/1.0.0, 7.2.6-070206-generic, x86_64: installed (WARNING! Diff between built and installed module!)\nold/1, 6.1.0-1-generic, x86_64: built\n" ;;
-            *) echo "dkms $*" >> "$tmp/dkms-calls" ;;
+            install)
+                echo "dkms $*" >> "$tmp/dkms-calls"
+                local n; for n in $(sed -nE 's/^BUILT_MODULE_NAME\[[0-9]+\]="?([^"]+)"?$/\1/p' "$KERNEL_POP_DKMS_TREE/$4/$6/source/dkms.conf"); do
+                    echo "9B:1B:75:AD" > "$kd/$n.ko.zst"
+                done ;;
         esac
     }
     update-secureboot-policy() { [[ "$1" == --new-key ]] && mkdir -p "$tmp/dkms-mok" && touch "$KERNEL_POP_DKMS_MOK"; }
     setup_dkms_key >/dev/null
     [[ "$(cat "$tmp/dkms-calls")" == $'dkms install --force -m nvidia -v 615.71.09 -k 7.2.6-070206-generic\ndkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
         || bad "DKMS rebuilds got [$(cat "$tmp/dkms-calls")]"
+    # All signed with the key now: nothing is rebuilt
     : > "$tmp/dkms-calls"; setup_dkms_key >/dev/null
-    [[ ! -s "$tmp/dkms-calls" ]] || bad "an existing DKMS key still rebuilt modules"
+    [[ ! -s "$tmp/dkms-calls" ]] || bad "modules signed with the DKMS key were rebuilt: [$(cat "$tmp/dkms-calls")]"
+    # The key exists already (shim-signed made it) but one module was built
+    # before it: only that package is rebuilt
+    : > "$kd/gpu_unlock.ko.zst"
+    : > "$tmp/dkms-calls"; setup_dkms_key >/dev/null
+    [[ "$(cat "$tmp/dkms-calls")" == 'dkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
+        || bad "an unsigned module with an existing key: [$(cat "$tmp/dkms-calls")]"
+    export KERNEL_POP_MODULES="$saved_modules"
+    unset -f modinfo cert_key_ids
 
     # The hooks setup writes
     install_signing_hooks systemd-boot
