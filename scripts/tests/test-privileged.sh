@@ -1118,6 +1118,28 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     grep -q "Signed systemd-boot" <<<"$out" || bad "a new systemd-boot was not signed: $out"
     [[ "$(head -1 "$KERNEL_POP_SDBOOT.signed")" == sdboot-new ]] || bad "the .signed copy is the old binary"
 
+    # A full ESP: a copy fails part way. No firmware entry may then point at
+    # shim, the direct systemd-boot entry stays, and the loader already on
+    # the ESP is left whole.
+    fesp="$tmp/full-esp"
+    mkdir -p "$fesp/EFI/systemd" "$fesp/EFI/BOOT"
+    cp "$KERNEL_POP_SDBOOT" "$fesp/EFI/systemd/systemd-bootx64.efi"
+    echo old-loader > "$fesp/EFI/BOOT/BOOTX64.EFI"
+    printf 'Boot0001* Linux Boot Manager\tHD(1,GPT,x,0x800,0x219800)/\\EFI\\systemd\\systemd-bootx64.efi\n' > "$st"
+    : > "$tmp/fw-calls"
+    bootctl() { [[ "$1" == --print-esp-path ]] && echo "$fesp"; return 0; }
+    # Out of space in EFI/BOOT: what was written so far stays, truncated.
+    install() {
+        if [[ "${*: -1}" == "$fesp"/EFI/BOOT/* ]]; then echo "install: No space left on device" >&2; : > "${*: -1}"; return 1; fi
+        command install "$@"
+    }
+    out="$(setup_shim_chain "$fesp" 2>&1)" && bad "setup_shim_chain succeeded although a copy to the ESP failed"
+    grep -q "SIGN WARNING: could not copy" <<<"$out" || bad "a failed ESP copy was not reported: $out"
+    [[ ! -s "$tmp/fw-calls" ]] || bad "firmware entries changed although a copy to the ESP failed: $(cat "$tmp/fw-calls")"
+    [[ "$(cat "$fesp/EFI/BOOT/BOOTX64.EFI")" == old-loader ]] || bad "a failed copy damaged the loader on the ESP"
+    unset -f install
+    bootctl() { [[ "$1" == --print-esp-path ]] && echo "$cesp"; return 0; }
+
     # The kernel hook signs only a kernel without any signature
     mkdir -p "$tmp/newk"; KERNEL_POP_BOOT="$tmp/newk"
     echo img > "$tmp/newk/vmlinuz-9.9.8-new"; echo img > "$tmp/newk/vmlinuz-9.9.7-distro"
