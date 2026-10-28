@@ -78,6 +78,9 @@ VFS-panics on boot. This app is built around not letting that happen:
   kernel
 - DKMS modules (such as NVIDIA) are built for the new kernel and reported
   per module; a failure is a warning, not an install error
+- When a software update (GNOME Software, unattended upgrades) is using
+  the package manager, installs, removals and the build tools wait for it
+  to finish, up to 30 minutes, and say which program they are waiting for
 - Disk space checks for the build, / and /boot
 - Install log in-app plus /var/log/kernel-pop.log
 

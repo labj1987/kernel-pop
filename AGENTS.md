@@ -172,6 +172,11 @@ boots once MOK Manager enrolls it.
   real modes on a dev machine. CI sets
   `KERNEL_POP_REQUIRE_ALL_TESTS=1`, which turns a skipped test group into
   a failure.
+- Every package operation in the script goes through `apt_get` or
+  `dpkg_install`, never `apt-get`/`dpkg -i` directly: they wait for a
+  software updater holding dpkg's locks (`package_lock_holder` reads
+  `/proc/locks`, no fuser needed) and print the wait on fd 3, the script's
+  own output, since their callers send stdout to the log file.
 
 ## Build process
 

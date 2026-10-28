@@ -4,6 +4,14 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.1.4 — 2026-10-28
+
+**Fixed: installing the build tools failing when a software update was running.** When
+GNOME Software, unattended upgrades or another updater is using the package manager,
+installing the build tools, installing or removing a kernel and Set Up Signing now wait for
+it to finish (up to 30 minutes) instead of failing at once. The log names the program they
+are waiting for and says when they go on.
+
 ## 2.1.3 — 2026-10-27
 
 **Fixed: keys enrolled at boot still showing as waiting**, and this app and other apps that

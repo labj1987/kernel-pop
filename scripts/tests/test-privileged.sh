@@ -35,6 +35,10 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # No EFI firmware directory unless a test sets one, so nothing ever mounts
 # the real machine's EFI variables; the shared list of waiting keys in $tmp.
 export KERNEL_POP_EFI="$tmp/no-efi" KERNEL_POP_MOK_PENDING="$tmp/mok-pending/list"
+# No real dpkg locks either: an empty /proc/locks and no lock files.
+mkdir -p "$tmp/proc" "$tmp/dpkg"; : > "$tmp/proc/locks"
+export KERNEL_POP_PROC="$tmp/proc" KERNEL_POP_DPKG_ADMIN="$tmp/dpkg"
+APT_OPTS="-o DPkg::Lock::Timeout=300"
 
 deb_allowed "$tmp/linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb"   || bad "deb_allowed image"
 deb_allowed "$tmp/linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb" || bad "deb_allowed headers"
@@ -816,7 +820,7 @@ EOF2
                 shift; printf '%s\n' "$@" > "$root/dpkg-args"
                 touch "$KERNEL_POP_BOOT/vmlinuz-$kv"; mkdir -p "$KERNEL_POP_MODULES/$kv/build"
             }
-            apt-get() { echo "$*" >> "$root/apt-args"; [[ "$1" == "purge" ]]; }
+            apt-get() { echo "$*" >> "$root/apt-args"; [[ "$3" == "purge" ]]; }
             update-initramfs() { touch "$KERNEL_POP_BOOT/initrd.img-$3"; }   # -c|-u -k <kver>
             if [[ -n "${DKMS_BROKEN:-}" ]]; then
                 dkms() { [[ "$1" == "status" ]] && echo "nvidia/615.78.08, $kv, x86_64: built"; [[ "$1" == "status" ]]; }
@@ -883,7 +887,7 @@ EOF2
     out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled run_install signfail)" && bad "do_install should fail when signing fails under Secure Boot"
     root="$tmp/inst-signfail"
     [[ "$(count 'SIGN WARNING:' "$out")" == 1 ]] || bad "a failed sign should give exactly one SIGN WARNING line, got $(count 'SIGN WARNING:' "$out")"
-    [[ "$(cat "$root/apt-args" 2>/dev/null)" == "purge -y linux-headers-$kv linux-image-$kv" ]] \
+    [[ "$(cat "$root/apt-args" 2>/dev/null)" == "$APT_OPTS purge -y linux-headers-$kv linux-image-$kv" ]] \
         || bad "the rollback should purge exactly the installed packages, got [$(cat "$root/apt-args" 2>/dev/null)]"
     grep -q "removed again. Nothing is left installed" <<< "$out" || bad "the rollback should be reported: $out"
     [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "a rolled-back install changed the default"
@@ -951,7 +955,7 @@ EOF2
     apt-get() { echo "$*" >> "$tmp/deps-apt"; return 0; }
     rm -f "$tmp/deps-apt"
     out="$(do_install_build_deps pahole zstd 2>&1)" || bad "do_install_build_deps should install allowlisted packages: $out"
-    [[ "$(cat "$tmp/deps-apt")" == "install -y pahole zstd" ]] || bad "apt-get got [$(cat "$tmp/deps-apt" 2>/dev/null)]"
+    [[ "$(cat "$tmp/deps-apt")" == "$APT_OPTS install -y pahole zstd" ]] || bad "apt-get got [$(cat "$tmp/deps-apt" 2>/dev/null)]"
     rm -f "$tmp/deps-apt"
     (do_install_build_deps pahole bash >/dev/null 2>&1) && bad "do_install_build_deps should refuse a package outside the allowlist"
     (do_install_build_deps 'pahole;id' >/dev/null 2>&1) && bad "do_install_build_deps should refuse an odd name"
@@ -959,12 +963,70 @@ EOF2
     [[ -e "$tmp/deps-apt" ]] && bad "apt-get ran for a refused package list"
     (do_install_build_deps >/dev/null 2>&1) && bad "do_install_build_deps should fail with no packages"
     # A failed install is retried once after an index refresh
-    apt-get() { echo "$*" >> "$tmp/deps-apt"; [[ "$1" == "update" || -e "$tmp/deps-updated" ]] && { touch "$tmp/deps-updated"; return 0; }; return 1; }
+    apt-get() { echo "$*" >> "$tmp/deps-apt"; [[ "$3" == "update" || -e "$tmp/deps-updated" ]] && { touch "$tmp/deps-updated"; return 0; }; return 1; }
     rm -f "$tmp/deps-apt" "$tmp/deps-updated"
     do_install_build_deps cpio >/dev/null 2>&1 || bad "do_install_build_deps should succeed after an index refresh"
-    [[ "$(tr '\n' '|' < "$tmp/deps-apt")" == "install -y cpio|update|install -y cpio|" ]] || bad "retry sequence got [$(tr '\n' '|' < "$tmp/deps-apt")]"
+    [[ "$(tr '\n' '|' < "$tmp/deps-apt")" == "$APT_OPTS install -y cpio|$APT_OPTS update|$APT_OPTS install -y cpio|" ]] || bad "retry sequence got [$(tr '\n' '|' < "$tmp/deps-apt")]"
     exit "$fails"
 ) || { echo "FAIL: build tools group"; fails=$((fails + 1)); }
+
+# ── Package manager lock: wait for an updater, then go on ──────────────
+(
+    fails=0
+    : > "$tmp/dpkg/lock-frontend"; : > "$tmp/dpkg/lock"
+    mkdir -p "$tmp/proc/4883"; echo packagekitd > "$tmp/proc/4883/comm"
+    lock_line() {
+        local dev ino
+        read -r dev ino < <(stat -L -c '%d %i' "$1")
+        printf '1: POSIX  ADVISORY  WRITE 4883 %02x:%02x:%s 0 EOF\n' \
+            $(( ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfff) )) \
+            $(( (dev & 0xff) | ((dev >> 12) & ~0xff) )) "$ino"
+    }
+    [[ -z "$(package_lock_holder)" ]] || bad "package_lock_holder should see no holder with an empty /proc/locks"
+    lock_line "$tmp/dpkg/lock-frontend" > "$tmp/proc/locks"
+    [[ "$(package_lock_holder)" == "4883 packagekitd" ]] || bad "package_lock_holder got [$(package_lock_holder)]"
+    sed 's/^1: /1: -> /' "$tmp/proc/locks" > "$tmp/proc/locks.w"; mv "$tmp/proc/locks.w" "$tmp/proc/locks"
+    [[ -z "$(package_lock_holder)" ]] || bad "package_lock_holder should ignore a waiting request"
+    lock_line "$tmp/dpkg/lock" > "$tmp/proc/locks"
+    [[ "$(package_lock_holder)" == "4883 packagekitd" ]] || bad "package_lock_holder should see the database lock"
+    # A lock on another file with another inode is not dpkg's
+    : > "$tmp/not-dpkg-lock"; lock_line "$tmp/not-dpkg-lock" > "$tmp/proc/locks"
+    [[ -z "$(package_lock_holder)" ]] || bad "package_lock_holder matched an unrelated lock"
+
+    # The updater finishes after two polls: apt-get runs only then
+    lock_line "$tmp/dpkg/lock-frontend" > "$tmp/proc/locks"
+    polls=0
+    sleep() { polls=$((polls + 1)); (( polls >= 2 )) && : > "$tmp/proc/locks"; return 0; }
+    apt-get() { echo "polls=$polls $*" >> "$tmp/lock-apt"; return 0; }
+    rm -f "$tmp/lock-apt"
+    # The wait messages go to fd 3, the script's own output
+    out="$(do_install_build_deps pahole 2>&1 3>&1)" || bad "do_install_build_deps should go on once the lock is free: $out"
+    [[ "$(cat "$tmp/lock-apt")" == "polls=2 $APT_OPTS install -y pahole" ]] || bad "apt-get ran before the lock was free: [$(cat "$tmp/lock-apt")]"
+    grep -q "packagekitd (process 4883).*Waiting" <<<"$out" || bad "the wait should name the holder: $out"
+    [[ "$(grep -c "Waiting for it" <<<"$out")" == 1 ]] || bad "the wait message should appear once: $out"
+    grep -q "free again" <<<"$out" || bad "no message when the lock was free again: $out"
+
+    # A holder that never lets go: give up after LOCK_WAIT, apt-get never runs
+    lock_line "$tmp/dpkg/lock-frontend" > "$tmp/proc/locks"
+    sleep() { return 0; }
+    rm -f "$tmp/lock-apt"
+    out="$(LOCK_WAIT=20 LOCK_POLL=5 do_install_build_deps pahole 2>&1 3>&1)" && bad "do_install_build_deps should fail while the lock stays taken"
+    grep -q "still in use by packagekitd" <<<"$out" || bad "the timeout should name the holder: $out"
+    [[ -e "$tmp/lock-apt" ]] && bad "apt-get ran although the lock never came free"
+    : > "$tmp/proc/locks"
+
+    # dpkg -i that lost the lock race is run again; other failures are not
+    # dpkg runs in a command substitution: count its runs in a file
+    rm -f "$tmp/dpkg-runs"
+    dpkg() { echo x >> "$tmp/dpkg-runs"; [[ "$(wc -l < "$tmp/dpkg-runs")" == 1 ]] && { echo "dpkg: error: dpkg frontend lock was locked by another process with pid 4883"; return 2; }; echo "dpkg $*"; return 0; }
+    out="$(dpkg_install a.deb)" || bad "dpkg_install should retry after a lock error: $out"
+    [[ "$(tail -1 <<<"$out")" == "dpkg -i a.deb" ]] || bad "dpkg_install retry got [$out]"
+    dpkg() { echo "dpkg: error processing archive a.deb"; return 1; }
+    dpkg_install a.deb >/dev/null && bad "dpkg_install should pass on a real dpkg failure"
+    dpkg_install a.deb >/dev/null; [[ $? == 1 ]] || bad "dpkg_install should return dpkg's exit code"
+    exit "$fails"
+) || { echo "FAIL: package lock group"; fails=$((fails + 1)); }
+rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
 
 # Optional: a real finished build (debs + SHA256SUMS) in
 # $KERNEL_POP_TEST_REAL_DEBS is staged and verified.

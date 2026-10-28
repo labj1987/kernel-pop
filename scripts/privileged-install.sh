@@ -42,6 +42,9 @@ log() {
     { echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE"; } 2>/dev/null || true
 }
 die() { log "ERROR: $*"; exit 1; }
+# The script's own output, for messages from code whose stdout goes to the
+# log file (apt_get and dpkg_install are called with >>"$LOGFILE").
+exec 3>&1
 
 MODE="${1:-}"
 ARG="${2:-}"
@@ -50,9 +53,84 @@ ARG="${2:-}"
 # run): KERNEL_POP_BOOT, KERNEL_POP_MODULES, KERNEL_POP_ROOTFS,
 # KERNEL_POP_MOK_DIR, KERNEL_POP_SIGNED_DIR, KERNEL_POP_STAGING,
 # KERNEL_POP_EFI, KERNEL_POP_EFIVARS, KERNEL_POP_MOK_PENDING, KERNEL_POP_DKMS_MOK,
-# KERNEL_POP_GRUB_CFG, KERNEL_POP_GRUB_DEFAULTS, KERNEL_POP_DKMS_TREE.
+# KERNEL_POP_GRUB_CFG, KERNEL_POP_GRUB_DEFAULTS, KERNEL_POP_DKMS_TREE,
+# KERNEL_POP_DPKG_ADMIN, KERNEL_POP_PROC, KERNEL_POP_LOCK_WAIT,
+# KERNEL_POP_LOCK_POLL.
 boot_dir()    { echo "${KERNEL_POP_BOOT:-/boot}"; }
 modules_dir() { echo "${KERNEL_POP_MODULES:-/lib/modules}"; }
+
+# ── Package manager lock ────────────────────────────────────────────────
+# A software updater (packagekitd, aptd, unattended-upgrades) can hold
+# dpkg's locks for minutes, and apt-get and dpkg -i fail at once when they
+# are taken. So every package operation first waits for them to be free,
+# and says who it is waiting for, on fd 3 so it shows in the app.
+dpkg_admin_dir() { echo "${KERNEL_POP_DPKG_ADMIN:-/var/lib/dpkg}"; }
+proc_dir()       { echo "${KERNEL_POP_PROC:-/proc}"; }
+LOCK_WAIT="${KERNEL_POP_LOCK_WAIT:-1800}"
+LOCK_POLL="${KERNEL_POP_LOCK_POLL:-5}"
+
+# "<pid> <name>" of a process holding dpkg's frontend lock or its database
+# lock, from /proc/locks (no fuser or lsof needed). Nothing when both are
+# free. /proc/locks names a file as MAJOR:MINOR:INODE, major and minor in
+# hex.
+package_lock_holder() {
+    local f dev ino key pid name proc
+    proc="$(proc_dir)"
+    for f in "$(dpkg_admin_dir)/lock-frontend" "$(dpkg_admin_dir)/lock"; do
+        [[ -e "$f" ]] || continue
+        read -r dev ino < <(stat -L -c '%d %i' "$f" 2>/dev/null) || continue
+        key="$(printf '%02x:%02x:%s' \
+            $(( ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfff) )) \
+            $(( (dev & 0xff) | ((dev >> 12) & ~0xff) )) "$ino")"
+        # A waiting request ("->") holds nothing.
+        pid="$(awk -v k="$key" '$2 != "->" && $6 == k { print $5; exit }' "$proc/locks" 2>/dev/null || true)"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        name="$(cat "$proc/$pid/comm" 2>/dev/null || echo unknown)"
+        echo "$pid $name"
+        return 0
+    done
+}
+
+wait_for_package_lock() {
+    local holder waited=0 told=""
+    while holder="$(package_lock_holder)" && [[ -n "$holder" ]]; do
+        if [[ "$told" != "$holder" ]]; then
+            log >&3 "Another program is using the package manager: ${holder#* } (process ${holder%% *}), most likely a software update. Waiting for it to finish (up to $((LOCK_WAIT / 60)) minutes)…"
+            told="$holder"
+        fi
+        (( waited >= LOCK_WAIT )) && die >&3 "The package manager is still in use by ${holder#* } (process ${holder%% *}) after $((LOCK_WAIT / 60)) minutes. Let that update finish (or close the program running it), then try again."
+        sleep "$LOCK_POLL"
+        waited=$(( waited + LOCK_POLL ))
+    done
+    [[ -n "$told" ]] && log >&3 "The package manager is free again — continuing"
+    return 0
+}
+
+# apt-get after the lock is free. The lock timeout covers another program
+# taking it in between; noninteractive because nobody can answer a prompt.
+apt_get() {
+    wait_for_package_lock
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 "$@" </dev/null
+}
+
+# dpkg has no lock timeout: retry while another program holds the lock.
+# A run that could not take the lock changed nothing, so retrying is safe.
+dpkg_install() {
+    local out rc tries=0
+    while :; do
+        wait_for_package_lock
+        rc=0
+        out="$(dpkg -i "$@" 2>&1)" || rc=$?
+        printf '%s\n' "$out"
+        if (( rc != 0 && tries < 60 )) \
+            && grep -qE 'dpkg: error: dpkg (frontend lock|status database|lock) (is|was) locked' <<<"$out"; then
+            tries=$(( tries + 1 ))
+            sleep "$LOCK_POLL"
+            continue
+        fi
+        return "$rc"
+    done
+}
 
 # ── Boot loader detection ───────────────────────────────────────────────
 # GRUB and systemd-boot binaries/config can both be present on a machine
@@ -676,7 +754,7 @@ rollback_install() {
         pkgs+=("$(dpkg-deb -f "$d" Package)")
     done
     log "Removing the just-installed packages again: ${pkgs[*]}"
-    apt-get purge -y "${pkgs[@]}" >>"$LOGFILE" 2>&1
+    apt_get purge -y "${pkgs[@]}" >>"$LOGFILE" 2>&1
 }
 
 # MOK Manager takes 8-16 characters, typed on a US keyboard layout at boot.
@@ -877,9 +955,9 @@ do_install() {
     before_modules="$(ls -1 "$mods" 2>/dev/null || true)"
 
     log "Installing ${#debs[@]} packages…"
-    if ! dpkg -i "${debs[@]}" >>"$LOGFILE" 2>&1; then
+    if ! dpkg_install "${debs[@]}" >>"$LOGFILE" 2>&1; then
         log "dpkg -i reported errors — attempting to fix dependencies…"
-        apt-get install -f -y >>"$LOGFILE" 2>&1 || die "dpkg install failed and apt-get -f could not repair it"
+        apt_get install -f -y >>"$LOGFILE" 2>&1 || die "dpkg install failed and apt-get -f could not repair it"
     fi
     log "Packages installed"
 
@@ -1096,7 +1174,7 @@ do_remove() {
         log "Purging packages:"
         log "$pkgs"
         # shellcheck disable=SC2086
-        apt-get purge -y $pkgs >>"$LOGFILE" 2>&1 || die "apt-get purge failed"
+        apt_get purge -y $pkgs >>"$LOGFILE" 2>&1 || die "apt-get purge failed"
     else
         log "No packages own this kernel — removing files directly"
         rm -f "$boot/vmlinuz-$kver" "$boot/initrd.img-$kver" \
@@ -1369,7 +1447,7 @@ do_setup_signing() {
     if [[ -n "$missing" ]]; then
         log "Installing signing tools: $missing"
         # shellcheck disable=SC2086
-        apt-get install -y $missing </dev/null >>"$LOGFILE" 2>&1 || die "apt-get could not install: $missing"
+        apt_get install -y $missing >>"$LOGFILE" 2>&1 || die "apt-get could not install: $missing"
     fi
 
     generate_signing_key || die "Could not create the signing key"
@@ -1461,10 +1539,10 @@ do_install_build_deps() {
         build_dep_allowed "$p" || die "Refusing to install '$p': not one of the kernel build tools"
     done
     log "==== Installing kernel build tools: $* ===="
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" </dev/null >>"$LOGFILE" 2>&1; then
+    if ! apt_get install -y "$@" >>"$LOGFILE" 2>&1; then
         log "apt-get install failed — refreshing the package index and trying once more…"
-        apt-get update </dev/null >>"$LOGFILE" 2>&1 || log "apt-get update reported errors"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" </dev/null >>"$LOGFILE" 2>&1 \
+        apt_get update >>"$LOGFILE" 2>&1 || log "apt-get update reported errors"
+        apt_get install -y "$@" >>"$LOGFILE" 2>&1 \
             || die "apt-get could not install: $*"
     fi
     log "==== Done. Build tools installed: $* ===="
