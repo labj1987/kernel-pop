@@ -1317,6 +1317,44 @@ prune_direct_sdboot_entries() {
     return 0
 }
 
+# The md5sum dpkg recorded for <path> in <package>, nothing when it has none.
+package_file_md5() {
+    local pkg="$1" path="${2#/}" f
+    for f in "$(dpkg_admin_dir)/info/$pkg.md5sums" "$(dpkg_admin_dir)/info/$pkg":*.md5sums; do
+        [[ -f "$f" ]] || continue
+        awk -v p="$path" '$2 == p { print $1; exit }' "$f"
+        return 0
+    done
+}
+
+# Set Up Signing before 2.2.3 signed the unsigned systemd-boot over the
+# .signed copy a package ships, which the distribution had signed: shim
+# trusts that one through its vendor key with no enrollment, Kernel Pop's
+# copy only once Kernel Pop's key is enrolled. Reinstalling the package puts
+# the distribution's copy back, and sign_boot_loader then keeps it. Only a
+# .signed copy that is signed with Kernel Pop's key and differs from what
+# its package shipped is touched. Run by Set Up Signing only: the apt hook
+# runs inside dpkg and cannot reinstall a package.
+restore_distribution_sdboot() {
+    local signed pkg want have
+    signed="$(sdboot_efi).signed"
+    [[ -f "$signed" ]] && signing_key_present || return 0
+    sbverify --cert "$(mok_dir)/signing.pem" "$signed" >/dev/null 2>&1 || return 0
+    pkg="$(dpkg-query -S "$signed" 2>/dev/null | grep -v '^diversion' | head -1)" || true
+    pkg="${pkg%%: *}"
+    pkg="${pkg%%,*}"
+    [[ -n "$pkg" ]] || return 0
+    want="$(package_file_md5 "$pkg" "$signed")"
+    have="$(md5sum < "$signed" | cut -d' ' -f1)"
+    [[ -n "$want" && "$want" != "$have" ]] || return 0
+    log "Putting back the distribution's signed systemd-boot: an earlier Set Up Signing replaced it with one signed only with the Kernel Pop key (reinstalling $pkg)"
+    if ! apt_get install -y --reinstall "$pkg" >>"$LOGFILE" 2>&1; then
+        log "Could not reinstall $pkg: systemd-boot stays signed with the Kernel Pop key, and boots with Secure Boot on once that key is enrolled"
+        return 0
+    fi
+    rm -f "$(sdboot_stamp)"
+}
+
 # Keep systemd-boot signed with Kernel Pop's key: the .signed copy that
 # bootctl installs, and the copy on the ESP. Signs again only when the
 # package shipped a new binary since the last signing. Run by Set Up Signing
@@ -1456,6 +1494,7 @@ setup_shim_chain() {
     vendor="$(esp_vendor)"
     V="${vendor^}"
     [[ -f "$lib/shimx64.efi.signed" ]] || { log "SIGN WARNING: shim-signed is not installed"; return 1; }
+    restore_distribution_sdboot
     sign_boot_loader || return 1
     # Every copy must be in place before a firmware entry points at it or the
     # direct systemd-boot entries go.
