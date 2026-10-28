@@ -35,9 +35,12 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # No EFI firmware directory unless a test sets one, so nothing ever mounts
 # the real machine's EFI variables; the shared list of waiting keys in $tmp.
 export KERNEL_POP_EFI="$tmp/no-efi" KERNEL_POP_MOK_PENDING="$tmp/mok-pending/list"
-# No real dpkg locks either: an empty /proc/locks and no lock files.
+# No real dpkg locks either: an empty /proc/locks and no lock files. And no
+# interrupted package run: dpkg --audit and dpkg-query report nothing.
 mkdir -p "$tmp/proc" "$tmp/dpkg"; : > "$tmp/proc/locks"
 export KERNEL_POP_PROC="$tmp/proc" KERNEL_POP_DPKG_ADMIN="$tmp/dpkg"
+dpkg() { [[ "$1" == --audit ]] && return 0; command dpkg "$@"; }
+dpkg-query() { [[ "$1" == -W ]] && return 0; command dpkg-query "$@"; }
 APT_OPTS="-o DPkg::Lock::Timeout=300"
 # Hooks and systemd-boot files Set Up Signing writes go to $tmp, never /etc.
 export KERNEL_POP_APT_HOOK="$tmp/hooks/apt-hook" KERNEL_POP_KERNEL_HOOK="$tmp/hooks/kernel-hook" \
@@ -1058,6 +1061,37 @@ EOF2
     exit "$fails"
 ) || { echo "FAIL: package lock group"; fails=$((fails + 1)); }
 rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
+
+# ── An interrupted package run is finished before apt-get runs ───────────
+(
+    fails=0
+    mkdir -p "$tmp/dpkg/updates"; : > "$tmp/dpkg/updates/0003"
+    state="$tmp/dpkg-state"; echo broken > "$state"
+    dpkg() {
+        case "$1" in
+            --audit) [[ "$(cat "$state")" == fixed ]] || echo "The following packages have been unpacked but not yet configured:" ;;
+            --configure) echo "dpkg $*" >> "$tmp/int-calls"; rm -f "$tmp/dpkg/updates/"*; echo reinst > "$state" ;;
+        esac
+        return 0
+    }
+    dpkg-query() { [[ "$(cat "$state")" == reinst ]] && printf 'iFR tailscale\nii  bash\n'; return 0; }
+    apt-get() {
+        echo "apt-get $*" >> "$tmp/int-calls"
+        [[ "$*" == *"--reinstall -y tailscale"* ]] && echo fixed > "$state"
+        return 0
+    }
+    rm -f "$tmp/int-calls"
+    out="$(do_install_build_deps pahole 2>&1 3>&1)" || bad "the install should go on after finishing the interrupted run: $out"
+    [[ "$(cat "$tmp/int-calls")" == "dpkg --configure -a"$'\n'"apt-get $APT_OPTS install -f -y"$'\n'"apt-get $APT_OPTS install --reinstall -y tailscale"$'\n'"apt-get $APT_OPTS install -y pahole" ]] \
+        || bad "interrupted-run repair got [$(cat "$tmp/int-calls")]"
+    grep -q "interrupted earlier" <<<"$out" || bad "the repair should be shown: $out"
+    grep -q "is finished — continuing" <<<"$out" || bad "the repair's end should be shown: $out"
+    # Nothing interrupted: dpkg is not touched
+    rm -f "$tmp/int-calls"
+    do_install_build_deps pahole >/dev/null 2>&1
+    [[ "$(cat "$tmp/int-calls")" == "apt-get $APT_OPTS install -y pahole" ]] || bad "a clean dpkg state still ran a repair: [$(cat "$tmp/int-calls")]"
+    exit "$fails"
+) || { echo "FAIL: interrupted dpkg group"; fails=$((fails + 1)); }
 
 # ── shim in front of systemd-boot ────────────────────────────────────────
 (

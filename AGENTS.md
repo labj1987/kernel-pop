@@ -234,7 +234,11 @@ boots once MOK Manager enrolls it.
   `dpkg_install`, never `apt-get`/`dpkg -i` directly: they wait for a
   software updater holding dpkg's locks (`package_lock_holder` reads
   `/proc/locks`, no fuser needed) and print the wait on fd 3, the script's
-  own output, since their callers send stdout to the log file.
+  own output, since their callers send stdout to the log file. They also
+  run `finish_interrupted_dpkg` first: with files in
+  `/var/lib/dpkg/updates` or any `dpkg --audit` output (a run cut off by a
+  crash or power cut), `dpkg --configure -a`, `apt-get install -f`, and
+  `--reinstall` of packages whose status has the reinst-required flag.
 
 ## Build process
 

@@ -111,11 +111,42 @@ wait_for_package_lock() {
     return 0
 }
 
-# apt-get after the lock is free. The lock timeout covers another program
-# taking it in between; noninteractive because nobody can answer a prompt.
+# apt-get after the lock is free and any interrupted package run is
+# finished. The lock timeout covers another program taking it in between;
+# noninteractive because nobody can answer a prompt.
 apt_get() {
     wait_for_package_lock
+    finish_interrupted_dpkg
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 "$@" </dev/null
+}
+
+# A package run cut off by a crash or a power cut (an update running while
+# the machine was switched off, say) leaves packages unpacked but not
+# configured, and apt then refuses everything until "dpkg --configure -a".
+# Finish it first, the way apt asks for, and reinstall a package dpkg marks
+# as needing it. Says so on fd 3; a failure is reported by the apt-get that
+# follows.
+finish_interrupted_dpkg() {
+    local pending="" reinst
+    [[ -n "$(ls -A "$(dpkg_admin_dir)/updates" 2>/dev/null)" ]] && pending=1
+    [[ -n "$(dpkg --audit 2>/dev/null)" ]] && pending=1
+    [[ -n "$pending" ]] || return 0
+    log >&3 "A package operation was interrupted earlier (a crash or a power cut during an update?). Finishing it first…"
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a </dev/null >>"$LOGFILE" 2>&1 \
+        || log >&3 "dpkg --configure -a reported errors — repairing with apt"
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -f -y </dev/null >>"$LOGFILE" 2>&1 || true
+    reinst="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk 'substr($1,3,1) == "R" {print $2}')"
+    if [[ -n "$reinst" ]]; then
+        log >&3 "Reinstalling packages the interruption left broken: ${reinst//$'\n'/ }"
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install --reinstall -y $reinst </dev/null >>"$LOGFILE" 2>&1 || true
+    fi
+    if [[ -z "$(dpkg --audit 2>/dev/null)" ]]; then
+        log >&3 "The interrupted package operation is finished — continuing"
+    else
+        log >&3 "Some packages are still not fully installed (see $LOGFILE)"
+    fi
+    return 0
 }
 
 # dpkg has no lock timeout: retry while another program holds the lock.
@@ -124,6 +155,7 @@ dpkg_install() {
     local out rc tries=0
     while :; do
         wait_for_package_lock
+        finish_interrupted_dpkg
         rc=0
         out="$(dpkg -i "$@" 2>&1)" || rc=$?
         printf '%s\n' "$out"

@@ -4,6 +4,14 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.5 — 2026-10-28
+
+**Fixed: installing the build tools (or a kernel) failing after an interrupted update.** When
+the machine was switched off or crashed while packages were being updated, apt refused to
+install anything until the interrupted run was finished ("dpkg was interrupted"). Kernel Pop now
+finishes it first: it completes the half-done package setup, repairs dependencies and reinstalls
+any package the interruption left broken, says so in the log, and then goes on.
+
 ## 2.2.4 — 2026-10-28
 
 **Fixed: a systemd-boot signed over by an earlier version stayed that way.** Before 2.2.3, Set

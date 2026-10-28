@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "kernel-pop"
-version = "2.2.4"
+version = "2.2.5"
 dependencies = [
  "anyhow",
  "futures-util",
