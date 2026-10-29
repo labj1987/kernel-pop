@@ -1355,6 +1355,29 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     exit "$fails"
 ) || { echo "FAIL: setup order group"; fails=$((fails + 1)); }
 
+# ── Unused initramfs copies on the ESP are removed ───────────────────────
+(
+    fails=0
+    pe="$tmp/prune-esp"; mid=0123abcd
+    mkdir -p "$pe/loader/entries" "$pe/$mid/9.9.9-kernelpop" "$pe/$mid/9.9.8-generic"
+    printf 'title t\nversion 9.9.9-kernelpop\nlinux /%s/9.9.9-kernelpop/linux\ninitrd /%s/9.9.9-kernelpop/initrd.img-9.9.9-kernelpop\n' "$mid" "$mid" > "$pe/loader/entries/$mid-9.9.9-kernelpop.conf"
+    printf 'title t\nversion 9.9.8-generic\nlinux /%s/9.9.8-generic/linux\ninitrd /%s/9.9.8-generic/initrd\n' "$mid" "$mid" > "$pe/loader/entries/$mid-9.9.8-generic.conf"
+    for f in linux initrd initrd.img-9.9.9-kernelpop; do echo x > "$pe/$mid/9.9.9-kernelpop/$f"; done
+    for f in linux initrd initrd.img-9.9.8-generic; do echo x > "$pe/$mid/9.9.8-generic/$f"; done
+    prune_esp_initrds "$pe" 9.9.9-kernelpop >/dev/null
+    [[ -f "$pe/$mid/9.9.9-kernelpop/initrd.img-9.9.9-kernelpop" && -f "$pe/$mid/9.9.9-kernelpop/linux" ]] || bad "prune removed what the entry uses"
+    [[ -e "$pe/$mid/9.9.9-kernelpop/initrd" ]] && bad "prune left the unused initrd"
+    # An entry that names "initrd" keeps it and loses initrd.img-*
+    prune_esp_initrds "$pe" 9.9.8-generic >/dev/null
+    [[ -f "$pe/$mid/9.9.8-generic/initrd" ]] || bad "prune removed the initrd the entry names"
+    [[ -e "$pe/$mid/9.9.8-generic/initrd.img-9.9.8-generic" ]] && bad "prune left the unused initrd.img"
+    # No entry: nothing is touched
+    mkdir -p "$pe/$mid/9.9.7-x"; echo x > "$pe/$mid/9.9.7-x/initrd"
+    prune_esp_initrds "$pe" 9.9.7-x >/dev/null
+    [[ -f "$pe/$mid/9.9.7-x/initrd" ]] || bad "prune touched a kernel without an entry"
+    exit "$fails"
+) || { echo "FAIL: ESP prune group"; fails=$((fails + 1)); }
+
 # Optional: a real finished build (debs + SHA256SUMS) in
 # $KERNEL_POP_TEST_REAL_DEBS is staged and verified.
 if [[ -n "${KERNEL_POP_TEST_REAL_DEBS:-}" ]]; then

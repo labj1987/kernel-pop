@@ -4,6 +4,14 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.7 — 2026-10-28
+
+**Fixed: kernel installs filling the ESP on systemd-boot.** Each install left a second copy of
+the initramfs in the kernel's ESP directory (one written by the package's own hook, one by Kernel
+Pop), and only one of them is ever loaded. With large initramfs images (GPU firmware, for
+example) a 1 GB ESP filled up and the next kernel install failed. Kernel Pop now removes the
+initramfs copy the boot entry does not use, after every install, signing and refresh.
+
 ## 2.2.6 — 2026-10-28
 
 **Fixed: a DKMS module loaded from the initramfs still refused with Secure Boot on.** When Set

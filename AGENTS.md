@@ -187,6 +187,10 @@ boots once MOK Manager enrolls it.
   before 2.2.3) gets its package reinstalled, which puts the
   distribution's copy back. A failed reinstall only logs. Never from the
   apt hook, which runs inside dpkg.
+- `prune_esp_initrds <esp> <kver>`: after every kernel-install add and at the
+  end of a systemd-boot install, initramfs files ("initrd", "initrd.img-*")
+  in the entry's ESP directory that the entry does not name are removed
+  (the package hook writes "initrd", Kernel Pop passes "initrd.img-<kver>").
 - `sync_signed_to_esp` returns non-zero when the ESP copy is not known to
   be signed; `do_install` then calls `esp_copy_unsigned`, which rolls the
   install back with Secure Boot enforcing (a warning with it off), like a

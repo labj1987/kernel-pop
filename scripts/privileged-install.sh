@@ -273,6 +273,35 @@ sdboot_entry_for_kver() {
     return 0
 }
 
+# kernel-install writes the initramfs under two names in a kernel's ESP
+# directory: "initrd" when the package's own hook generated it, and
+# "initrd.img-<kver>" when Kernel Pop passes its verified one. Only the one
+# the loader entry names is ever loaded; the other is dead weight (two
+# 220 MB copies per kernel filled a 1 GB ESP). Remove initramfs files in
+# that directory the entry does not name. Quiet; best effort.
+prune_esp_initrds() {
+    local esp="$1" kver="$2" entry dir used=() f name keep
+    entry="$(sdboot_entry_for_kver "$esp" "$kver")"
+    [[ -n "$entry" && -f "$entry" ]] || return 0
+    dir="$(sed -nE 's/^linux[[:space:]]+(.*[^[:space:]])[[:space:]]*$/\1/p' "$entry" | head -1)"
+    [[ -n "$dir" ]] || return 0
+    dir="$esp$(dirname "$dir")"
+    [[ -d "$dir" && "$dir" != "$esp" && "$dir" != "$esp/" ]] || return 0
+    while IFS= read -r f; do used+=("$(basename "$f")"); done \
+        < <(sed -nE 's/^initrd[[:space:]]+(.*[^[:space:]])[[:space:]]*$/\1/p' "$entry")
+    (( ${#used[@]} > 0 )) || return 0
+    for f in "$dir"/initrd "$dir"/initrd.img-*; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f")"
+        keep=0
+        for u in "${used[@]}"; do [[ "$u" == "$name" ]] && keep=1; done
+        if (( ! keep )); then
+            rm -f -- "$f" && log "Removed $f from the ESP: the boot entry for $kver does not use it"
+        fi
+    done
+    return 0
+}
+
 # The entry ID systemd-boot uses for an entry file (what bootctl
 # set-oneshot takes): the file name with any boot-counting suffix
 # ("+3.conf", "+2-1.conf") removed.
@@ -701,6 +730,7 @@ sync_signed_to_esp() {
                 log "SIGN WARNING: kernel-install add failed for $kver — the ESP copy may still be unsigned"
                 return 1
             fi
+            prune_esp_initrds "$esp" "$kver"
             ;;
         kernelstub)
             slot="$(kernelstub_slot_for_kver "$kver")"
@@ -1104,6 +1134,7 @@ do_install() {
             [[ -n "$entry" ]] || die "No systemd-boot entry appeared for $kver in $esp/loader/entries — DO NOT reboot expecting it in the menu"
             log "Verified: boot menu entry $entry exists"
             if (( signed_now )) && ! sync_signed_to_esp "$kver"; then esp_copy_unsigned "$dir" "$kver"; fi
+            prune_esp_initrds "$esp" "$kver"
             ;;
         grub)
             log "Updating GRUB…"
@@ -1626,8 +1657,11 @@ refresh_esp_copy() {
     case "$bl" in
         systemd-boot)
             [[ -f "$boot/initrd.img-$kver" ]] && initrd=("$boot/initrd.img-$kver")
-            kernel-install add "$kver" "$boot/vmlinuz-$kver" "${initrd[@]}" >>"$LOGFILE" 2>&1 \
-                || log "SIGN WARNING: kernel-install add failed for $kver — the ESP copy of its initramfs is the old one"
+            if kernel-install add "$kver" "$boot/vmlinuz-$kver" "${initrd[@]}" >>"$LOGFILE" 2>&1; then
+                prune_esp_initrds "$esp" "$kver"
+            else
+                log "SIGN WARNING: kernel-install add failed for $kver — the ESP copy of its initramfs is the old one"
+            fi
             ;;
         kernelstub)
             kernelstub >>"$LOGFILE" 2>&1 || log "SIGN WARNING: kernelstub failed — the ESP copy of $kver may be the old one"
