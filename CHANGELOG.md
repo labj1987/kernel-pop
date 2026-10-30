@@ -4,6 +4,24 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.8 — 2026-10-30
+
+Fixes from a review of the whole code base:
+
+- **Fixed: rebuilding a kernel version that is already installed could remove it.** With Secure Boot
+  on, a kernel that cannot be signed is removed again after the install, and by then it had replaced
+  the earlier build of the same version (possibly the kernel you are running). Kernel Pop now checks
+  that the new kernel can be signed before it installs anything, so a signing problem leaves your
+  installed kernels as they are.
+- **Fixed: closing the window during an install, removal or signing setup could cut it short halfway.**
+  The window now stays open until it has finished.
+- **Fixed: a release candidate counted as newer than its release.** With both 7.4-rc1 and 7.4 built,
+  removing old kernels kept the release candidate and offered the release for removal.
+- **Fixed: some DKMS modules were rebuilt on every Set Up Signing** and reported as still not signed
+  (those whose configuration names the module after its package).
+- After a failed install the System tab shows what is installed now, and pressing Build right after
+  cancelling one no longer races the cleanup of the cancelled one.
+
 ## 2.2.7 — 2026-10-28
 
 **Fixed: kernel installs filling the ESP on systemd-boot.** Each install left a second copy of

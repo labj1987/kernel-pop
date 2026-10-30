@@ -30,7 +30,8 @@ for v in '*' '../..' '../../etc' 'a/b' '' ' ' '-x' '.x' '6.8*' 'a b' '..' 'a..b'
 done
 
 # dpkg-deb stub: "<file>" -> Package name is the file's basename up to '_'
-dpkg-deb() { local b; b="$(basename "$2")"; echo "${b%%_*}"; }
+# (anything else goes to the real dpkg-deb: the trial signing unpacks a real package)
+dpkg-deb() { if [[ "$1" == -f ]]; then local b; b="$(basename "$2")"; echo "${b%%_*}"; else command dpkg-deb "$@"; fi; }
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # No EFI firmware directory unless a test sets one, so nothing ever mounts
 # the real machine's EFI variables; the shared list of waiting keys in $tmp.
@@ -128,6 +129,10 @@ got="$(KERNEL_POP_BOOT="$tmp/boot" installed_kvers | newest_kver_in_list)"
 [[ "$got" == "7.1.3-070103-generic" ]] || bad "newest_kver_in_list got [$got]"
 got="$(printf '6.9.0-1-generic\n6.10.0-1-generic\n' | newest_kver_in_list)"
 [[ "$got" == "6.10.0-1-generic" ]] || bad "newest_kver_in_list should sort numerically, got [$got]"
+got="$(printf '7.4.0-rc1-kernelpop\n7.4.0-kernelpop\n7.3.12-kernelpop\n' | newest_kver_in_list)"
+[[ "$got" == "7.4.0-kernelpop" ]] || bad "a release must be newer than its release candidate, got [$got]"
+got="$(printf '7.4.0-rc2-kernelpop\n7.4.0-rc1-kernelpop\n7.3.12-kernelpop\n' | newest_kver_in_list)"
+[[ "$got" == "7.4.0-rc2-kernelpop" ]] || bad "the newest release candidate, got [$got]"
 mkdir -p "$tmp/emptyboot"
 [[ -z "$(KERNEL_POP_BOOT="$tmp/emptyboot" installed_kvers)" ]] || bad "installed_kvers on an empty /boot"
 
@@ -439,6 +444,26 @@ else
         [[ "$got" == "$k" ]] || bad "installed_kvers should list only the kernel, got [$got]"
         remove_signed_marker "$k"
         [[ -e "$KERNEL_POP_SIGNED_DIR/$k" ]] && bad "remove_signed_marker left the marker"
+
+        # The trial signing before dpkg: the image in a real package signs, and
+        # leaves nothing behind; a package whose image is no PE, or without one, does not
+        mkpkg() {   # <dir> <kver> [image source]
+            rm -rf "$1"; mkdir -p "$1/DEBIAN" "$1/boot"
+            printf 'Package: linux-image-%s\nVersion: 1\nArchitecture: amd64\nMaintainer: t\nDescription: t\n' "$2" > "$1/DEBIAN/control"
+            [[ -n "${3:-}" ]] && cp "$3" "$1/boot/vmlinuz-$2"
+            command dpkg-deb --build --root-owner-group "$1" "$1.deb" >/dev/null
+        }
+        mkdir -p "$tmp/trial-priv"
+        mkpkg "$tmp/trialpkg" "$k" "$pe"
+        out="$(trial_sign_image "$tmp/trialpkg.deb" "$k" "$tmp/trial-priv")" || bad "the trial signing failed on a real package: $out"
+        [[ -z "$(ls -A "$tmp/trial-priv")" ]] || bad "the trial signing left files behind"
+        printf 'not a kernel image\n' > "$tmp/notpe"
+        mkpkg "$tmp/trialbad" "$k" "$tmp/notpe"
+        out="$(trial_sign_image "$tmp/trialbad.deb" "$k" "$tmp/trial-priv")" && bad "the trial signing should fail on an image that is no PE"
+        grep -q "SIGN WARNING" <<< "$out" || bad "a failed trial signing should log a SIGN WARNING"
+        [[ -z "$(ls -A "$tmp/trial-priv")" ]] || bad "a failed trial signing left files behind"
+        mkpkg "$tmp/trialnone" "$k"
+        out="$(trial_sign_image "$tmp/trialnone.deb" "$k" "$tmp/trial-priv")" && bad "the trial signing should fail on a package without the image"
 
         # sbsign failure (not a PE image): original byte-identical, no temp file, no marker
         bk=9.9.8-bad
@@ -855,6 +880,9 @@ EOF2
             if [[ -n "${SB_ON:-}" ]]; then secure_boot_enforcing() { return 0; }; else secure_boot_enforcing() { return 1; }; fi
             [[ -n "${KEY_STATE:-}" ]] && key_enrollment_state() { echo "$KEY_STATE"; }
             [[ -n "${SIGN_OK:-}" ]] && sign_kernel() { log "Signed: stub"; }
+            # The fake packages hold no image: the trial signing is stubbed (tested on a real package below)
+            trial_sign_image() { [[ -z "${TRIAL_FAIL:-}" ]] || { log "SIGN WARNING: stub trial signing failed"; return 1; }; }
+            dpkg-query() { [[ -n "${PREEXIST:-}" && "$*" == *"linux-image-$kv"* ]] && echo "install ok installed"; }
             do_install "$root/dl"
         ) 2>&1
     }
@@ -911,6 +939,16 @@ EOF2
         || bad "the rollback should purge exactly the installed packages, got [$(cat "$root/apt-args" 2>/dev/null)]"
     grep -q "removed again. Nothing is left installed" <<< "$out" || bad "the rollback should be reported: $out"
     [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "a rolled-back install changed the default"
+    # The same over an installed kernel of that version: the message says that one is gone too
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 run_install signfail-over)" && bad "do_install should fail when signing fails under Secure Boot"
+    grep -q "It had replaced the $kv installed before, which is gone with it" <<< "$out" || bad "the rollback over an installed $kv should say it is gone: $out"
+    # The image cannot be signed at all: refused before dpkg, an installed kernel untouched
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 TRIAL_FAIL=1 run_install trialfail)" && bad "do_install should refuse an image that cannot be signed"
+    [[ -e "$tmp/inst-trialfail/dpkg-args" ]] && bad "dpkg ran although the image could not be signed"
+    [[ -e "$tmp/inst-trialfail/apt-args" ]] && bad "something was purged although nothing was installed"
+    grep -q "could not be signed.*Nothing was installed" <<< "$out" || bad "the refusal should say nothing was installed: $out"
+    # Secure Boot off: no trial signing, a failed one changes nothing
+    out="$(WITH_KEY=1 TRIAL_FAIL=1 run_install trialoff)" || bad "Secure Boot off: the trial signing must not stop the install: $out"
 
     # systemd-boot, signed in /boot but the ESP copy is not, Secure Boot on:
     # undone like a failed signing
@@ -1259,6 +1297,16 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     dkms() { [[ "$1" == status ]] && echo "gpu-unlock/1.0.0, 7.2.6-070206-generic, x86_64: installed"; return 0; }
     out="$(setup_dkms_key 2>&1)"
     grep -q "SIGN WARNING: gpu-unlock 1.0.0 for 7.2.6-070206-generic was rebuilt but is still not signed" <<<"$out" || bad "an unsigned rebuild was not reported: $out"
+    # A module named after its package ("$PACKAGE_NAME", as many dkms.conf
+    # files write it) is found, and judged by its signature
+    mkdir -p "$KERNEL_POP_DKMS_TREE/v4l2loopback/0.13.2/source"
+    printf 'PACKAGE_NAME="v4l2loopback"\nBUILT_MODULE_NAME[0]="$PACKAGE_NAME"\n' > "$KERNEL_POP_DKMS_TREE/v4l2loopback/0.13.2/source/dkms.conf"
+    echo "9B:1B:75:AD" > "$kd/v4l2loopback.ko.zst"
+    dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" || bad "a \$PACKAGE_NAME module signed with the key counted as unsigned"
+    printf 'PACKAGE_NAME="v4l2loopback"\nBUILT_MODULE_NAME[0]="${PACKAGE_NAME}"\n' > "$KERNEL_POP_DKMS_TREE/v4l2loopback/0.13.2/source/dkms.conf"
+    dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" || bad "a \${PACKAGE_NAME} module signed with the key counted as unsigned"
+    echo "11:22:33:44" > "$kd/v4l2loopback.ko.zst"
+    dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" && bad "a \${PACKAGE_NAME} module signed with another key counted as signed"
     export KERNEL_POP_MODULES="$saved_modules" KERNEL_POP_BOOT="$saved_boot"
     unset -f modinfo cert_key_ids generate_initramfs refresh_esp_copy
 

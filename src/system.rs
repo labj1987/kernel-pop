@@ -692,9 +692,26 @@ pub fn install_warnings(info: &SystemInfo) -> Vec<String> {
 
 // ── Pruning old kernels ──────────────────────────────────────────────────
 
-/// Leading numeric components of a version string, for newest-first sorting.
+/// Numeric components of a version string, for newest-first sorting: the dotted release, then 1 for a
+/// release or 0 and N for its "-rcN" (a release is newer than its release candidates), then the rest.
 fn version_key(version: &str) -> Vec<u32> {
-    version.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse().ok()).collect()
+    let digits = |s: &str| -> Vec<u32> { s.split(|c: char| !c.is_ascii_digit()).filter_map(|p| p.parse().ok()).collect() };
+    let end = version.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(version.len());
+    let (release, rest) = version.split_at(end);
+    let mut key = digits(release);
+    let rc = rest.strip_prefix("-rc").map(|r| r.find(|c: char| !c.is_ascii_digit()).map_or((r, ""), |i| r.split_at(i)));
+    match rc {
+        Some((n, rest)) if !n.is_empty() => {
+            key.push(0);
+            key.push(n.parse().unwrap_or(0));
+            key.extend(digits(rest));
+        }
+        _ => {
+            key.push(1);
+            key.extend(digits(rest));
+        }
+    }
+    key
 }
 
 /// Kernels that can be removed to keep only the newest `keep` (at least 1).
@@ -1135,6 +1152,17 @@ mod tests {
         assert!(!prune_candidates(&ks, 0).contains(&"7.1.3-070103-generic".to_string()));
         // keep more than exist: nothing to remove
         assert!(prune_candidates(&ks, 10).is_empty());
+    }
+
+    /// A release is newer than its release candidates (the script's newest_kver_in_list agrees).
+    #[test]
+    fn a_release_is_newer_than_its_release_candidate() {
+        let ks =
+            vec![kernel("6.8.0-45-generic", true), kernel("7.4.0-rc1-kernelpop", false), kernel("7.4.0-kernelpop", false), kernel("7.3.12-kernelpop", false)];
+        assert_eq!(prune_candidates(&ks, 1), vec!["7.4.0-rc1-kernelpop".to_string(), "7.3.12-kernelpop".to_string()]);
+        assert!(version_key("7.4.0-rc2-kernelpop") > version_key("7.4.0-rc1-kernelpop"));
+        assert!(version_key("7.4.0-rc1-kernelpop") > version_key("7.3.12-kernelpop"));
+        assert!(version_key("6.10.0-9-generic") > version_key("6.8.0-45-generic"));
     }
 
     #[test]

@@ -814,6 +814,29 @@ secure_boot_preflight() {
     esac
 }
 
+# Sign the kernel image in <image .deb> on a copy under <private dir> and
+# verify the signature, as sign_kernel will after dpkg: whether the image can
+# be signed at all, before anything is installed.
+trial_sign_image() {
+    local deb="$1" kver="$2" priv="$3" d t
+    d="$(mok_dir)"
+    [[ -n "$deb" ]] || { log "SIGN WARNING: no linux-image package for $kver"; return 1; }
+    t="$(mktemp -d "$priv/trial-sign.XXXXXX")" || { log "SIGN WARNING: could not create a directory for the trial signing"; return 1; }
+    if ! dpkg-deb --fsys-tarfile "$deb" | tar -x -C "$t" "./boot/vmlinuz-$kver" 2>>"$LOGFILE"; then
+        rm -rf "$t"
+        log "SIGN WARNING: no boot/vmlinuz-$kver in ${deb##*/}"
+        return 1
+    fi
+    if ! sbsign --key "$d/signing.key" --cert "$d/signing.pem" --output "$t/signed" "$t/boot/vmlinuz-$kver" >>"$LOGFILE" 2>&1 \
+        || ! sbverify --cert "$d/signing.pem" "$t/signed" >>"$LOGFILE" 2>&1; then
+        rm -rf "$t"
+        log "SIGN WARNING: the kernel image of $kver could not be signed with the Kernel Pop key"
+        return 1
+    fi
+    rm -rf "$t"
+    log "Checked: the kernel image of $kver can be signed"
+}
+
 # Undo a just-finished dpkg install: purge exactly the packages of the
 # staged .debs. Used when Secure Boot is enforcing and signing failed, so no
 # kernel that shim would refuse stays installed (their postrm hooks take the
@@ -865,9 +888,11 @@ installed_kvers() {
     done
 }
 
-# Newest version in a newline-separated list on stdin (version sort).
+# Newest version in a newline-separated list on stdin (version sort). "-rc"
+# sorts as "~rc", before the release it leads to (sort -V alone ranks
+# 7.4.0-rc1-kernelpop above 7.4.0-kernelpop); the app's version_key agrees.
 newest_kver_in_list() {
-    sort -V | tail -n 1
+    sed 's/-rc\([0-9]\)/~rc\1/' | sort -V | tail -n 1 | sed 's/~rc\([0-9]\)/-rc\1/'
 }
 
 # Only a kernel image and its headers may be installed as root through this
@@ -1035,6 +1060,21 @@ do_install() {
     # Refuse up front what could not boot under Secure Boot.
     secure_boot_preflight
 
+    # With Secure Boot enforcing, a kernel that cannot be signed is removed
+    # again after dpkg, and dpkg has replaced an installed kernel of the same
+    # version by then (a rebuild, maybe of the running kernel). So the image
+    # is signed once here first, on a copy in the private staging dir: a
+    # failure stops before anything is installed.
+    local existed=0 image_deb=""
+    dpkg-query -W -f '${Status}' "linux-image-$kver" 2>/dev/null | grep -q 'install ok installed' && existed=1
+    for d in "${debs[@]}"; do
+        [[ "$(dpkg-deb -f "$d" Package)" == "linux-image-$kver" ]] && image_deb="$d"
+    done
+    if secure_boot_enforcing && signing_key_present; then
+        trial_sign_image "$image_deb" "$kver" "$dir" \
+            || die "Linux $kver could not be signed (see the SIGN WARNING above), so it could not boot while Secure Boot is enforcing. Nothing was installed. Check the signing setup on the System tab."
+    fi
+
     # Snapshot the modules directory so the post-install cross-check is honest
     local before_modules
     before_modules="$(ls -1 "$mods" 2>/dev/null || true)"
@@ -1074,6 +1114,9 @@ do_install() {
             signed_now=1
         elif secure_boot_enforcing; then
             if rollback_install "$dir"; then
+                if (( existed )); then
+                    die "$kver could not be signed (see the SIGN WARNING above), and with Secure Boot enforcing it could not boot, so it was removed again. It had replaced the $kver installed before, which is gone with it. Try again, or check the signing setup on the System tab."
+                fi
                 die "$kver could not be signed (see the SIGN WARNING above), and with Secure Boot enforcing it could not boot, so it was removed again. Nothing is left installed. Try again, or check the signing setup on the System tab."
             fi
             die "$kver could not be signed and could not be removed again — it will NOT boot while Secure Boot is enforcing. Remove it on the System tab before rebooting."
@@ -1686,6 +1729,9 @@ dkms_package_signed() {
     local m="$1" v="$2" k="$3" ids="$4" conf name f id found=0
     conf="${KERNEL_POP_DKMS_TREE:-/var/lib/dkms}/$m/$v/source/dkms.conf"
     while IFS= read -r name; do
+        # dkms.conf is shell: BUILT_MODULE_NAME[0]="$PACKAGE_NAME" names the package's own module.
+        name="${name//'${PACKAGE_NAME}'/$m}"
+        name="${name//'$PACKAGE_NAME'/$m}"
         for f in "$(modules_dir)/$k/updates/dkms/$name".ko*; do
             [[ -f "$f" ]] || continue
             found=1
