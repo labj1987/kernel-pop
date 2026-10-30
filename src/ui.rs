@@ -44,6 +44,9 @@ type BeginBusy = Rc<dyn Fn(&'static str) -> Option<BusyGuard>>;
 
 struct BusyGuard(Rc<dyn Fn()>);
 
+/// The busy states that run the privileged script: the window is not closed under them.
+const PRIVILEGED_ACTIONS: &[&str] = &["signing", "boot selection", "kernel removal", "signing setup", "build tools install", "kernel install"];
+
 impl Drop for BusyGuard {
     fn drop(&mut self) {
         (self.0)();
@@ -2238,8 +2241,9 @@ pub fn build_ui(app: &Application) {
                     let Some(prepared) = prepared_slot.borrow_mut().take() else { return };
                     if resp != "build" {
                         log_fn("Build not started; the configured tree is deleted.".to_string());
-                        spawn_async(async move { tokio::task::spawn_blocking(move || prepared.discard()).await }, |_| {});
-                        finish("");
+                        // Busy until the tree is gone: a new build at once would extract into it.
+                        let finish = finish.clone();
+                        spawn_async(async move { tokio::task::spawn_blocking(move || prepared.discard()).await }, move |_| finish(""));
                         return;
                     }
                     let krel = prepared.summary.kernelrelease.clone();
@@ -2354,8 +2358,13 @@ pub fn build_ui(app: &Application) {
                     Ok(Err(e)) => {
                         log_fn(format!("Install failed: {}", e));
                         toast_overlay.add_toast(Toast::new("Install failed — see Log tab"));
+                        // A failed install can still have changed /boot (or rolled a kernel back out).
+                        load_sysinfo();
                     }
-                    Err(e) => log_fn(format!("Task error: {}", e)),
+                    Err(e) => {
+                        log_fn(format!("Task error: {}", e));
+                        load_sysinfo();
+                    }
                 }
             });
         });
@@ -2448,10 +2457,17 @@ pub fn build_ui(app: &Application) {
     // Closing the window stops a running build first: its process group
     // would otherwise keep compiling with nobody to collect the packages.
     // The window closes once the build has stopped and cleaned up.
+    // A privileged action is not closed under: the script writes its output
+    // to the app, and with nobody reading it the next write would end the
+    // script halfway (in dpkg, or with the ESP half updated).
     {
         let state = state.clone();
         let toast_overlay = toast_overlay.clone();
         window.connect_close_request(move |w| {
+            if let Some(what) = state.borrow().busy.filter(|what| PRIVILEGED_ACTIONS.contains(what)) {
+                toast_overlay.add_toast(Toast::new(&format!("Wait until the {what} has finished before closing")));
+                return glib::Propagation::Stop;
+            }
             let Some(control) = state.borrow().build_control.clone() else {
                 return glib::Propagation::Proceed;
             };
@@ -2473,4 +2489,22 @@ pub fn build_ui(app: &Application) {
     }
 
     window.present();
+}
+
+#[cfg(test)]
+mod close_guard_tests {
+    use super::PRIVILEGED_ACTIONS;
+
+    /// Every busy state that runs the privileged script blocks closing the window; the others are a
+    /// download, a signature check and a build (which is stopped first).
+    #[test]
+    fn every_privileged_busy_state_blocks_closing() {
+        let source = include_str!("ui.rs");
+        let labels: Vec<&str> = source.split("begin_busy(\"").skip(1).filter_map(|rest| rest.split('"').next()).collect();
+        assert!(labels.len() >= 9, "found the busy states: {labels:?}");
+        for label in labels {
+            let unprivileged = ["download", "signature check", "build"].contains(&label);
+            assert_eq!(PRIVILEGED_ACTIONS.contains(&label), !unprivileged, "{label}");
+        }
+    }
 }
