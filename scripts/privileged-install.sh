@@ -2091,7 +2091,7 @@ do_remove_many() {
 # ── Build dependencies ──────────────────────────────────────────────────
 # The packages a kernel build needs (the app's BUILD_DEPS, kept equal by a
 # test). Only these names are ever installed through this mode.
-BUILD_DEPS_ALLOWED=(build-essential dpkg-dev bc bison flex debhelper kmod libdw-dev libelf-dev libssl-dev python3 rsync xz-utils pahole zstd cpio openssl gawk)
+BUILD_DEPS_ALLOWED=(build-essential dpkg-dev bc bison flex debhelper kmod libdw-dev libelf-dev libssl-dev python3 rsync xz-utils pahole zstd cpio openssl gawk ccache gnupg)
 
 build_dep_allowed() {
     local p

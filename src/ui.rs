@@ -1,6 +1,6 @@
 use crate::build::{
-    self, built_sets, ccache_available, free_bytes, is_build_cancelled, missing_build_deps, space_problem, verify_built_set, BuildControl, BuildEvent,
-    BuildRequest, BuiltSet, ConfigMode, EventSink, Prepared, SourceTrust, Stage,
+    self, built_sets, free_bytes, is_build_cancelled, missing_build_deps, space_problem, verify_built_set, BuildControl, BuildEvent, BuildRequest, BuiltSet,
+    ConfigMode, EventSink, Prepared, SourceTrust, Stage,
 };
 use crate::download::{download_files, is_cancelled, Progress, Remote};
 use crate::install::{
@@ -468,10 +468,8 @@ pub fn build_ui(app: &Application) {
         .build();
     deps_btn.add_css_class("flat");
     deps_row.add_suffix(&deps_btn);
-    let ccache_row = ActionRow::builder().title("ccache").subtitle("Checking…").build();
     let space_row = ActionRow::builder().title("Disk space").subtitle("Checking…").build();
     req_group.add(&deps_row);
-    req_group.add(&ccache_row);
     req_group.add(&space_row);
     build_page.append(&req_group);
 
@@ -1512,17 +1510,15 @@ pub fn build_ui(app: &Application) {
         })
     };
 
-    // Build tools, ccache and disk space, checked without blocking the UI.
+    // Build tools (ccache among them) and disk space, checked without blocking the UI.
     let refresh_requirements: Rc<dyn Fn()> = {
         let state = state.clone();
         let deps_row = deps_row.clone();
-        let ccache_row = ccache_row.clone();
         let space_row = space_row.clone();
         let refresh_controls = refresh_controls.clone();
         Rc::new(move || {
             let state = state.clone();
             let deps_row = deps_row.clone();
-            let ccache_row = ccache_row.clone();
             let space_row = space_row.clone();
             let refresh_controls = refresh_controls.clone();
             spawn_async(
@@ -1532,22 +1528,17 @@ pub fn build_ui(app: &Application) {
                         // build starts, so its space counts as free here.
                         let root = build::build_root();
                         let cache_free = free_bytes(&root).map(|f| f + build::dir_size(&root));
-                        (missing_build_deps(), ccache_available(), cache_free, free_bytes(std::path::Path::new("/boot")))
+                        (missing_build_deps(), cache_free, free_bytes(std::path::Path::new("/boot")))
                     })
                     .await
                 },
                 move |result| {
-                    let Ok((missing, ccache, cache_free, boot_free)) = result else { return };
+                    let Ok((missing, cache_free, boot_free)) = result else { return };
                     if missing.is_empty() {
                         deps_row.set_subtitle("All installed");
                     } else {
                         deps_row.set_subtitle(&format!("Missing: {}", missing.join(", ")));
                     }
-                    ccache_row.set_subtitle(if ccache {
-                        "Installed — used, so rebuilds and the next point release compile much faster"
-                    } else {
-                        "Not installed (optional) — install ccache to make rebuilds much faster"
-                    });
                     let (mode, boot_need) = {
                         let mut s = state.borrow_mut();
                         s.missing_deps = missing;

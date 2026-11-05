@@ -33,7 +33,9 @@ pub const LOCALVERSION: &str = "-kernelpop";
 /// bindeb-pkg itself checks bc, bison, flex, debhelper (debhelper-compat),
 /// kmod, libdw-dev, libelf-dev, libssl-dev, python3 and rsync; the Ubuntu
 /// config adds pahole (BTF), zstd (module compression), cpio, openssl
-/// (module signing key) and gawk (modules.builtin.ranges).
+/// (module signing key) and gawk (modules.builtin.ranges). ccache is required
+/// too, so rebuilds and the next point release reuse the objects of the last
+/// build, and gnupg (gpg, gpgconf, dirmngr) runs the kernel.org signature check.
 /// The privileged script's --install-build-deps accepts exactly this list.
 pub const BUILD_DEPS: &[&str] = &[
     "build-essential",
@@ -54,6 +56,8 @@ pub const BUILD_DEPS: &[&str] = &[
     "cpio",
     "openssl",
     "gawk",
+    "ccache",
+    "gnupg",
 ];
 
 /// Free space a build needs in ~/.cache, measured (docs/SOURCE_BUILD.md:
@@ -221,12 +225,6 @@ pub fn missing_build_deps() -> Vec<String> {
         Ok(o) => missing_from_dpkg_query(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => BUILD_DEPS.iter().map(|p| p.to_string()).collect(),
     }
-}
-
-/// Whether ccache is installed (used when it is: consecutive point releases
-/// share most objects).
-pub fn ccache_available() -> bool {
-    Command::new("ccache").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 fn home() -> PathBuf {
@@ -501,19 +499,17 @@ pub struct ConfigSummary {
     /// Things the configuration changed on its own or that need attention.
     pub notes: Vec<String>,
     pub modules: usize,
-    pub ccache: bool,
 }
 
 impl ConfigSummary {
     pub fn text(&self) -> String {
         let mut s = format!(
-            "Kernel: {}\nConfiguration: {}\nBase config: {}\nLOCALVERSION: {}\nModules: {}\nccache: {}\n\nFixes applied:\n",
+            "Kernel: {}\nConfiguration: {}\nBase config: {}\nLOCALVERSION: {}\nModules: {}\nccache: used\n\nFixes applied:\n",
             self.kernelrelease,
             self.mode.label(),
             self.base_config.display(),
             self.localversion,
             self.modules,
-            if self.ccache { "used" } else { "not installed" },
         );
         for f in &self.fixes {
             s.push_str(&format!("• {f}\n"));
@@ -576,12 +572,10 @@ pub fn space_problem(mode: &ConfigMode, cache_free: Option<u64>, boot_free: Opti
     None
 }
 
-fn make(tree: &Path, ccache: bool) -> Command {
+/// Every build compiles through ccache (a required build tool).
+fn make(tree: &Path) -> Command {
     let mut c = Command::new("make");
-    c.current_dir(tree);
-    if ccache {
-        c.arg("CC=ccache gcc").env("CCACHE_BASEDIR", tree);
-    }
+    c.current_dir(tree).arg("CC=ccache gcc").env("CCACHE_BASEDIR", tree);
     c
 }
 
@@ -657,7 +651,6 @@ pub fn prepare(req: BuildRequest, events: EventSink, control: Arc<BuildControl>,
 }
 
 fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) -> Result<ConfigSummary> {
-    let ccache = ccache_available();
     r.note(format!("Kernel Pop {} source build", env!("CARGO_PKG_VERSION")));
     r.note(format!(
         "Source: {} (Linux {}; building Kernel Pop's private copy {})",
@@ -704,7 +697,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
 
     let mut notes = vec![];
     if base_rust {
-        let mut c = make(tree, ccache);
+        let mut c = make(tree);
         c.arg("rustavailable");
         let (ok, lines) = r.run_with(c, "make rustavailable", true, &|_| {})?;
         if !ok {
@@ -727,7 +720,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     }
 
     let olddefconfig = || -> Result<()> {
-        let mut c = make(tree, ccache);
+        let mut c = make(tree);
         c.arg("olddefconfig");
         r.run(c, "make olddefconfig").map(|_| ())
     };
@@ -750,7 +743,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         keep.dedup();
         let list = tree.join(".kernel-pop-lsmod");
         std::fs::write(&list, lsmod_text(&keep))?;
-        let mut c = make(tree, ccache);
+        let mut c = make(tree);
         c.arg(format!("LSMOD={}", list.display())).arg("localmodconfig");
         r.run(c, "make localmodconfig")?;
         apply_fixes()?;
@@ -790,7 +783,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
             .push("CONFIG_INTEGRITY_CA_MACHINE_KEYRING is on: only CA keys from the MOK list are trusted, so a DKMS key that is not a CA would not be.".into());
     }
 
-    let mut c = make(tree, ccache);
+    let mut c = make(tree);
     c.args(["-s", "kernelrelease"]);
     let lines = r.run(c, "make kernelrelease")?;
     let kernelrelease = lines.iter().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).unwrap_or_default();
@@ -809,7 +802,6 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         fixes,
         notes,
         modules: module_count(&config),
-        ccache,
     };
     for l in summary.text().lines() {
         r.note(l.to_string());
@@ -993,7 +985,7 @@ fn run_build(p: &Prepared, r: &Runner, root: &Path) -> Result<BuiltSet> {
     let krel = &p.summary.kernelrelease;
     r.stage(Stage::Build);
     let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let mut c = make(&p.tree, p.summary.ccache);
+    let mut c = make(&p.tree);
     c.arg(format!("-j{jobs}"))
         .arg("bindeb-pkg")
         .arg(format!("KDEB_PKGVERSION={}", p.request.tarball.version.deb_version()))
@@ -1249,7 +1241,6 @@ mod tests {
             fixes: vec!["LOCALVERSION set".into()],
             notes: vec!["CONFIG_RUST turned off".into()],
             modules: 6000,
-            ccache: true,
         };
         let t = s.text();
         for want in [
@@ -1329,7 +1320,6 @@ mod tests {
             fixes: vec![],
             notes: vec![],
             modules: 1,
-            ccache: false,
         };
         let request =
             BuildRequest { tarball, trust: SourceTrust::Unverified { reason: "test".into() }, mode: ConfigMode::MatchSystem, running_kernel: "x".into() };
