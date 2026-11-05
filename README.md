@@ -55,7 +55,8 @@ VFS-panics on boot. This app is built around not letting that happen:
   Ubuntu config needs for a kernel.org tree are applied automatically, and
   a summary is shown before the build starts
 - Builds never run as root. Missing build tools are listed and installed
-  with one authentication; ccache is used when installed
+  with one authentication. ccache is one of them: every build uses it, so
+  rebuilds and the next point release compile much faster
 - Live build stage and elapsed time, the output in the Log tab and in
   `build.log`, and a Cancel button that stops the whole build
 - Only the kernel image and headers packages are installed, never the
@@ -160,7 +161,7 @@ systemd-boot while Secure Boot is on: the machine boots through them.
 
 ![Browse tab](docs/screenshots/browse-tab.png)
 
-**Build** — the source and its signature check, the configuration mode, and the build tools, ccache and disk space it needs
+**Build** — the source and its signature check, the configuration mode, and the build tools (ccache among them) and disk space it needs
 
 ![Build tab](docs/screenshots/build-tab.png)
 

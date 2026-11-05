@@ -30,7 +30,7 @@ kernel, and why each step is the way it is. The code is in `src/kernelorg.rs`,
    (`tar --strip-components=1`), configure (below), and show the summary.
 4. **Build** (`build::build`, as the user, after the summary is accepted):
    `make -j$(nproc) bindeb-pkg KDEB_PKGVERSION=<version>-1` with
-   `CC="ccache gcc"` and `CCACHE_BASEDIR` when ccache is installed, and
+   `CC="ccache gcc"` and `CCACHE_BASEDIR`, and
    `DEB_BUILD_PROFILES=pkg.linux-upstream.nokerneldbg`. Output goes to the
    Log tab and to `build.log` in the tree.
 5. **Publish.** The `linux-image-<release>` and `linux-headers-<release>`
@@ -113,8 +113,10 @@ which must equal the script's `BUILD_DEPS_ALLOWED`):
 | cpio | `CONFIG_IKHEADERS` |
 | openssl | generating the module signing key |
 | gawk | `modules.builtin.ranges` (`CONFIG_BUILTIN_MODULE_RANGES`); the first container build failed at the link step without it |
+| ccache | every build compiles through it, so a rebuild or the next point release reuses most objects (required since 2.2.9) |
+| gnupg | the kernel.org signature check (`gpg` and `dirmngr` fetch the developers' keys over WKD, `gpgconf` stops the throwaway agent) |
 
-ccache is optional and used when installed. Missing tools are installed
+Missing tools, ccache and gnupg included, are installed
 with one `pkexec … --install-build-deps <names>`, which refuses any name not
 in its allowlist.
 

@@ -4,6 +4,15 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.2.9 — 2026-11-05
+
+**ccache is now a required build tool.** It used to be optional, so a machine without it compiled
+every kernel from scratch, and the Build tab only suggested installing it. It is now on the list of
+build tools a build needs: the Build tab lists it as missing and **Install** puts it in with the other
+tools in one authentication, and every build compiles through it, so rebuilding a kernel or building
+the next point release reuses most of the last build's work. gnupg, which the kernel.org signature
+check needs, is on the list too.
+
 ## 2.2.8 — 2026-10-30
 
 Fixes from a review of the whole code base:
