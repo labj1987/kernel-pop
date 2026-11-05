@@ -128,6 +128,7 @@ impl AppState {
 enum UiMsg {
     Log(String),
     Stage(Stage),
+    Progress(f64),
 }
 
 /// The Log tab keeps this many lines; the full build output is in build.log.
@@ -483,6 +484,10 @@ pub fn build_ui(app: &Application) {
     progress.set_text(Some(""));
     progress.set_visible(false);
     build_page.append(&progress);
+    // Where the build is, 0.0 to 1.0, shown as a percentage: extracting 0%,
+    // configuring 2%, compiling 5-95% by objects compiled, packaging 95%.
+    // None while compiling when the object count is unknown: the bar pulses.
+    let build_fraction: Rc<std::cell::Cell<Option<f64>>> = Rc::new(std::cell::Cell::new(None));
 
     let build_btn_box = GtkBox::new(Orientation::Horizontal, 8);
     build_btn_box.set_halign(Align::Center);
@@ -652,6 +657,7 @@ pub fn build_ui(app: &Application) {
     {
         let append_log = append_log.clone();
         let stage_label = stage_label.clone();
+        let build_fraction = build_fraction.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Some(first) = ui_rx.recv().await {
                 let mut batch = String::new();
@@ -665,6 +671,18 @@ pub fn build_ui(app: &Application) {
                     UiMsg::Stage(s) => {
                         stage_label.set_label(s.label());
                         stage_label.set_visible(true);
+                        build_fraction.set(match s {
+                            Stage::Extract => Some(0.0),
+                            Stage::Configure => Some(0.02),
+                            Stage::Build => None,
+                            Stage::Package => Some(0.95),
+                        });
+                    }
+                    UiMsg::Progress(f) => {
+                        // A late compile line never moves the bar back from packaging.
+                        if build_fraction.get().is_none_or(|b| b < 0.95) {
+                            build_fraction.set(Some(0.05 + 0.90 * f.clamp(0.0, 1.0)));
+                        }
                     }
                 };
                 handle(first, &mut batch);
@@ -684,6 +702,7 @@ pub fn build_ui(app: &Application) {
             let _ = tx.send(match e {
                 BuildEvent::Stage(s) => UiMsg::Stage(s),
                 BuildEvent::Line(l) => UiMsg::Log(l),
+                BuildEvent::Progress(f) => UiMsg::Progress(f),
             });
         })
     };
@@ -2120,6 +2139,7 @@ pub fn build_ui(app: &Application) {
         let refresh_controls = refresh_controls.clone();
         let stage_label = stage_label.clone();
         let progress = progress.clone();
+        let build_fraction = build_fraction.clone();
         let event_sink = event_sink.clone();
         let load_built = load_built.clone();
         let stack = stack.clone();
@@ -2149,11 +2169,14 @@ pub fn build_ui(app: &Application) {
             stage_label.set_visible(true);
             progress.set_visible(true);
             progress.set_fraction(0.0);
+            build_fraction.set(Some(0.0));
 
-            // Elapsed time and a pulsing bar while the build runs.
+            // The percentage while the build runs (a pulsing bar if the object
+            // count is unknown).
             {
                 let state = state.clone();
                 let progress = progress.clone();
+                let build_fraction = build_fraction.clone();
                 // Runs while the build holds the busy state; between the
                 // configure step and the yes to the summary it just waits.
                 glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
@@ -2161,13 +2184,16 @@ pub fn build_ui(app: &Application) {
                     if s.build_control.is_none() {
                         return glib::ControlFlow::Break;
                     }
-                    match s.build_started {
-                        Some(start) => {
-                            let secs = start.elapsed().as_secs();
-                            progress.set_text(Some(&format!("{:02}:{:02}:{:02} elapsed", secs / 3600, secs / 60 % 60, secs % 60)));
+                    match (s.build_started, build_fraction.get()) {
+                        (None, _) => progress.set_text(Some("Waiting for you to confirm the configuration")),
+                        (Some(_), Some(f)) => {
+                            progress.set_fraction(f);
+                            progress.set_text(Some(&format!("{:.0}%", (f * 100.0).floor())));
+                        }
+                        (Some(_), None) => {
+                            progress.set_text(Some(""));
                             progress.pulse();
                         }
-                        None => progress.set_text(Some("Waiting for you to confirm the configuration")),
                     }
                     glib::ControlFlow::Continue
                 });

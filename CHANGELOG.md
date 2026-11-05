@@ -4,6 +4,14 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.3.0 — 2026-11-05
+
+**The Build tab shows how far a build has got as a percentage** instead of the time it has been
+running. Before the build starts, Kernel Pop counts the files the build will compile (a few seconds
+after configuring), and the bar fills as they are compiled: 5% when compiling starts, 95% when
+packaging starts, then done. If the count cannot be made, the bar moves without a percentage. The time
+a finished build took is still shown at the end.
+
 ## 2.2.9 — 2026-11-05
 
 **ccache is now a required build tool.** It used to be optional, so a machine without it compiled
