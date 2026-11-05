@@ -56,6 +56,7 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   modules, the modalias-resolved drivers of every device and
   `TUNED_EXTRA_MODULES`),
   `prepare` (disk preflight, extract into `~/.cache/kernel-pop/build/`,
+  `make prepare` + a dry run that counts the objects for the progress bar,
   configure, `ConfigSummary`) and `build` (`make bindeb-pkg`, publish to
   `~/Downloads/kernel-pop/linux-<release>/` with `SHA256SUMS`, the final
   config, build-info.txt and build.log, then delete the tree). Each command

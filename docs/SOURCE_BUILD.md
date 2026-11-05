@@ -27,11 +27,16 @@ kernel, and why each step is the way it is. The code is in `src/kernelorg.rs`,
    is kept until here, so its space counts as free), check disk space, list
    the whole tarball and refuse it if any member is outside its one
    top-level directory, extract into `~/.cache/kernel-pop/build/linux-X.Y.Z/`
-   (`tar --strip-components=1`), configure (below), and show the summary.
+   (`tar --strip-components=1`), configure (below), run `make prepare` and a
+   dry run (`make -n vmlinux modules`, a few seconds) that counts the objects
+   the build compiles, and show the summary.
 4. **Build** (`build::build`, as the user, after the summary is accepted):
    `make -j$(nproc) bindeb-pkg KDEB_PKGVERSION=<version>-1` with
    `CC="ccache gcc"` and `CCACHE_BASEDIR`, and
-   `DEB_BUILD_PROFILES=pkg.linux-upstream.nokerneldbg`. Output goes to the
+   `DEB_BUILD_PROFILES=pkg.linux-upstream.nokerneldbg`. The progress bar
+   counts kbuild's `CC`/`AS` lines for objects against the dry run's count
+   (extracting 0%, configuring 2%, compiling 5-95%, packaging 95%); without
+   a count it pulses. Output goes to the
    Log tab and to `build.log` in the tree.
 5. **Publish.** The `linux-image-<release>` and `linux-headers-<release>`
    packages (picked by their Package field) are moved into

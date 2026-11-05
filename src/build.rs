@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Appended to every kernel Kernel Pop builds: 7.2.12 becomes 7.2.12-kernelpop.
@@ -329,6 +329,9 @@ impl Stage {
 pub enum BuildEvent {
     Stage(Stage),
     Line(String),
+    /// The share of the build's objects compiled so far, 0.0 to 1.0. Sent
+    /// when the whole percentage changes; only when the object count is known.
+    Progress(f64),
 }
 
 pub type EventSink = Arc<dyn Fn(BuildEvent) + Send + Sync>;
@@ -499,6 +502,9 @@ pub struct ConfigSummary {
     /// Things the configuration changed on its own or that need attention.
     pub notes: Vec<String>,
     pub modules: usize,
+    /// How many objects the build compiles (from a dry run), for the progress
+    /// bar; None when the dry run could not count them.
+    pub objects: Option<usize>,
 }
 
 impl ConfigSummary {
@@ -570,6 +576,64 @@ pub fn space_problem(mode: &ConfigMode, cache_free: Option<u64>, boot_free: Opti
         ));
     }
     None
+}
+
+fn jobs() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// How many objects `make vmlinux modules` compiles in a prepared tree, from a
+/// dry run (`make -n -k`, a few seconds). A dry run never creates the
+/// built-in.a/lib.a archives, so the link steps that need them fail; -k lists
+/// everything else. Any other error means the count may be incomplete: None.
+fn count_objects(tree: &Path) -> Option<usize> {
+    let mut c = make(tree);
+    c.arg(format!("-j{}", jobs())).args(["-n", "-k", "vmlinux", "modules"]).stdin(Stdio::null());
+    let out = c.output().ok()?;
+    if !out.status.success() && !only_archive_errors(&String::from_utf8_lossy(&out.stderr)) {
+        return None;
+    }
+    let n = objects_in_dry_run(&String::from_utf8_lossy(&out.stdout));
+    (n > 0).then_some(n)
+}
+
+/// Whether every error in a dry run's stderr is a missing archive (`No rule to
+/// make target '<x>.a'`) or a sub-make passing such an error up.
+pub fn only_archive_errors(stderr: &str) -> bool {
+    stderr.lines().filter_map(|l| l.split_once("*** ").map(|(_, e)| e)).all(|e| {
+        e.starts_with('[') && e.contains("] Error ")
+            || e.strip_prefix("No rule to make target '").and_then(|r| r.split_once('\'')).is_some_and(|(t, _)| t.ends_with(".a"))
+    })
+}
+
+/// The distinct `-c -o <file>.o` targets of the compiler commands in a dry run.
+pub fn objects_in_dry_run(text: &str) -> usize {
+    let mut objects = std::collections::HashSet::new();
+    for line in text.lines() {
+        for (i, _) in line.match_indices(" -c -o ") {
+            if let Some(target) = line[i + " -c -o ".len()..].split_whitespace().next() {
+                if target.ends_with(".o") {
+                    objects.insert(target);
+                }
+            }
+        }
+    }
+    objects.len()
+}
+
+/// Whether a build output line is kbuild's note for one compiled object
+/// ("  CC [M]  drivers/x/y.o", "  AS      arch/x/z.o"). Module stubs
+/// (*.mod.o) come from modpost and are not in the dry run's count.
+pub fn is_object_line(l: &str) -> bool {
+    let mut words = l.split_whitespace();
+    if !matches!(words.next(), Some("CC" | "AS")) {
+        return false;
+    }
+    let mut file = words.next();
+    if file == Some("[M]") {
+        file = words.next();
+    }
+    matches!(file, Some(f) if f.ends_with(".o") && !f.ends_with(".mod.o")) && words.next().is_none()
 }
 
 /// Every build compiles through ccache (a required build tool).
@@ -794,6 +858,16 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     if kernelrelease != wanted {
         notes.push(format!("The tree adds its own local version: the kernel will be {kernelrelease}, not {wanted}."));
     }
+    // `make prepare` now (the build would start with it anyway), so a dry run
+    // can list every object the build compiles: the Build tab's progress bar.
+    let mut c = make(tree);
+    c.arg(format!("-j{}", jobs())).arg("prepare");
+    r.run(c, "make prepare")?;
+    let objects = count_objects(tree);
+    match objects {
+        Some(n) => r.note(format!("Objects to compile: {n}")),
+        None => r.note("Could not count the objects to compile; the progress bar will not show a percentage."),
+    }
     let summary = ConfigSummary {
         base_config: base_config.to_path_buf(),
         mode: req.mode.clone(),
@@ -802,6 +876,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         fixes,
         notes,
         modules: module_count(&config),
+        objects,
     };
     for l in summary.text().lines() {
         r.note(l.to_string());
@@ -984,7 +1059,7 @@ fn remove_package_outputs(root: &Path) {
 fn run_build(p: &Prepared, r: &Runner, root: &Path) -> Result<BuiltSet> {
     let krel = &p.summary.kernelrelease;
     r.stage(Stage::Build);
-    let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let jobs = jobs();
     let mut c = make(&p.tree);
     c.arg(format!("-j{jobs}"))
         .arg("bindeb-pkg")
@@ -996,10 +1071,24 @@ fn run_build(p: &Prepared, r: &Runner, root: &Path) -> Result<BuiltSet> {
         .env_remove("DEB_BUILD_OPTIONS");
     r.note(format!("make -j{jobs} bindeb-pkg KDEB_PKGVERSION={}", p.request.tarball.version.deb_version()));
     let packaging = AtomicBool::new(false);
+    let (compiled, percent) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    if p.summary.objects.is_some() {
+        (r.events)(BuildEvent::Progress(0.0));
+    }
     let on_line = |l: &str| {
         if !packaging.load(Ordering::Relaxed) && is_packaging_line(l) {
             packaging.store(true, Ordering::Relaxed);
             (r.events)(BuildEvent::Stage(Stage::Package));
+        }
+        if let Some(total) = p.summary.objects {
+            if is_object_line(l) {
+                let done = (compiled.fetch_add(1, Ordering::Relaxed) + 1).min(total);
+                let pct = done * 100 / total;
+                if pct > percent.load(Ordering::Relaxed) {
+                    percent.store(pct, Ordering::Relaxed);
+                    (r.events)(BuildEvent::Progress(done as f64 / total as f64));
+                }
+            }
         }
     };
     let (ok, _) = r.run_with(c, "make bindeb-pkg", false, &on_line)?;
@@ -1178,6 +1267,42 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_objects_are_counted_once() {
+        let text = "gcc -Wp,-MMD,init/.main.o.d -nostdinc -c -o init/main.o init/main.c\n\
+                    ccache gcc -D__ASSEMBLY__ -c -o arch/x86/entry/entry_64.o arch/x86/entry/entry_64.S\n\
+                    gcc -c -o init/main.o init/main.c\n\
+                    echo '  CC      init/main.o'\n\
+                    gcc -E -o include/generated/x.h x.c\n";
+        assert_eq!(objects_in_dry_run(text), 2);
+        assert_eq!(objects_in_dry_run(""), 0);
+    }
+
+    #[test]
+    fn dry_run_tolerates_only_missing_archives() {
+        let ok = "make[2]: *** No rule to make target 'built-in.a', needed by 'built-in-fixup.a'.\n\
+                  make[2]: *** No rule to make target 'arch/x86/lib/lib.a', needed by 'built-in-fixup.a'.\n\
+                  make[1]: *** [/tmp/linux/Makefile:1361: vmlinux_a] Error 2\n\
+                  make: *** [Makefile:248: __sub-make] Error 2\n\
+                  make: Target 'modules' not remade because of errors.\n";
+        assert!(only_archive_errors(ok));
+        assert!(only_archive_errors(""));
+        assert!(!only_archive_errors("make[2]: *** No rule to make target 'include/generated/autoconf.h', needed by 'x.o'.  Stop.\n"));
+        assert!(!only_archive_errors("make[1]: *** missing separator.  Stop.\n"));
+    }
+
+    #[test]
+    fn object_lines_are_recognised() {
+        assert!(is_object_line("  CC      init/main.o"));
+        assert!(is_object_line("  CC [M]  drivers/net/foo.o"));
+        assert!(is_object_line("  AS      arch/x86/entry/entry_64.o"));
+        assert!(!is_object_line("  CC [M]  drivers/net/foo.mod.o"));
+        assert!(!is_object_line("  LD [M]  drivers/net/foo.ko"));
+        assert!(!is_object_line("  CC      scripts/mod/devicetable-offsets.s"));
+        assert!(!is_object_line("drivers/net/foo.c: warning: CC unused"));
+        assert!(!is_object_line(""));
+    }
+
+    #[test]
     fn build_deps_match_the_privileged_allowlist() {
         let script = include_str!("../scripts/privileged-install.sh");
         let start = script.find("BUILD_DEPS_ALLOWED=(").expect("allowlist in the script") + "BUILD_DEPS_ALLOWED=(".len();
@@ -1241,6 +1366,7 @@ mod tests {
             fixes: vec!["LOCALVERSION set".into()],
             notes: vec!["CONFIG_RUST turned off".into()],
             modules: 6000,
+            objects: Some(6444),
         };
         let t = s.text();
         for want in [
@@ -1320,6 +1446,7 @@ mod tests {
             fixes: vec![],
             notes: vec![],
             modules: 1,
+            objects: None,
         };
         let request =
             BuildRequest { tarball, trust: SourceTrust::Unverified { reason: "test".into() }, mode: ConfigMode::MatchSystem, running_kernel: "x".into() };
@@ -1463,6 +1590,11 @@ mod tests {
             BuildEvent::Stage(s) => println!("[{:>6}s] STAGE {}", start.elapsed().as_secs(), s.label()),
             BuildEvent::Line(l) if l.starts_with("====") || l.contains("ERROR") || l.contains("WARNING") || l.contains("error:") => println!("{l}"),
             BuildEvent::Line(_) => {}
+            BuildEvent::Progress(f) => {
+                if ((f * 100.0).round() as u32).is_multiple_of(10) {
+                    println!("[{:>6}s] {:.0}% compiled", start.elapsed().as_secs(), f * 100.0)
+                }
+            }
         });
         let control = BuildControl::new();
         let prepared = prepare(req, events.clone(), control.clone(), 300 << 20).unwrap();

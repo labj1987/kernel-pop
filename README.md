@@ -57,7 +57,8 @@ VFS-panics on boot. This app is built around not letting that happen:
 - Builds never run as root. Missing build tools are listed and installed
   with one authentication. ccache is one of them: every build uses it, so
   rebuilds and the next point release compile much faster
-- Live build stage and elapsed time, the output in the Log tab and in
+- Live build stage and a percentage bar (from a count of the objects the build
+  compiles), the output in the Log tab and in
   `build.log`, and a Cancel button that stops the whole build
 - Only the kernel image and headers packages are installed, never the
   `linux-libc-dev` package bindeb-pkg also builds. The install step checks
