@@ -1,0 +1,107 @@
+name: Bug report
+description: Something in Kernel Pop doesn't work as it should
+labels:
+- bug
+body:
+- type: markdown
+  attributes:
+    value: |-
+      Thanks for taking the time to report this. Before you start:
+      - **Try the [newest release](https://github.com/labj1987/kernel-pop/releases/latest) first.** Every release includes the fixes before it, and yours may already be fixed.
+      - **Search the [open issues](https://github.com/labj1987/kernel-pop/issues).** If yours is there, add your details to it instead.
+      - English, please.
+      - If a new kernel doesn't boot, start the previous one from the boot menu: Kernel Pop keeps your current default.
+- type: input
+  id: version
+  attributes:
+    label: Kernel Pop version
+    description: Shown in the app's About window, or in the AppImage's file name (`kernel-pop-X.Y.Z-x86_64.AppImage`).
+    placeholder: 1.2.3
+  validations:
+    required: true
+- type: dropdown
+  id: kind
+  attributes:
+    label: What kind of problem
+    options:
+    - Download or signature check failed
+    - Configure or build failed
+    - Install failed
+    - The new kernel doesn't boot, or something is missing in it
+    - Secure Boot, MOK or module signing (DKMS, NVIDIA)
+    - The app
+    - Something else
+  validations:
+    required: true
+- type: textarea
+  id: what
+  attributes:
+    label: What happened
+    description: What you did, what you saw, and what you expected instead.
+  validations:
+    required: true
+- type: input
+  id: kernel
+  attributes:
+    label: Kernel versions
+    description: The kernel you built, and the one you were running.
+    placeholder: 7.3.3 built on 7.3.0
+  validations:
+    required: true
+- type: input
+  id: options
+  attributes:
+    label: Build options
+    description: Mainline, stable or longterm; Use my own .config; other options you changed.
+    placeholder: stable, defaults
+  validations:
+    required: false
+- type: input
+  id: system
+  attributes:
+    label: Distribution, kernel and desktop
+    description: For example from `uname -r` and your desktop's About page.
+    placeholder: Ubuntu 26.04, kernel 7.3.0, GNOME Wayland
+  validations:
+    required: true
+- type: dropdown
+  id: secureboot
+  attributes:
+    label: Secure Boot
+    options:
+    - 'On'
+    - 'Off'
+    - Not sure
+  validations:
+    required: true
+- type: input
+  id: modules
+  attributes:
+    label: DKMS modules
+    description: For example the NVIDIA driver. Leave empty if none.
+    placeholder: nvidia 620.70.06
+  validations:
+    required: false
+- type: textarea
+  id: logs
+  attributes:
+    label: Logs
+    description: Attach `/var/log/kernel-pop.log`, and for a build problem `build.log` from `~/Downloads/kernel-pop/linux-<version>-kernelpop/`. The Log tab's text helps too.
+  validations:
+    required: true
+- type: textarea
+  id: media
+  attributes:
+    label: Screenshots
+    description: For problems in the app, or the boot screen.
+  validations:
+    required: false
+- type: checkboxes
+  id: checks
+  attributes:
+    label: Before you send it
+    options:
+    - label: I'm on the newest release, or the problem is still there on it.
+      required: true
+    - label: I searched the open issues for this problem.
+      required: true
