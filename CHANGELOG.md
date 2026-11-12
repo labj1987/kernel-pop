@@ -4,6 +4,10 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.3.2 — 2026-11-12
+
+**Build:** built with Rust 1.100, new dependency versions wait 3 days after publication before they are taken, and Cargo's own lints are on. Nothing changes in the app.
+
 ## 2.3.1 — 2026-11-11
 
 **Bluetooth controllers, keyboards and mice work with a Tuned for this machine kernel.** Tuned
