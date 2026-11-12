@@ -296,7 +296,7 @@ is not.
     apt install -y libgtk-4-dev libadwaita-1-dev pkg-config
     cargo build --release --locked
 
-The compiler is pinned in `rust-toolchain.toml` (Rust 1.96.0), which rustup
+The compiler is pinned in `rust-toolchain.toml` (Rust 1.100.0), which rustup
 picks up automatically; a distribution's `cargo`/`rustc` may be older.
 
 Or build the AppImage. An ordinary user is enough once the build
