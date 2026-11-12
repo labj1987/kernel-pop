@@ -202,7 +202,7 @@ pub fn check_single_top_dir(t: &Tarball) -> Result<()> {
     }
     let prefix = format!("{}/", t.top_dir);
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = line.strip_prefix("./").unwrap_or(line);
+        let name = line.trim_prefix("./");
         if name != t.top_dir && name != prefix && !name.starts_with(&prefix) {
             bail!("The tarball holds {name}, outside its top-level directory {} — refusing to build it", t.top_dir);
         }
