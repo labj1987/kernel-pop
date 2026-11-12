@@ -128,6 +128,10 @@ pub const TUNED_EXTRA_MODULES: &[&str] = &[
     "xpad",
     "joydev",
     "uinput",
+    // Bluetooth LE controllers, keyboards and mice reach the input layer
+    // through BlueZ's userspace HID (/dev/uhid); without it they connect
+    // but never become input devices
+    "uhid",
     "i2c_hid_acpi",
     // audio and video
     "snd_usb_audio",
@@ -139,6 +143,10 @@ pub const TUNED_EXTRA_MODULES: &[&str] = &[
     "btrtl",
     "btbcm",
     "btmtk",
+    // classic Bluetooth controllers, keyboards and mice; serial; tethering
+    "hidp",
+    "rfcomm",
+    "bnep",
     // USB network adapters and phone tethering
     "usbnet",
     "cdc_ether",
@@ -467,6 +475,25 @@ pub fn config_value(config: &str, name: &str) -> Option<String> {
     config.lines().find_map(|l| l.strip_prefix(&key).map(|v| v.to_string()))
 }
 
+/// Options every kernel Kernel Pop builds must have (built in or as a
+/// module), in every mode: without them game controllers, Bluetooth
+/// controllers, keyboards and mice, or Steam Input stop working.
+pub const REQUIRED_INPUT_SYMBOLS: &[&str] = &["USB_HID", "HID_GENERIC", "UHID", "INPUT_UINPUT", "INPUT_JOYDEV"];
+/// The same for kernels with classic Bluetooth (BT_BREDR): Bluetooth HID.
+pub const REQUIRED_BLUETOOTH_SYMBOLS: &[&str] = &["BT_HIDP"];
+
+/// The required options `config` leaves off (neither y nor m). For Match
+/// and Tuned these are turned on as modules before configuring, since
+/// localmodconfig only ever removes modules.
+pub fn missing_required(config: &str) -> Vec<&'static str> {
+    let on = |s: &str| matches!(config_value(config, s).as_deref(), Some("y" | "m"));
+    let mut need: Vec<&'static str> = REQUIRED_INPUT_SYMBOLS.to_vec();
+    if on("BT") && on("BT_BREDR") {
+        need.extend_from_slice(REQUIRED_BLUETOOTH_SYMBOLS);
+    }
+    need.into_iter().filter(|s| !on(s)).collect()
+}
+
 /// The number of =m symbols: how many modules the configuration builds.
 pub fn module_count(config: &str) -> usize {
     config.lines().filter(|l| l.starts_with("CONFIG_") && l.ends_with("=m")).count()
@@ -743,6 +770,8 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     let base_rust = config_value(&base, "RUST").as_deref() == Some("y");
 
     let (debug_args, debug_text) = debug_info_args();
+    let own_config = matches!(req.mode, ConfigMode::OwnConfig(_));
+    let enable: Vec<&str> = if own_config { vec![] } else { missing_required(&base) };
     let mut fixes = vec![
         format!("LOCALVERSION set to \"{LOCALVERSION}\""),
         "SYSTEM_TRUSTED_KEYS set to \"\" (Ubuntu's points at Canonical certificate files that are not in a kernel.org tree)".to_string(),
@@ -755,8 +784,17 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
             .args(["--set-str", "SYSTEM_TRUSTED_KEYS", ""])
             .args(["--set-str", "SYSTEM_REVOCATION_KEYS", ""])
             .args(&debug_args);
+        for sym in &enable {
+            c.args(["--module", sym]);
+        }
         r.run(c, "scripts/config").map(|_| ())
     };
+    if !enable.is_empty() {
+        fixes.push(format!(
+            "CONFIG_{} turned on as modules (game controllers and Bluetooth controllers, keyboards and mice need them)",
+            enable.join(", CONFIG_")
+        ));
+    }
     apply_fixes()?;
 
     let mut notes = vec![];
@@ -826,6 +864,15 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         }
     };
     expect("LOCALVERSION", &format!("\"{LOCALVERSION}\""))?;
+    let missing = missing_required(&config);
+    if !missing.is_empty() {
+        let what = format!("CONFIG_{} is off: game controllers or Bluetooth input devices would not work with this kernel", missing.join(", CONFIG_"));
+        if own_config {
+            notes.push(format!("{what}."));
+        } else {
+            bail!("{what} — refusing to build");
+        }
+    }
     if config_value(&config, "DEBUG_INFO").is_some() {
         bail!("CONFIG_DEBUG_INFO is still on after configuring — refusing to build");
     }
@@ -1323,6 +1370,34 @@ mod tests {
             assert!(m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "{m}");
             assert!(seen.insert(*m), "{m} listed twice");
         }
+    }
+
+    #[test]
+    fn controller_and_bluetooth_input_always_kept() {
+        // The Tuned keep list has what turns a connected controller or Bluetooth device into input.
+        for m in ["uhid", "hidp", "rfcomm", "bnep", "uinput", "joydev", "usbhid", "hid_generic", "xpad"] {
+            assert!(TUNED_EXTRA_MODULES.contains(&m), "{m} missing from TUNED_EXTRA_MODULES");
+        }
+        let full = "CONFIG_USB_HID=y\nCONFIG_HID_GENERIC=y\nCONFIG_UHID=m\nCONFIG_INPUT_UINPUT=m\nCONFIG_INPUT_JOYDEV=m\nCONFIG_BT=m\nCONFIG_BT_BREDR=y\nCONFIG_BT_HIDP=m\n";
+        assert!(missing_required(full).is_empty());
+        // The 7.3.4 Tuned kernel's case: uhid off.
+        let no_uhid = full.replace("CONFIG_UHID=m\n", "# CONFIG_UHID is not set\n");
+        assert_eq!(missing_required(&no_uhid), ["UHID"]);
+        let no_hidp = full.replace("CONFIG_BT_HIDP=m\n", "");
+        assert_eq!(missing_required(&no_hidp), ["BT_HIDP"]);
+        let hidp_unset = full.replace("CONFIG_BT_HIDP=m\n", "# CONFIG_BT_HIDP is not set\n");
+        assert_eq!(missing_required(&hidp_unset), ["BT_HIDP"]);
+        // Without Bluetooth, or with LE-only Bluetooth, Bluetooth HID is not asked for.
+        let no_bt = full.replace("CONFIG_BT=m\n", "").replace("CONFIG_BT_HIDP=m\n", "");
+        assert!(missing_required(&no_bt).is_empty());
+        let le_only = full.replace("CONFIG_BT_BREDR=y\n", "").replace("CONFIG_BT_HIDP=m\n", "");
+        assert!(missing_required(&le_only).is_empty());
+        // LordNikon's 7.3.4 base (both off) asks for both, and nothing that is already y is touched.
+        let base = full
+            .replace("CONFIG_UHID=m\n", "# CONFIG_UHID is not set\n")
+            .replace("CONFIG_BT_HIDP=m\n", "# CONFIG_BT_HIDP is not set\n")
+            .replace("CONFIG_INPUT_UINPUT=m", "CONFIG_INPUT_UINPUT=y");
+        assert_eq!(missing_required(&base), ["UHID", "BT_HIDP"]);
     }
 
     #[test]

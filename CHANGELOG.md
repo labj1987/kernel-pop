@@ -4,6 +4,17 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.3.1 — 2026-11-11
+
+**Bluetooth controllers, keyboards and mice work with a Tuned for this machine kernel.** Tuned
+kernels could leave out the userspace HID driver (`uhid`), so a Bluetooth LE controller (an 8BitDo
+Ultimate 2 Wireless, for one) paired and connected but never showed up as a controller, and neither
+games nor Steam saw it. Tuned kernels now always keep `uhid`, classic Bluetooth HID (`hidp`),
+Bluetooth serial (`rfcomm`) and Bluetooth tethering (`bnep`). Match this system and Tuned builds turn
+on USB and Bluetooth HID, `uhid`, `uinput` and the joystick interface when the base config lacks
+them, and check them before building; a custom .config without them gets a warning. A kernel built
+in Tuned mode before this needs a rebuild to get them.
+
 ## 2.3.0 — 2026-11-05
 
 **The Build tab shows how far a build has got as a percentage** instead of the time it has been
