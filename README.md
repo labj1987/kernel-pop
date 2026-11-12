@@ -50,7 +50,8 @@ VFS-panics on boot. This app is built around not letting that happen:
 - Three configurations: **Match this system** (the default: the running
   kernel's `/boot/config-*`), **Tuned for this machine** (only drivers for
   the hardware in this computer plus the kinds people plug in, such as USB
-  storage, controllers, headsets, webcams, docks and VPN/container
+  storage, USB and Bluetooth controllers, keyboards and mice, headsets,
+  webcams, docks and VPN/container
   networking; about a third of the build time) and **Use my own .config**. The fixes every
   Ubuntu config needs for a kernel.org tree are applied automatically, and
   a summary is shown before the build starts
