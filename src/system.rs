@@ -53,6 +53,17 @@ pub fn is_unsupported_system(has_dpkg: bool, has_apt: bool, os_release: Option<&
     }
 }
 
+/// [`is_unsupported_system`] for this machine. Cheap (no programs started), so the window can ask
+/// before the System tab's facts are in.
+pub fn unsupported_system() -> bool {
+    is_unsupported_system(
+        command_exists("dpkg"),
+        command_exists("apt-get"),
+        std::fs::read_to_string("/etc/os-release").or_else(|_| std::fs::read_to_string("/usr/lib/os-release")).ok().as_deref(),
+        Path::new("/var/lib/dpkg/status").exists(),
+    )
+}
+
 fn os_release_is_debian(text: &str) -> bool {
     text.lines()
         .filter_map(|line| line.strip_prefix("ID=").or_else(|| line.strip_prefix("ID_LIKE=")))
@@ -378,12 +389,7 @@ pub fn query_system() -> SystemInfo {
         dkms_key: detect_dkms_key(),
         boot_path: detect_boot_path(),
         boot_needed_bytes: boot_needed_bytes(),
-        unsupported_system: is_unsupported_system(
-            command_exists("dpkg"),
-            command_exists("apt-get"),
-            std::fs::read_to_string("/etc/os-release").or_else(|_| std::fs::read_to_string("/usr/lib/os-release")).ok().as_deref(),
-            Path::new("/var/lib/dpkg/status").exists(),
-        ),
+        unsupported_system: unsupported_system(),
     }
 }
 

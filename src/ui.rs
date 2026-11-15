@@ -607,8 +607,10 @@ pub fn build_ui(app: &Application) {
     // The privileged helper must be the one this build ships: AppRun
     // installs it at startup, and a cancelled or failed install leaves the
     // old one (or none) in place. install.rs refuses to run a mismatched one.
+    // Not on a system Kernel Pop doesn't support: AppRun installs no helper there, and the
+    // unsupported-system banner says it all (asked now, so it never flashes up first).
     let helper_banner = Banner::new("");
-    match helper_problem() {
+    match helper_problem().filter(|_| !crate::system::unsupported_system()) {
         Some(problem) => {
             helper_banner.set_title(&problem);
             helper_banner.set_revealed(true);
