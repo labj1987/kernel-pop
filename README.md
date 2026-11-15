@@ -92,7 +92,11 @@ VFS-panics on boot. This app is built around not letting that happen:
 
 An x86_64 Debian- or Ubuntu-based system (apt and dpkg: Kernel Pop builds
 `.deb` packages and installs them with dpkg) with polkit, booting with GRUB,
-systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI.
+systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI. The AppImage
+uses the system's GTK 4.12+ and libadwaita 1.5+; without them Kernel Pop says which
+are missing and which packages to install, before it asks for a password. On a system
+without dpkg and apt it shows a notice that only Debian- and Ubuntu-based systems are
+supported, and building and installing stay off.
 
 ## Install
 

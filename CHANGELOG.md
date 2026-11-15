@@ -12,6 +12,16 @@ install used to fail with "Not authorized, or pkexec could not run the privilege
 that no agent is running, that nothing was changed, and which one to start (for example hyprpolkitagent
 on Hyprland, or polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway and i3).
 
+**A missing GTK 4 or libadwaita is now explained.** On a system without them (a fresh Fedora KDE or
+Hyprland install, for one) Kernel Pop used to ask for your password and then not start at all. It now
+checks first, before asking for anything, and says which libraries are missing and which packages to
+install for apt, dnf, pacman and zypper.
+
+**No false alarms on systems that are not Debian or Ubuntu.** Where dpkg or apt is missing (Fedora,
+Arch and the like), Kernel Pop used to show every kernel as "INITRD MISSING" and warn not to reboot
+into it. It now says once that it supports Debian- and Ubuntu-based systems only and that building
+and installing are disabled, and no longer reports initramfs problems there.
+
 ## 2.3.2 — 2026-11-12
 
 **Build:** built with Rust 1.100, new dependency versions wait 3 days after publication before they are taken, and Cargo's own lints are on. Nothing changes in the app.

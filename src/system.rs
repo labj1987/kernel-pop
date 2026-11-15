@@ -28,6 +28,29 @@ pub struct SystemInfo {
     /// kernel image plus twice the largest existing initramfs (the margin
     /// covers update-initramfs briefly needing more than the final size).
     pub boot_needed_bytes: u64,
+    /// dpkg or apt is missing: not a Debian- or Ubuntu-based system, where
+    /// Kernel Pop can neither build packages nor install them, and where the
+    /// initramfs and boot entries follow other naming (Fedora's
+    /// `initramfs-<version>.img`), so the per-kernel checks below mean nothing.
+    pub unsupported_system: bool,
+}
+
+/// Shown instead of the per-kernel health checks on a system without dpkg/apt.
+pub const UNSUPPORTED_TEXT: &str = "Kernel Pop supports Debian- and Ubuntu-based systems only; building and installing are disabled.";
+
+/// Kernel Pop needs both dpkg and apt-get (it builds .deb packages and installs them with dpkg).
+pub fn lacks_debian_tools(has_dpkg: bool, has_apt: bool) -> bool {
+    !(has_dpkg && has_apt)
+}
+
+/// The System tab's warning banner: the unsupported-system notice, or what is
+/// wrong with the installed kernels (never initramfs findings on a system
+/// that is not Debian-based, where the check looks for the wrong file).
+pub fn health_banner_text(info: &SystemInfo) -> Option<String> {
+    if info.unsupported_system {
+        return Some(UNSUPPORTED_TEXT.to_string());
+    }
+    health_summary(&info.kernels)
 }
 
 impl SystemInfo {
@@ -333,6 +356,7 @@ pub fn query_system() -> SystemInfo {
         dkms_key: detect_dkms_key(),
         boot_path: detect_boot_path(),
         boot_needed_bytes: boot_needed_bytes(),
+        unsupported_system: lacks_debian_tools(command_exists("dpkg"), command_exists("apt-get")),
     }
 }
 
@@ -629,6 +653,9 @@ fn boot_needed_bytes() -> u64 {
 /// queued for enrollment; anything else would leave a kernel shim refuses.
 /// The privileged script makes the same check itself before installing.
 pub fn install_blocker(info: &SystemInfo) -> Option<&'static str> {
+    if info.unsupported_system {
+        return Some(UNSUPPORTED_TEXT);
+    }
     if info.secure_boot != SecureBoot::Enabled {
         return None;
     }
@@ -1049,6 +1076,25 @@ mod tests {
             info.secure_boot = sb;
             assert!(install_blocker(&info).is_none());
         }
+    }
+
+    #[test]
+    fn a_system_without_dpkg_or_apt_is_unsupported() {
+        assert!(!lacks_debian_tools(true, true));
+        assert!(lacks_debian_tools(false, true));
+        assert!(lacks_debian_tools(true, false));
+        assert!(lacks_debian_tools(false, false));
+        // Fedora: the initramfs is initramfs-<ver>.img, so the Debian check finds none.
+        let mut fedora_kernel = kernel("7.2.11-300.fc45.x86_64", true);
+        fedora_kernel.has_initrd = false;
+        let mut info = SystemInfo { kernels: vec![fedora_kernel], unsupported_system: true, ..Default::default() };
+        assert_eq!(health_banner_text(&info).as_deref(), Some(UNSUPPORTED_TEXT));
+        assert!(!health_banner_text(&info).unwrap().contains("initramfs"));
+        assert_eq!(install_blocker(&info), Some(UNSUPPORTED_TEXT));
+        // Debian-based: unchanged behaviour.
+        info.unsupported_system = false;
+        assert!(health_banner_text(&info).unwrap().contains("missing its initramfs"));
+        assert_eq!(install_blocker(&info), None);
     }
 
     #[test]

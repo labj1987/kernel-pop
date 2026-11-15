@@ -10,8 +10,8 @@ use crate::install::{
 use crate::kernelorg::{fetch_releases, fetch_signature, url_file_name, Moniker, Release};
 use crate::source::{inspect, private_copy, Tarball};
 use crate::system::{
-    compare_to_running, format_bytes, health_summary, install_blocker, install_warnings, prune_candidates, query_system, BootEntry, BootPath, KernelSignature,
-    KernelSigning, KeyEnrollment, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
+    compare_to_running, format_bytes, health_banner_text, install_blocker, install_warnings, prune_candidates, query_system, BootEntry, BootPath,
+    KernelSignature, KernelSigning, KeyEnrollment, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
 use crate::verify::{verify_tarball, Signer};
 
@@ -732,12 +732,14 @@ pub fn build_ui(app: &Application) {
         Rc::new(move || {
             let s = state.borrow();
             let idle = s.busy.is_none();
-            download_btn.set_sensitive(idle && s.selected_release.is_some());
-            build_btn.set_sensitive(idle && s.can_build());
-            install_btn.set_sensitive(idle && s.staged.is_some() && s.staged_verified);
-            prune_btn.set_sensitive(idle);
-            setup_signing_btn.set_sensitive(idle);
-            kernels_list.set_sensitive(idle);
+            // Without dpkg/apt nothing can be built or installed.
+            let usable = idle && !s.sysinfo.unsupported_system;
+            download_btn.set_sensitive(usable && s.selected_release.is_some());
+            build_btn.set_sensitive(usable && s.can_build());
+            install_btn.set_sensitive(usable && s.staged.is_some() && s.staged_verified);
+            prune_btn.set_sensitive(usable);
+            setup_signing_btn.set_sensitive(usable);
+            kernels_list.set_sensitive(usable);
             open_btn.set_sensitive(idle);
             own_btn.set_sensitive(idle);
             recheck_btn.set_sensitive(idle);
@@ -848,6 +850,7 @@ pub fn build_ui(app: &Application) {
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
         let begin_busy = begin_busy.clone();
+        let refresh_controls = refresh_controls.clone();
 
         // Forward declaration hack: the remove action needs load_sysinfo,
         // which is what we're building. A Rc<RefCell<Option<…>>> slot breaks
@@ -876,6 +879,7 @@ pub fn build_ui(app: &Application) {
             let toast_overlay = toast_overlay.clone();
             let self_slot = self_slot.clone();
             let begin_busy = begin_busy.clone();
+            let refresh_controls = refresh_controls.clone();
 
             spawn_async(async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() }, move |info: SystemInfo| {
                 running_row.set_title(&info.running_kernel);
@@ -928,6 +932,12 @@ pub fn build_ui(app: &Application) {
                 }
                 for k in &info.kernels {
                     let mut subtitle_parts = vec![];
+                    if info.unsupported_system {
+                        // The checks below look for Debian's files: say nothing rather than raise a false alarm.
+                        let row = ActionRow::builder().title(&k.version).subtitle("installed in /boot").build();
+                        kernels_list.append(&row);
+                        continue;
+                    }
                     subtitle_parts.push(if k.has_initrd { "initrd ✓".to_string() } else { "INITRD MISSING".to_string() });
                     subtitle_parts.push(if k.has_modules { "modules ✓".to_string() } else { "modules missing".to_string() });
                     subtitle_parts.push(match k.boot_entry {
@@ -1100,7 +1110,7 @@ pub fn build_ui(app: &Application) {
                     kernels_list.append(&row);
                 }
 
-                match health_summary(&info.kernels) {
+                match health_banner_text(&info) {
                     Some(text) => {
                         health_banner.set_title(&text);
                         health_banner.set_revealed(true);
@@ -1113,6 +1123,7 @@ pub fn build_ui(app: &Application) {
                 let running_kernel = info.running_kernel.clone();
                 state.borrow_mut().sysinfo = info;
                 update_install_tab();
+                refresh_controls();
 
                 // Nice-to-have, not safety-critical: check kernel.org for a
                 // newer stable release without blocking the System tab's
