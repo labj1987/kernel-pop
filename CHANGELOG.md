@@ -4,7 +4,7 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
-## Unreleased
+## 2.4.0 — 2026-11-15
 
 **A missing password dialog is now named as the problem.** On a desktop with no polkit authentication
 agent (the program that shows the admin password dialog, often missing on Hyprland, sway and i3), an

@@ -104,6 +104,8 @@ it asks for a password. On a system
 without dpkg and apt it shows a notice that only Debian- and Ubuntu-based systems are
 supported, and building and installing stay off.
 
+Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC. Other Wayland and X11 desktops should work too.
+
 ## Install
 
 Download the AppImage from the Releases page:
