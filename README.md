@@ -92,8 +92,12 @@ VFS-panics on boot. This app is built around not letting that happen:
 
 An x86_64 Debian- or Ubuntu-based system (apt and dpkg: Kernel Pop builds
 `.deb` packages and installs them with dpkg) with polkit, booting with GRUB,
-systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI. The AppImage
-brings its own GTK 4 and libadwaita, and takes the basics every desktop has from the
+systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI. GTK 4.12+ and
+libadwaita 1.5+ from the system are used when they are there, so the window looks like
+the rest of your desktop (theme, accent colour); without them, or with older ones, the
+AppImage uses the GTK 4 and libadwaita it brings (libadwaita 1.5: dark mode, but not the
+desktop's accent colour). `KERNEL_POP_GTK=bundled` or `KERNEL_POP_GTK=host` forces one or the other.
+Either way it takes the basics every desktop has from the
 system: glibc 2.39 or newer, OpenGL/EGL drivers, X11 or Wayland client libraries, and
 fontconfig, freetype, harfbuzz and fribidi; if one is missing, Kernel Pop names it before
 it asks for a password. On a system
@@ -316,8 +320,8 @@ dependencies are installed:
         patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas
     bash build-appimage.sh
 
-The AppImage bundles the build machine's GTK 4 and libadwaita (release builds run on Ubuntu 24.04,
-which sets the glibc 2.39 floor).
+The AppImage bundles the build machine's GTK 4 and libadwaita as the fallback for systems without
+them (release builds run on Ubuntu 24.04, which sets the glibc 2.39 floor).
 
 ## Acknowledgements
 
