@@ -10,7 +10,7 @@ headings.
 agent (the program that shows the admin password dialog, often missing on Hyprland, sway and i3), an
 install used to fail with "Not authorized, or pkexec could not run the privileged helper". It now says
 that no agent is running, that nothing was changed, and which one to start (for example hyprpolkitagent
-on Hyprland, or polkit-gnome or lxqt-policykit on sway and i3).
+on Hyprland, or polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway and i3).
 
 ## 2.3.2 — 2026-11-12
 

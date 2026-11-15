@@ -109,7 +109,7 @@ kernels stay off until you restart it and authenticate.
 
 If no password dialog ever appears and Kernel Pop says that no polkit authentication
 agent is running, start one and try again. KDE, GNOME and COSMIC include one; on
-Hyprland use `hyprpolkitagent`, on sway or i3 use `polkit-gnome` or `lxqt-policykit`.
+Hyprland use `hyprpolkitagent`, on sway or i3 use `polkit-gnome` (`policykit-1-gnome` on Debian/Ubuntu) or `lxqt-policykit`.
 
 ### Updating
 
