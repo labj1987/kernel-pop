@@ -114,7 +114,7 @@ if [[ $needs_install -eq 1 ]]; then
     if [[ $rc -ne 0 ]]; then
         case $rc in
             126) why="authentication was cancelled" ;;
-            127) why="authorization failed" ;;
+            127) why="authorization failed, or no polkit authentication agent is running (if pkexec said \"No authentication agent found\", start one: hyprpolkitagent on Hyprland, polkit-gnome or lxqt-policykit on sway or i3)" ;;
             *)   why="the install failed (exit code $rc)" ;;
         esac
         echo "kernel-pop: the privileged helper was not installed or updated: $why." \

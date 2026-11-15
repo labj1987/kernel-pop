@@ -4,6 +4,14 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## Unreleased
+
+**A missing password dialog is now named as the problem.** On a desktop with no polkit authentication
+agent (the program that shows the admin password dialog, often missing on Hyprland, sway and i3), an
+install used to fail with "Not authorized, or pkexec could not run the privileged helper". It now says
+that no agent is running, that nothing was changed, and which one to start (for example hyprpolkitagent
+on Hyprland, or polkit-gnome or lxqt-policykit on sway and i3).
+
 ## 2.3.2 — 2026-11-12
 
 **Build:** built with Rust 1.100, new dependency versions wait 3 days after publication before they are taken, and Cargo's own lints are on. Nothing changes in the app.
