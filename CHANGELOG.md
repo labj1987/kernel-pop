@@ -4,6 +4,29 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.4.0 — 2026-11-15
+
+**A missing password dialog is now named as the problem.** On a desktop with no polkit authentication
+agent (the program that shows the admin password dialog, often missing on Hyprland, sway and i3), an
+install used to fail with "Not authorized, or pkexec could not run the privileged helper". It now says
+that no agent is running, that nothing was changed, and which one to start (for example hyprpolkitagent
+on Hyprland, or polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway and i3).
+
+**Runs on desktops without GTK 4 or libadwaita.** The AppImage now also carries its own GTK 4 and
+libadwaita, for systems that have none or too old a copy (older than GTK 4.12 or libadwaita 1.5), so it
+starts on a stock KDE Plasma or Hyprland install, where it used to ask for your password and then not
+start at all. Where the system has them, as on any current GNOME, Kernel Pop uses the system's, as
+before, with your theme and accent colour. If a basic system library is missing (graphics drivers,
+fonts) or the system is too old (glibc older than 2.39), Kernel Pop says so before asking for anything. `KERNEL_POP_GTK=bundled` or `KERNEL_POP_GTK=host` forces one or
+the other. The AppImage is larger: about 36 MB instead of 4 MB.
+
+**No false alarms on systems that are not Debian or Ubuntu.** Where dpkg or apt is missing (Fedora,
+Arch and the like), Kernel Pop used to show every kernel as "INITRD MISSING" and warn not to reboot
+into it. It now says once that it supports Debian- and Ubuntu-based systems only and that building
+and installing are disabled, and no longer reports initramfs problems there. It also no longer asks
+for your password at launch there, and its Build tab no longer offers to install build tools with apt.
+Fedora or Arch with the dpkg and apt packages installed count as unsupported too.
+
 ## 2.3.2 — 2026-11-12
 
 **Build:** built with Rust 1.100, new dependency versions wait 3 days after publication before they are taken, and Cargo's own lints are on. Nothing changes in the app.

@@ -228,7 +228,7 @@ pub fn missing_from_dpkg_query(output: &str) -> Vec<String> {
 }
 
 pub fn missing_build_deps() -> Vec<String> {
-    let out = Command::new("dpkg-query").args(["-W", "-f", "${Package} ${db:Status-Abbrev}\n"]).args(BUILD_DEPS).output();
+    let out = crate::host_env::command("dpkg-query").args(["-W", "-f", "${Package} ${db:Status-Abbrev}\n"]).args(BUILD_DEPS).output();
     match out {
         Ok(o) => missing_from_dpkg_query(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => BUILD_DEPS.iter().map(|p| p.to_string()).collect(),
@@ -578,7 +578,7 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     while !p.exists() {
         p = p.parent()?;
     }
-    let out = Command::new("df").args(["-B1", "--output=avail"]).arg(p).output().ok()?;
+    let out = crate::host_env::command("df").args(["-B1", "--output=avail"]).arg(p).output().ok()?;
     String::from_utf8_lossy(&out.stdout).lines().nth(1)?.trim().parse().ok()
 }
 
@@ -665,13 +665,13 @@ pub fn is_object_line(l: &str) -> bool {
 
 /// Every build compiles through ccache (a required build tool).
 fn make(tree: &Path) -> Command {
-    let mut c = Command::new("make");
+    let mut c = crate::host_env::command("make");
     c.current_dir(tree).arg("CC=ccache gcc").env("CCACHE_BASEDIR", tree);
     c
 }
 
 fn scripts_config(tree: &Path) -> Command {
-    let mut c = Command::new("bash");
+    let mut c = crate::host_env::command("bash");
     c.current_dir(tree).args(["scripts/config", "--file", ".config"]);
     c
 }
@@ -757,7 +757,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
 
     r.stage(Stage::Extract);
     crate::source::check_single_top_dir(&req.tarball)?;
-    let mut tar = Command::new("tar");
+    let mut tar = crate::host_env::command("tar");
     tar.arg("-xf").arg(&req.tarball.path).arg("-C").arg(tree).args(["--strip-components=1", "--no-same-owner"]);
     r.run(tar, "Extracting the source")?;
     if !tree.join("Makefile").is_file() || !tree.join("scripts/config").is_file() {
@@ -956,7 +956,7 @@ fn present_device_modules() -> Vec<String> {
         // One modprobe per alias (it resolves one at a time); run them in a
         // single shell to keep the process count down.
         let script = chunk.iter().map(|a| format!("modprobe -R {} 2>/dev/null;", shell_quote(a))).collect::<String>();
-        if let Ok(out) = Command::new("sh").arg("-c").arg(script).output() {
+        if let Ok(out) = crate::host_env::command("sh").arg("-c").arg(script).output() {
             for l in String::from_utf8_lossy(&out.stdout).lines() {
                 if !l.trim().is_empty() {
                     mods.insert(normalize_module(l));
@@ -1049,7 +1049,7 @@ pub fn manifest_text(entries: &BTreeMap<String, String>) -> String {
 }
 
 fn deb_package(deb: &Path) -> Result<String> {
-    let out = Command::new("dpkg-deb").arg("-f").arg(deb).arg("Package").output().context("Could not run dpkg-deb")?;
+    let out = crate::host_env::command("dpkg-deb").arg("-f").arg(deb).arg("Package").output().context("Could not run dpkg-deb")?;
     if !out.status.success() {
         bail!("{} is not a readable package", deb.display());
     }

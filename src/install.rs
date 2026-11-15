@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const SCRIPT: &str = "/usr/lib/kernel-pop/privileged-install.sh";
 
@@ -79,7 +79,7 @@ fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String
     let mut full = vec![SCRIPT.to_string()];
     full.extend_from_slice(args);
 
-    let mut cmd = Command::new("pkexec");
+    let mut cmd = crate::host_env::command("pkexec");
     cmd.args(&full).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if secret.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = cmd.spawn().context("Failed to launch pkexec — is polkit installed?")?;
@@ -98,6 +98,19 @@ fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String
     Ok(stdout)
 }
 
+/// pkexec's own complaint when no polkit authentication agent (the program
+/// that shows the admin password dialog) is running, as on a bare Hyprland,
+/// sway or i3 session. It exits 127 with this on stderr.
+const NO_AGENT_TEXTS: [&str; 2] = [
+    // With --disable-internal-agent, or when no agent is registered.
+    "No authentication agent found",
+    // What an app started from a launcher (no terminal) gets: pkexec's own
+    // text agent can't open /dev/tty.
+    "Error creating textual authentication agent",
+];
+
+const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed. Start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use hyprpolkitagent; on sway or i3 use polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit.";
+
 /// What a failed run means. pkexec itself exits 126 when the authentication
 /// dialog was dismissed and 127 when authorization failed or it could not
 /// run the program; the script can exit with any code too (127 for a missing
@@ -109,6 +122,7 @@ fn describe_failure(code: Option<i32>, stdout: &str, stderr: &str) -> String {
     let with_err = |msg: String| if err.is_empty() { msg } else { format!("{msg}\n{err}") };
     match code {
         Some(126) if !script_ran => "Authentication was cancelled.".to_string(),
+        Some(127) if !script_ran && NO_AGENT_TEXTS.iter().any(|t| stderr.contains(t)) => NO_AGENT_MESSAGE.to_string(),
         Some(127) if !script_ran => with_err("Not authorized, or pkexec could not run the privileged helper.".to_string()),
         Some(c) => with_err(format!("Script exited with code {c} (see /var/log/kernel-pop.log)\n{}", tail_lines(stdout, ERROR_TAIL_LINES))),
         None => with_err(format!("The privileged helper was killed by a signal (see /var/log/kernel-pop.log)\n{}", tail_lines(stdout, ERROR_TAIL_LINES))),
@@ -265,6 +279,15 @@ mod tests {
         let e = describe_failure(Some(127), "", "Error executing command as another user: Not authorized\n");
         assert!(e.starts_with("Not authorized"), "{e}");
         assert!(e.contains("Error executing command"), "{e}");
+        let e = describe_failure(Some(127), "", "Error executing command as another user: No authentication agent found.\n");
+        assert!(e.starts_with("No polkit authentication agent") && e.contains("hyprpolkitagent"), "{e}");
+        assert!(!e.contains("Not authorized"), "{e}");
+        let e = describe_failure(
+            Some(127),
+            "",
+            "Error creating textual authentication agent: Error opening current controlling terminal for the process (`/dev/tty'): No such device or address\n",
+        );
+        assert!(e.starts_with("No polkit authentication agent"), "{e}");
         // The script ran and itself exited 127 (a missing command): not an auth problem.
         let e = describe_failure(Some(127), "[kernel-pop] ==== Kernel install started ====\n", "privileged-install.sh: line 9: gpgv: command not found\n");
         assert!(e.starts_with("Script exited with code 127"), "{e}");

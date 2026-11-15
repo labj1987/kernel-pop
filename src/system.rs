@@ -28,6 +28,57 @@ pub struct SystemInfo {
     /// kernel image plus twice the largest existing initramfs (the margin
     /// covers update-initramfs briefly needing more than the final size).
     pub boot_needed_bytes: u64,
+    /// dpkg or apt is missing: not a Debian- or Ubuntu-based system, where
+    /// Kernel Pop can neither build packages nor install them, and where the
+    /// initramfs and boot entries follow other naming (Fedora's
+    /// `initramfs-<version>.img`), so the per-kernel checks below mean nothing.
+    pub unsupported_system: bool,
+}
+
+/// Shown instead of the per-kernel health checks on a system without dpkg/apt.
+pub const UNSUPPORTED_TEXT: &str = "Kernel Pop supports Debian- and Ubuntu-based systems only; building and installing are disabled.";
+
+/// Kernel Pop builds .deb packages and installs them with dpkg, so it needs dpkg and apt-get on a
+/// Debian- or Ubuntu-based system: `os_release` (the text of /etc/os-release, None when there is
+/// none) must name debian or ubuntu in ID or ID_LIKE, or, with no os-release, dpkg's status file
+/// must exist. dpkg and apt-get alone are not enough: Fedora and Arch package them too.
+/// AppRun's `debian_based` applies the same rule before its launch setup; keep the two in step.
+pub fn is_unsupported_system(has_dpkg: bool, has_apt: bool, os_release: Option<&str>, dpkg_status: bool) -> bool {
+    if !(has_dpkg && has_apt) {
+        return true;
+    }
+    match os_release {
+        Some(text) => !os_release_is_debian(text),
+        None => !dpkg_status,
+    }
+}
+
+/// [`is_unsupported_system`] for this machine. Cheap (no programs started), so the window can ask
+/// before the System tab's facts are in.
+pub fn unsupported_system() -> bool {
+    is_unsupported_system(
+        command_exists("dpkg"),
+        command_exists("apt-get"),
+        std::fs::read_to_string("/etc/os-release").or_else(|_| std::fs::read_to_string("/usr/lib/os-release")).ok().as_deref(),
+        Path::new("/var/lib/dpkg/status").exists(),
+    )
+}
+
+fn os_release_is_debian(text: &str) -> bool {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("ID=").or_else(|| line.strip_prefix("ID_LIKE=")))
+        .flat_map(|value| value.trim().trim_matches(|c| c == '"' || c == '\'').split_whitespace())
+        .any(|id| id == "debian" || id == "ubuntu")
+}
+
+/// The System tab's warning banner: the unsupported-system notice, or what is
+/// wrong with the installed kernels (never initramfs findings on a system
+/// that is not Debian-based, where the check looks for the wrong file).
+pub fn health_banner_text(info: &SystemInfo) -> Option<String> {
+    if info.unsupported_system {
+        return Some(UNSUPPORTED_TEXT.to_string());
+    }
+    health_summary(&info.kernels)
 }
 
 impl SystemInfo {
@@ -68,7 +119,7 @@ pub enum BootPath {
 }
 
 pub fn detect_boot_path() -> BootPath {
-    match Command::new("efibootmgr").output() {
+    match crate::host_env::command("efibootmgr").output() {
         Ok(o) if o.status.success() => parse_boot_path(&String::from_utf8_lossy(&o.stdout)),
         _ => BootPath::Unknown,
     }
@@ -215,7 +266,7 @@ pub fn detect_bootloader() -> Bootloader {
         return Bootloader::Kernelstub;
     }
     if Path::new("/sys/firmware/efi").exists() {
-        if let Ok(out) = Command::new("bootctl").arg("--print-esp-path").output() {
+        if let Ok(out) = crate::host_env::command("bootctl").arg("--print-esp-path").output() {
             if out.status.success() {
                 let esp = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !esp.is_empty() && Path::new(&format!("{esp}/loader/loader.conf")).exists() {
@@ -230,8 +281,13 @@ pub fn detect_bootloader() -> Bootloader {
     Bootloader::Unknown
 }
 
+/// Whether `name` is an executable file in a PATH directory (PATH unset: the default search path).
+/// Looked up directly, without starting a shell, so that a failure to start one can't make a
+/// program look absent.
 fn command_exists(name: &str) -> bool {
-    Command::new("sh").args(["-c", &format!("command -v {name}")]).output().map(|o| o.status.success()).unwrap_or(false)
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    std::env::split_paths(&path).any(|dir| std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
 /// Which ESP file kernelstub keeps for `version`: it copies only the kernel
@@ -333,6 +389,7 @@ pub fn query_system() -> SystemInfo {
         dkms_key: detect_dkms_key(),
         boot_path: detect_boot_path(),
         boot_needed_bytes: boot_needed_bytes(),
+        unsupported_system: unsupported_system(),
     }
 }
 
@@ -444,7 +501,7 @@ const MOK_PENDING_LIST: &str = "/var/lib/mok-pending/list";
 const DKMS_MOK_DER: &str = "/var/lib/shim-signed/mok/MOK.der";
 
 fn cert_fingerprint(der: &Path) -> Option<String> {
-    stdout_of(Command::new("openssl").args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"]).arg(der))
+    stdout_of(crate::host_env::command("openssl").args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"]).arg(der))
         .and_then(|t| parse_openssl_fingerprint(&t))
 }
 
@@ -462,7 +519,7 @@ fn key_pending(der: &Path) -> bool {
 /// `mokutil --test-key`; it prints "EFI variables are not supported" on
 /// stderr, so both streams are read.
 fn test_key(der: &Path) -> Option<TestKey> {
-    let out = Command::new("mokutil").arg("--test-key").arg(der).output().ok()?;
+    let out = crate::host_env::command("mokutil").arg("--test-key").arg(der).output().ok()?;
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     parse_mokutil_test_key(&text, Path::new("/sys/firmware/efi").exists())
 }
@@ -530,7 +587,7 @@ pub fn parse_distro_signed(text: &str) -> HashSet<String> {
 }
 
 fn distro_signed_kernels() -> HashSet<String> {
-    stdout_of(Command::new("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${source:Package}\n", "linux-image-*"]))
+    stdout_of(crate::host_env::command("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${source:Package}\n", "linux-image-*"]))
         .map(|t| parse_distro_signed(&t))
         .unwrap_or_default()
 }
@@ -593,7 +650,7 @@ fn detect_secure_boot() -> SecureBoot {
         .map(|raw| parse_secureboot_efivar(&raw))
         .unwrap_or(SecureBoot::Unknown);
     // mokutil may be missing; that is fine.
-    let mokutil = Command::new("mokutil").arg("--sb-state").output().ok().map(|o| parse_mokutil_sb_state(&String::from_utf8_lossy(&o.stdout)));
+    let mokutil = crate::host_env::command("mokutil").arg("--sb-state").output().ok().map(|o| parse_mokutil_sb_state(&String::from_utf8_lossy(&o.stdout)));
     combine_secure_boot(efi, mokutil)
 }
 
@@ -629,6 +686,9 @@ fn boot_needed_bytes() -> u64 {
 /// queued for enrollment; anything else would leave a kernel shim refuses.
 /// The privileged script makes the same check itself before installing.
 pub fn install_blocker(info: &SystemInfo) -> Option<&'static str> {
+    if info.unsupported_system {
+        return Some(UNSUPPORTED_TEXT);
+    }
     if info.secure_boot != SecureBoot::Enabled {
         return None;
     }
@@ -724,7 +784,11 @@ pub fn prune_candidates(kernels: &[InstalledKernel], keep: usize) -> Vec<String>
 
 /// uname -r
 fn get_running_kernel() -> String {
-    Command::new("uname").arg("-r").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|_| "unknown".to_string())
+    crate::host_env::command("uname")
+        .arg("-r")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Every vmlinuz-* in /boot, with initrd and modules presence checks.
@@ -759,7 +823,7 @@ fn get_installed_kernels(running: &str, bootloader: &Bootloader, signing_key_pre
 
 /// Free space at a mount point via df -B1.
 fn get_free_disk(path: &str) -> Option<u64> {
-    let out = Command::new("df").args(["-B1", "--output=avail", path]).output().ok()?;
+    let out = crate::host_env::command("df").args(["-B1", "--output=avail", path]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok())
 }
@@ -1049,6 +1113,38 @@ mod tests {
             info.secure_boot = sb;
             assert!(install_blocker(&info).is_none());
         }
+    }
+
+    #[test]
+    fn a_system_without_dpkg_or_apt_is_unsupported() {
+        let ubuntu = Some("NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n");
+        assert!(!is_unsupported_system(true, true, ubuntu, true));
+        assert!(is_unsupported_system(false, true, ubuntu, true));
+        assert!(is_unsupported_system(true, false, ubuntu, true));
+        assert!(is_unsupported_system(false, false, ubuntu, true));
+        assert!(!is_unsupported_system(true, true, Some("ID=pop\nID_LIKE=\"ubuntu debian\"\n"), false));
+        assert!(!is_unsupported_system(true, true, Some("ID='debian'\n"), false));
+        assert!(!is_unsupported_system(true, true, Some("ID=linuxmint\nID_LIKE=ubuntu\n"), false));
+        // Fedora and Arch with the dpkg and apt packages installed.
+        assert!(is_unsupported_system(true, true, Some("ID=fedora\n"), true));
+        assert!(is_unsupported_system(true, true, Some("ID=cachyos\nID_LIKE=arch\n"), true));
+        // "debianish" is not debian; VERSION_ID and the like are not read.
+        assert!(is_unsupported_system(true, true, Some("ID=debianish\nVERSION_CODENAME=ubuntu\n"), true));
+        // No os-release: dpkg's status file decides.
+        assert!(!is_unsupported_system(true, true, None, true));
+        assert!(is_unsupported_system(true, true, None, false));
+        assert!(command_exists("sh") && !command_exists("no-such-program-kernel-pop"));
+        // Fedora: the initramfs is initramfs-<ver>.img, so the Debian check finds none.
+        let mut fedora_kernel = kernel("7.2.11-300.fc45.x86_64", true);
+        fedora_kernel.has_initrd = false;
+        let mut info = SystemInfo { kernels: vec![fedora_kernel], unsupported_system: true, ..Default::default() };
+        assert_eq!(health_banner_text(&info).as_deref(), Some(UNSUPPORTED_TEXT));
+        assert!(!health_banner_text(&info).unwrap().contains("initramfs"));
+        assert_eq!(install_blocker(&info), Some(UNSUPPORTED_TEXT));
+        // Debian-based: unchanged behaviour.
+        info.unsupported_system = false;
+        assert!(health_banner_text(&info).unwrap().contains("missing its initramfs"));
+        assert_eq!(install_blocker(&info), None);
     }
 
     #[test]

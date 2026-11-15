@@ -10,8 +10,8 @@ use crate::install::{
 use crate::kernelorg::{fetch_releases, fetch_signature, url_file_name, Moniker, Release};
 use crate::source::{inspect, private_copy, Tarball};
 use crate::system::{
-    compare_to_running, format_bytes, health_summary, install_blocker, install_warnings, prune_candidates, query_system, BootEntry, BootPath, KernelSignature,
-    KernelSigning, KeyEnrollment, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
+    compare_to_running, format_bytes, health_banner_text, install_blocker, install_warnings, prune_candidates, query_system, BootEntry, BootPath,
+    KernelSignature, KernelSigning, KeyEnrollment, SecureBoot, SystemInfo, VersionRelation, MIN_ROOT_BYTES,
 };
 use crate::verify::{verify_tarball, Signer};
 
@@ -607,8 +607,10 @@ pub fn build_ui(app: &Application) {
     // The privileged helper must be the one this build ships: AppRun
     // installs it at startup, and a cancelled or failed install leaves the
     // old one (or none) in place. install.rs refuses to run a mismatched one.
+    // Not on a system Kernel Pop doesn't support: AppRun installs no helper there, and the
+    // unsupported-system banner says it all (asked now, so it never flashes up first).
     let helper_banner = Banner::new("");
-    match helper_problem() {
+    match helper_problem().filter(|_| !crate::system::unsupported_system()) {
         Some(problem) => {
             helper_banner.set_title(&problem);
             helper_banner.set_revealed(true);
@@ -726,24 +728,31 @@ pub fn build_ui(app: &Application) {
         let recheck_btn = recheck_btn.clone();
         let unverified_row = unverified_row.clone();
         let deps_btn = deps_btn.clone();
+        let deps_row = deps_row.clone();
         let config_group = config_group.clone();
         let built_list = built_list.clone();
         let delete_built_btn = delete_built_btn.clone();
         Rc::new(move || {
             let s = state.borrow();
             let idle = s.busy.is_none();
-            download_btn.set_sensitive(idle && s.selected_release.is_some());
-            build_btn.set_sensitive(idle && s.can_build());
-            install_btn.set_sensitive(idle && s.staged.is_some() && s.staged_verified);
-            prune_btn.set_sensitive(idle);
-            setup_signing_btn.set_sensitive(idle);
-            kernels_list.set_sensitive(idle);
+            // Without dpkg/apt nothing can be built or installed.
+            let usable = idle && !s.sysinfo.unsupported_system;
+            download_btn.set_sensitive(usable && s.selected_release.is_some());
+            build_btn.set_sensitive(usable && s.can_build());
+            install_btn.set_sensitive(usable && s.staged.is_some() && s.staged_verified);
+            prune_btn.set_sensitive(usable);
+            setup_signing_btn.set_sensitive(usable);
+            kernels_list.set_sensitive(usable);
             open_btn.set_sensitive(idle);
             own_btn.set_sensitive(idle);
             recheck_btn.set_sensitive(idle);
             unverified_row.set_sensitive(idle);
-            deps_btn.set_sensitive(idle);
+            // Installing build tools needs apt: off where nothing can be built.
+            deps_btn.set_sensitive(usable);
             deps_btn.set_visible(!s.missing_deps.is_empty());
+            if s.sysinfo.unsupported_system {
+                deps_row.set_subtitle("Not checked: building needs a Debian- or Ubuntu-based system");
+            }
             config_group.set_sensitive(idle);
             built_list.set_sensitive(idle);
             delete_built_btn.set_sensitive(idle);
@@ -841,6 +850,7 @@ pub fn build_ui(app: &Application) {
         let signing_row = signing_row.clone();
         let setup_signing_btn = setup_signing_btn.clone();
         let health_banner = health_banner.clone();
+        let helper_banner = helper_banner.clone();
         let update_banner = update_banner.clone();
         let state = state.clone();
         let update_install_tab = update_install_tab.clone();
@@ -868,6 +878,7 @@ pub fn build_ui(app: &Application) {
             let signing_row = signing_row.clone();
             let setup_signing_btn = setup_signing_btn.clone();
             let health_banner = health_banner.clone();
+            let helper_banner = helper_banner.clone();
             let update_banner = update_banner.clone();
             let state = state.clone();
             let update_install_tab = update_install_tab.clone();
@@ -928,6 +939,12 @@ pub fn build_ui(app: &Application) {
                 }
                 for k in &info.kernels {
                     let mut subtitle_parts = vec![];
+                    if info.unsupported_system {
+                        // The checks below look for Debian's files: say nothing rather than raise a false alarm.
+                        let row = ActionRow::builder().title(&k.version).subtitle("installed in /boot").build();
+                        kernels_list.append(&row);
+                        continue;
+                    }
                     subtitle_parts.push(if k.has_initrd { "initrd ✓".to_string() } else { "INITRD MISSING".to_string() });
                     subtitle_parts.push(if k.has_modules { "modules ✓".to_string() } else { "modules missing".to_string() });
                     subtitle_parts.push(match k.boot_entry {
@@ -1100,7 +1117,12 @@ pub fn build_ui(app: &Application) {
                     kernels_list.append(&row);
                 }
 
-                match health_summary(&info.kernels) {
+                if info.unsupported_system {
+                    // AppRun doesn't install the helper here, and nothing would use it: the
+                    // unsupported-system banner says all there is to say.
+                    helper_banner.set_revealed(false);
+                }
+                match health_banner_text(&info) {
                     Some(text) => {
                         health_banner.set_title(&text);
                         health_banner.set_revealed(true);
@@ -2458,6 +2480,9 @@ pub fn build_ui(app: &Application) {
                     running, count
                 ))
                 .build();
+            // The website and issue links: opened with the system's environment, not GTK's fallback
+            // (which would start the browser with the AppImage's GTK variables).
+            dialog.connect_activate_link(|_, uri| crate::host_env::open_uri(uri));
             dialog.add_credit_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
             dialog.present(Some(&window));
         });

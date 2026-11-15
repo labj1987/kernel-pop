@@ -1,5 +1,6 @@
 mod build;
 mod download;
+mod host_env;
 mod install;
 mod kernelorg;
 mod source;
