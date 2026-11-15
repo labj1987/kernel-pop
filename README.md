@@ -98,7 +98,7 @@ the rest of your desktop (theme, accent colour); without them, or with older one
 AppImage uses the GTK 4 and libadwaita it brings (libadwaita 1.5: dark mode, but not the
 desktop's accent colour). `KERNEL_POP_GTK=bundled` or `KERNEL_POP_GTK=host` forces one or the other.
 Either way it takes the basics every desktop has from the
-system: glibc 2.39 or newer, OpenGL/EGL drivers, X11 or Wayland client libraries, and
+system: glibc 2.39 or newer, OpenGL/EGL drivers and the Vulkan loader, X11 or Wayland client libraries, and
 fontconfig, freetype, harfbuzz and fribidi; if one is missing, Kernel Pop names it before
 it asks for a password. On a system
 without dpkg and apt it shows a notice that only Debian- and Ubuntu-based systems are

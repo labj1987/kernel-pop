@@ -38,9 +38,26 @@ pub struct SystemInfo {
 /// Shown instead of the per-kernel health checks on a system without dpkg/apt.
 pub const UNSUPPORTED_TEXT: &str = "Kernel Pop supports Debian- and Ubuntu-based systems only; building and installing are disabled.";
 
-/// Kernel Pop needs both dpkg and apt-get (it builds .deb packages and installs them with dpkg).
-pub fn lacks_debian_tools(has_dpkg: bool, has_apt: bool) -> bool {
-    !(has_dpkg && has_apt)
+/// Kernel Pop builds .deb packages and installs them with dpkg, so it needs dpkg and apt-get on a
+/// Debian- or Ubuntu-based system: `os_release` (the text of /etc/os-release, None when there is
+/// none) must name debian or ubuntu in ID or ID_LIKE, or, with no os-release, dpkg's status file
+/// must exist. dpkg and apt-get alone are not enough: Fedora and Arch package them too.
+/// AppRun's `debian_based` applies the same rule before its launch setup; keep the two in step.
+pub fn is_unsupported_system(has_dpkg: bool, has_apt: bool, os_release: Option<&str>, dpkg_status: bool) -> bool {
+    if !(has_dpkg && has_apt) {
+        return true;
+    }
+    match os_release {
+        Some(text) => !os_release_is_debian(text),
+        None => !dpkg_status,
+    }
+}
+
+fn os_release_is_debian(text: &str) -> bool {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("ID=").or_else(|| line.strip_prefix("ID_LIKE=")))
+        .flat_map(|value| value.trim().trim_matches(|c| c == '"' || c == '\'').split_whitespace())
+        .any(|id| id == "debian" || id == "ubuntu")
 }
 
 /// The System tab's warning banner: the unsupported-system notice, or what is
@@ -253,8 +270,13 @@ pub fn detect_bootloader() -> Bootloader {
     Bootloader::Unknown
 }
 
+/// Whether `name` is an executable file in a PATH directory (PATH unset: the default search path).
+/// Looked up directly, without starting a shell, so that a failure to start one can't make a
+/// program look absent.
 fn command_exists(name: &str) -> bool {
-    crate::host_env::command("sh").args(["-c", &format!("command -v {name}")]).output().map(|o| o.status.success()).unwrap_or(false)
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    std::env::split_paths(&path).any(|dir| std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
 /// Which ESP file kernelstub keeps for `version`: it copies only the kernel
@@ -356,7 +378,12 @@ pub fn query_system() -> SystemInfo {
         dkms_key: detect_dkms_key(),
         boot_path: detect_boot_path(),
         boot_needed_bytes: boot_needed_bytes(),
-        unsupported_system: lacks_debian_tools(command_exists("dpkg"), command_exists("apt-get")),
+        unsupported_system: is_unsupported_system(
+            command_exists("dpkg"),
+            command_exists("apt-get"),
+            std::fs::read_to_string("/etc/os-release").or_else(|_| std::fs::read_to_string("/usr/lib/os-release")).ok().as_deref(),
+            Path::new("/var/lib/dpkg/status").exists(),
+        ),
     }
 }
 
@@ -1084,10 +1111,23 @@ mod tests {
 
     #[test]
     fn a_system_without_dpkg_or_apt_is_unsupported() {
-        assert!(!lacks_debian_tools(true, true));
-        assert!(lacks_debian_tools(false, true));
-        assert!(lacks_debian_tools(true, false));
-        assert!(lacks_debian_tools(false, false));
+        let ubuntu = Some("NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n");
+        assert!(!is_unsupported_system(true, true, ubuntu, true));
+        assert!(is_unsupported_system(false, true, ubuntu, true));
+        assert!(is_unsupported_system(true, false, ubuntu, true));
+        assert!(is_unsupported_system(false, false, ubuntu, true));
+        assert!(!is_unsupported_system(true, true, Some("ID=pop\nID_LIKE=\"ubuntu debian\"\n"), false));
+        assert!(!is_unsupported_system(true, true, Some("ID='debian'\n"), false));
+        assert!(!is_unsupported_system(true, true, Some("ID=linuxmint\nID_LIKE=ubuntu\n"), false));
+        // Fedora and Arch with the dpkg and apt packages installed.
+        assert!(is_unsupported_system(true, true, Some("ID=fedora\n"), true));
+        assert!(is_unsupported_system(true, true, Some("ID=cachyos\nID_LIKE=arch\n"), true));
+        // "debianish" is not debian; VERSION_ID and the like are not read.
+        assert!(is_unsupported_system(true, true, Some("ID=debianish\nVERSION_CODENAME=ubuntu\n"), true));
+        // No os-release: dpkg's status file decides.
+        assert!(!is_unsupported_system(true, true, None, true));
+        assert!(is_unsupported_system(true, true, None, false));
+        assert!(command_exists("sh") && !command_exists("no-such-program-kernel-pop"));
         // Fedora: the initramfs is initramfs-<ver>.img, so the Debian check finds none.
         let mut fedora_kernel = kernel("7.2.11-300.fc45.x86_64", true);
         fedora_kernel.has_initrd = false;

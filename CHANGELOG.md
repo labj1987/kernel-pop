@@ -17,13 +17,15 @@ libadwaita, for systems that have none or too old a copy (older than GTK 4.12 or
 starts on a stock KDE Plasma or Hyprland install, where it used to ask for your password and then not
 start at all. Where the system has them, as on any current GNOME, Kernel Pop uses the system's, as
 before, with your theme and accent colour. If a basic system library is missing (graphics drivers,
-fonts), Kernel Pop names it before asking for anything. `KERNEL_POP_GTK=bundled` or `KERNEL_POP_GTK=host` forces one or
+fonts) or the system is too old (glibc older than 2.39), Kernel Pop says so before asking for anything. `KERNEL_POP_GTK=bundled` or `KERNEL_POP_GTK=host` forces one or
 the other. The AppImage is larger: about 36 MB instead of 4 MB.
 
 **No false alarms on systems that are not Debian or Ubuntu.** Where dpkg or apt is missing (Fedora,
 Arch and the like), Kernel Pop used to show every kernel as "INITRD MISSING" and warn not to reboot
 into it. It now says once that it supports Debian- and Ubuntu-based systems only and that building
-and installing are disabled, and no longer reports initramfs problems there.
+and installing are disabled, and no longer reports initramfs problems there. It also no longer asks
+for your password at launch there, and its Build tab no longer offers to install build tools with apt.
+Fedora or Arch with the dpkg and apt packages installed count as unsupported too.
 
 ## 2.3.2 — 2026-11-12
 

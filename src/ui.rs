@@ -726,6 +726,7 @@ pub fn build_ui(app: &Application) {
         let recheck_btn = recheck_btn.clone();
         let unverified_row = unverified_row.clone();
         let deps_btn = deps_btn.clone();
+        let deps_row = deps_row.clone();
         let config_group = config_group.clone();
         let built_list = built_list.clone();
         let delete_built_btn = delete_built_btn.clone();
@@ -744,8 +745,12 @@ pub fn build_ui(app: &Application) {
             own_btn.set_sensitive(idle);
             recheck_btn.set_sensitive(idle);
             unverified_row.set_sensitive(idle);
-            deps_btn.set_sensitive(idle);
+            // Installing build tools needs apt: off where nothing can be built.
+            deps_btn.set_sensitive(usable);
             deps_btn.set_visible(!s.missing_deps.is_empty());
+            if s.sysinfo.unsupported_system {
+                deps_row.set_subtitle("Not checked: building needs a Debian- or Ubuntu-based system");
+            }
             config_group.set_sensitive(idle);
             built_list.set_sensitive(idle);
             delete_built_btn.set_sensitive(idle);
@@ -843,6 +848,7 @@ pub fn build_ui(app: &Application) {
         let signing_row = signing_row.clone();
         let setup_signing_btn = setup_signing_btn.clone();
         let health_banner = health_banner.clone();
+        let helper_banner = helper_banner.clone();
         let update_banner = update_banner.clone();
         let state = state.clone();
         let update_install_tab = update_install_tab.clone();
@@ -850,7 +856,6 @@ pub fn build_ui(app: &Application) {
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
         let begin_busy = begin_busy.clone();
-        let refresh_controls = refresh_controls.clone();
 
         // Forward declaration hack: the remove action needs load_sysinfo,
         // which is what we're building. A Rc<RefCell<Option<…>>> slot breaks
@@ -871,6 +876,7 @@ pub fn build_ui(app: &Application) {
             let signing_row = signing_row.clone();
             let setup_signing_btn = setup_signing_btn.clone();
             let health_banner = health_banner.clone();
+            let helper_banner = helper_banner.clone();
             let update_banner = update_banner.clone();
             let state = state.clone();
             let update_install_tab = update_install_tab.clone();
@@ -879,7 +885,6 @@ pub fn build_ui(app: &Application) {
             let toast_overlay = toast_overlay.clone();
             let self_slot = self_slot.clone();
             let begin_busy = begin_busy.clone();
-            let refresh_controls = refresh_controls.clone();
 
             spawn_async(async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() }, move |info: SystemInfo| {
                 running_row.set_title(&info.running_kernel);
@@ -1110,6 +1115,11 @@ pub fn build_ui(app: &Application) {
                     kernels_list.append(&row);
                 }
 
+                if info.unsupported_system {
+                    // AppRun doesn't install the helper here, and nothing would use it: the
+                    // unsupported-system banner says all there is to say.
+                    helper_banner.set_revealed(false);
+                }
                 match health_banner_text(&info) {
                     Some(text) => {
                         health_banner.set_title(&text);
@@ -1123,7 +1133,6 @@ pub fn build_ui(app: &Application) {
                 let running_kernel = info.running_kernel.clone();
                 state.borrow_mut().sysinfo = info;
                 update_install_tab();
-                refresh_controls();
 
                 // Nice-to-have, not safety-critical: check kernel.org for a
                 // newer stable release without blocking the System tab's
@@ -2469,6 +2478,9 @@ pub fn build_ui(app: &Application) {
                     running, count
                 ))
                 .build();
+            // The website and issue links: opened with the system's environment, not GTK's fallback
+            // (which would start the browser with the AppImage's GTK variables).
+            dialog.connect_activate_link(|_, uri| crate::host_env::open_uri(uri));
             dialog.add_credit_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
             dialog.present(Some(&window));
         });

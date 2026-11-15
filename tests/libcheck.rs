@@ -25,7 +25,7 @@ fn run(name: &str, ldd_out: &str, os: &str, call: &str) -> (bool, String, String
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch(name);
     let ldd = dir.join("ldd");
-    std::fs::write(&ldd, format!("#!/bin/sh\ncat <<'OUT'\n{ldd_out}\nOUT\n")).unwrap();
+    std::fs::write(&ldd, format!("#!/bin/sh\ncat <<'OUT'\n{ldd_out}\nOUT\nexit ${{LDD_EXIT:-0}}\n")).unwrap();
     std::fs::set_permissions(&ldd, std::fs::Permissions::from_mode(0o755)).unwrap();
     let release = dir.join("os-release");
     std::fs::write(&release, os).unwrap();
@@ -45,7 +45,7 @@ const MISSING: &str = "\tlinux-vdso.so.1 (0x00007ffd)\n\tlibfribidi.so.0 => not 
 
 #[test]
 fn missing_libraries_are_listed_one_per_line() {
-    let (ok, out, _) = run("list", MISSING, "ID=fedora\n", "libcheck_missing /x");
+    let (ok, out, _) = run("list", MISSING, "ID=fedora\n", "libcheck_scan /x; printf '%s\\n' \"${LIBCHECK_LIBS[@]}\"");
     assert!(ok);
     assert_eq!(out, "libfribidi.so.0\nlibEGL.so.1\n");
 }
@@ -70,18 +70,35 @@ fn missing_libraries_stop_the_launch_with_a_message() {
 #[test]
 fn the_install_hint_follows_the_distribution() {
     for (os, want) in [
-        ("ID=fedora\n", "sudo dnf install 'libEGL.so.1()(64bit)'"),
-        ("ID=nobara\nID_LIKE=\"rhel centos fedora\"\n", "sudo dnf install 'libEGL.so.1()(64bit)'"),
-        ("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n", "sudo zypper install 'libEGL.so.1()(64bit)'"),
-        // apt and pacman cannot install by library name: no command, the generic advice instead.
-        ("ID=ubuntu\nID_LIKE=debian\n", ""),
-        ("ID=cachyos\nID_LIKE=arch\n", ""),
+        ("ID=fedora\n", "Install them with: sudo dnf install 'libEGL.so.1()(64bit)'."),
+        ("ID=nobara\nID_LIKE=\"rhel centos fedora\"\n", "Install them with: sudo dnf install 'libEGL.so.1()(64bit)'."),
+        ("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n", "Install them with: sudo zypper install 'libEGL.so.1()(64bit)'."),
+        ("ID=ubuntu\nID_LIKE=debian\n", "Install them with: sudo apt install libegl1."),
+        ("ID=pop\nID_LIKE=\"ubuntu debian\"\n", "Install them with: sudo apt install libegl1."),
+        ("ID=cachyos\nID_LIKE=arch\n", "Install them with: sudo pacman -S libglvnd."),
         ("ID=somethingelse\n", ""),
     ] {
         let (ok, out, _) = run("hint", "", os, "libcheck_install_hint libEGL.so.1");
         assert!(ok);
         assert_eq!(out.trim(), want, "{os}");
     }
+}
+
+#[test]
+fn apt_and_pacman_name_the_packages_and_how_to_find_the_rest() {
+    let (_, out, _) = run("hint-apt", "", "ID=debian\n", "libcheck_install_hint libEGL.so.1 libvulkan.so.1 libfoo.so.2 libbar.so.1");
+    assert_eq!(
+        out.trim(),
+        "Install them with: sudo apt install libegl1 libvulkan1. Find the package that provides libfoo.so.2, libbar.so.1 with: apt-file search <library>."
+    );
+    // libEGL and libGL are both in libglvnd: named once.
+    let (_, out, _) = run("hint-arch", "", "ID=arch\n", "libcheck_install_hint libEGL.so.1 libGL.so.1 libfoo.so.2");
+    assert_eq!(out.trim(), "Install them with: sudo pacman -S libglvnd. Find the package that provides libfoo.so.2 with: pacman -F <library>.");
+    let (_, out, _) = run("hint-none", "", "ID=ubuntu\n", "libcheck_install_hint libfoo.so.2");
+    assert_eq!(out.trim(), "Find the package that provides libfoo.so.2 with: apt-file search <library>.");
+    let (ok, _, err) = run("hint-msg", "\tlibz.so.1 => not found", "ID=ubuntu\n", "libcheck_run 'Test App' /x");
+    assert!(!ok);
+    assert!(err.contains("missing: libz.so.1.") && err.ends_with("Install them with: sudo apt install zlib1g. Then start Test App again.\n"), "{err}");
 }
 
 #[test]
@@ -280,4 +297,110 @@ fn libcheck_takes_a_note_for_the_host_path() {
     let (ok, _, err) = run("note", MISSING, "ID=fedora\n", "libcheck_run 'Green Light' /x 'GREEN_LIGHT_GTK=host is set.'");
     assert!(!ok);
     assert!(err.contains("missing: libfribidi.so.0, libEGL.so.1. GREEN_LIGHT_GTK=host is set. Install"), "{err}");
+}
+
+const OLD_GLIBC: &str = "/x: /lib64/libc.so.6: version `GLIBC_2.38' not found (required by /x)\n/x: /lib64/libc.so.6: version `GLIBC_2.39' not found (required by /x)\n/b/libgtk-4.so.1: /lib64/libc.so.6: version `GLIBC_2.34' not found (required by /b/libgtk-4.so.1)\n\tlibc.so.6 => /lib64/libc.so.6 (0x1)";
+
+#[test]
+fn an_old_system_glibc_stops_the_launch_with_its_version() {
+    let (ok, _, err) = run("glibc", OLD_GLIBC, "ID=debian\n", "export LIBCHECK_GLIBC_HAVE=2.36 LDD_EXIT=1; libcheck_run 'Test App' /x");
+    assert!(!ok);
+    assert!(err.contains("Test App can't start: it needs glibc 2.39 or newer; this system has 2.36."), "{err}");
+    // The system's own version, as getconf or ldd reports it.
+    let (ok, _, err) = run("glibc-real", OLD_GLIBC, "ID=debian\n", "libcheck_run 'Test App' /x");
+    assert!(!ok);
+    let have = err.split("this system has ").nth(1).unwrap_or_default();
+    assert!(have.starts_with("2.") && have.as_bytes()[2].is_ascii_digit(), "{err}");
+}
+
+#[test]
+fn undefined_symbols_stop_the_launch() {
+    let ldd = "\tlibadwaita-1.so.0 => /lib/libadwaita-1.so.0 (0x1)\nundefined symbol: adw_a\t(/x)\nundefined symbol: adw_b\t(/x)\nundefined symbol: adw_c\t(/x)\nundefined symbol: adw_d\t(/x)\nundefined symbol: adw_e\t(/x)";
+    let (ok, _, err) = run("undef", ldd, "ID=debian\n", "libcheck_run 'Test App' /x");
+    assert!(!ok);
+    assert!(
+        err.contains("the system's libraries are too old: they lack adw_a, adw_b, adw_c and 2 more. Update the system, then start Test App again."),
+        "{err}"
+    );
+    // With APP_GTK=host, the note says how to get the bundled copy instead.
+    let (ok, _, err) = run("undef-note", ldd, "ID=debian\n", "libcheck_run 'Test App' /x 'Unset APP_GTK.'");
+    assert!(!ok && err.contains("and 2 more. Unset APP_GTK."), "{err}");
+}
+
+#[test]
+fn other_missing_versions_and_a_failing_ldd_stop_the_launch() {
+    let ldd = "/x: /lib/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /x)";
+    let (ok, _, err) = run("other", ldd, "ID=debian\n", "export LDD_EXIT=1; libcheck_run 'Test App' /x");
+    assert!(!ok);
+    assert!(err.contains("too old: /x: /lib/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /x)."), "{err}");
+    let (ok, _, err) = run("rc", "", "ID=debian\n", "export LDD_EXIT=3; libcheck_run 'Test App' /x");
+    assert!(!ok);
+    assert!(err.contains("Test App can't start: checking its libraries with ldd failed (exit 3)."), "{err}");
+}
+
+#[test]
+fn the_real_ldd_passes_a_complete_binary() {
+    if !Path::new("/usr/bin/ldd").exists() && !Path::new("/bin/ldd").exists() {
+        return;
+    }
+    let script = format!("{}\nlibcheck_run 'Test App' /bin/sh\n", block());
+    let out = Command::new("bash").args(["-c", &script]).env("LIBCHECK_DIALOG", "none").env_remove("LIBCHECK_LDD").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// debian_based (AppRun skips the launch setup elsewhere), with stub dpkg/apt-get as asked and
+/// the os-release `os` (None: no os-release file) and whether /var/lib/dpkg/status exists.
+fn debian_based(name: &str, tools: &[&str], os: Option<&str>, dpkg_status: bool) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let script = include_str!("../build-appimage.sh");
+    let start = script.find("# >>> debian_based").expect("debian_based block start");
+    let end = script.find("# <<< debian_based").expect("debian_based block end");
+    let dir = scratch(name);
+    for tool in tools {
+        let path = dir.join(tool);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let release = dir.join("os-release");
+    if let Some(os) = os {
+        std::fs::write(&release, os).unwrap();
+    }
+    let status = dir.join("status");
+    if dpkg_status {
+        std::fs::write(&status, "").unwrap();
+    }
+    let body = format!("{}\ndebian_based\n", &script[start..end]);
+    let mut cmd = Command::new("/bin/bash");
+    cmd.args(["-c", &body]).env("PATH", &dir).env("DEBIAN_BASED_DPKG_STATUS", &status);
+    if os.is_some() {
+        cmd.env("LIBCHECK_OS_RELEASE", &release);
+    } else {
+        cmd.env("LIBCHECK_OS_RELEASE", dir.join("no-os-release"));
+    }
+    let ok = cmd.status().unwrap().success();
+    let _ = std::fs::remove_dir_all(&dir);
+    ok
+}
+
+#[test]
+fn the_launch_setup_runs_only_on_debian_based_systems() {
+    let both = ["dpkg", "apt-get"];
+    assert!(debian_based("ubuntu", &both, Some("ID=ubuntu\nID_LIKE=debian\n"), true));
+    assert!(debian_based("pop", &both, Some("ID=pop\nID_LIKE=\"ubuntu debian\"\n"), true));
+    assert!(debian_based("debian", &both, Some("ID=debian\n"), false));
+    // Fedora and Arch with the dpkg and apt packages installed are still not Debian-based.
+    assert!(!debian_based("fedora", &both, Some("ID=fedora\n"), true));
+    assert!(!debian_based("arch", &both, Some("ID=arch\n"), true));
+    assert!(!debian_based("no-apt", &["dpkg"], Some("ID=ubuntu\n"), true));
+    assert!(!debian_based("no-dpkg", &["apt-get"], Some("ID=ubuntu\n"), true));
+    // No os-release at all: dpkg's status file decides.
+    assert!(debian_based("no-os-status", &both, None, true));
+    assert!(!debian_based("no-os-no-status", &both, None, false));
+}
+
+#[test]
+fn the_apprun_skips_the_launch_setup_off_debian() {
+    let script = include_str!("../build-appimage.sh");
+    let apprun = &script[script.find("<< 'APPRUN'").expect("AppRun heredoc")..];
+    assert!(apprun.contains("\nif [[ $needs_install -eq 1 ]] && debian_based; then\n"));
 }
