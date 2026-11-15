@@ -142,7 +142,7 @@ impl GnupgHome {
     }
 
     fn gpg(&self) -> Command {
-        let mut c = Command::new("gpg");
+        let mut c = crate::host_env::command("gpg");
         c.arg("--homedir").arg(self.dir.path()).args(["--batch", "--no-tty"]).stdin(Stdio::null());
         c
     }
@@ -178,7 +178,13 @@ impl GnupgHome {
 
 impl Drop for GnupgHome {
     fn drop(&mut self) {
-        let _ = Command::new("gpgconf").arg("--homedir").arg(self.dir.path()).args(["--kill", "all"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let _ = crate::host_env::command("gpgconf")
+            .arg("--homedir")
+            .arg(self.dir.path())
+            .args(["--kill", "all"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -225,7 +231,7 @@ pub fn gpgv_tarball(tarball: &Tarball, sig: &Path, keyring: &Path) -> Result<Gpg
         .spawn()
         .context("Could not run the decompressor (xz-utils / gzip)")?;
     let tar_stream = decompress.stdout.take().context("no decompressor output")?;
-    let gpgv = Command::new("gpgv")
+    let gpgv = crate::host_env::command("gpgv")
         .arg("--homedir")
         .arg(scratch.path())
         .args(["--status-fd", "1", "--keyring"])

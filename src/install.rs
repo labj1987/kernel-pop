@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const SCRIPT: &str = "/usr/lib/kernel-pop/privileged-install.sh";
 
@@ -79,7 +79,7 @@ fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String
     let mut full = vec![SCRIPT.to_string()];
     full.extend_from_slice(args);
 
-    let mut cmd = Command::new("pkexec");
+    let mut cmd = crate::host_env::command("pkexec");
     cmd.args(&full).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if secret.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = cmd.spawn().context("Failed to launch pkexec — is polkit installed?")?;
