@@ -2,7 +2,7 @@ use crate::build::{
     self, built_sets, free_bytes, is_build_cancelled, missing_build_deps, space_problem, verify_built_set, BuildControl, BuildEvent, BuildRequest, BuiltSet,
     ConfigMode, EventSink, Prepared, SourceTrust, Stage,
 };
-use crate::download::{download_files, is_cancelled, Progress as DownloadProgress, Remote};
+use crate::download::{download_files, is_cancelled, remove_stale_parts, Progress as DownloadProgress, Remote};
 use crate::install::{
     helper_problem, run_privileged_boot_once, run_privileged_install, run_privileged_install_build_deps, run_privileged_remove, run_privileged_remove_many,
     run_privileged_setup_signing, run_privileged_sign, validate_mok_password, BootOutlook, ScriptReport,
@@ -85,16 +85,23 @@ enum CloseDecision {
     Refuse(&'static str),
     /// A build (or its preparation) runs: stop it, then close.
     StopBuildFirst,
+    /// A source download runs: stop it (which deletes its `.part` file), then close.
+    StopDownloadFirst,
     Close,
 }
 
-fn close_decision(busy: Option<&'static str>, build_running: bool) -> CloseDecision {
+fn close_decision(busy: Option<&'static str>, build_running: bool, download_running: bool) -> CloseDecision {
     match busy {
         Some(what) if PRIVILEGED_ACTIONS.contains(&what) => CloseDecision::Refuse(what),
         _ if build_running => CloseDecision::StopBuildFirst,
+        _ if download_running => CloseDecision::StopDownloadFirst,
         _ => CloseDecision::Close,
     }
 }
+
+/// How long closing waits for a cancelled download to stop and delete its
+/// `.part` file before deleting it itself and closing anyway.
+const DOWNLOAD_STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// The busy state of one download, build or privileged action. It lasts as
 /// long as this guard: it is moved into the action's completion callback, so
@@ -683,38 +690,21 @@ fn show_question(question: Question, on_ok: Continuation, on_cancel: Option<Cont
 /// in. Says so through whatever the desktop offers, then exits: a process
 /// left behind with no window would also keep later launches from starting.
 fn no_window(error: &str) -> ! {
-    let has_display = ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
-    let message = no_window_message(error, has_display);
+    let message = no_window_message(error, crate::notice::has_display());
     eprintln!("kernel-pop: {message}");
     // With no display there is nowhere to show a dialog either.
-    if has_display {
-        for (program, args) in ERROR_DIALOGS {
-            let status = std::process::Command::new(program).args(*args).arg(&message).status();
-            if status.is_ok_and(|status| helper_showed(program, status.code())) {
-                break;
-            }
-        }
-    }
+    crate::notice::show_error(&message);
     std::process::exit(1);
 }
 
-/// The programs tried, in order, to show an error when the app has no window.
-const ERROR_DIALOGS: &[(&str, &[&str])] = &[
-    ("kdialog", &["--title", "Kernel Pop", "--error"]),
-    ("zenity", &["--error", "--no-markup", "--title=Kernel Pop", "--width=480", "--text"]),
-    ("notify-send", &["--urgency=critical", "--app-name=Kernel Pop", "Kernel Pop"]),
-    ("xmessage", &["-center"]),
-];
-
-/// Whether `program`, having ended with exit `code`, did show the message, so
-/// the next one must not show it again. The dialogs end with 0 when the user
-/// pressed their button and 1 when the user closed them another way; both
-/// mean it was seen. Anything else (no display, a crash, a signal) does not.
-/// notify-send shows nothing itself: only 0 says the desktop took the message.
-fn helper_showed(program: &str, code: Option<i32>) -> bool {
-    match program {
-        "notify-send" => code == Some(0),
-        _ => matches!(code, Some(0 | 1)),
+/// The System tab's note that a newer stable kernel is out. Where Kernel Pop
+/// can't build kernels (not Debian or Ubuntu) the Browse tab's Download button
+/// is off, so the note does not send anyone there.
+fn update_banner_text(version: &str, unsupported_system: bool) -> String {
+    if unsupported_system {
+        format!("Linux {version} (stable) is out")
+    } else {
+        format!("Linux {version} (stable) is out — download it on the Browse tab to build it")
     }
 }
 
@@ -790,14 +780,56 @@ pub fn init(cx: &mut App) {
     }
 }
 
+/// The size the window asks for: room for every tab's content, but never
+/// more than the display's usable area (`usable`, when GPUI knows it) less
+/// room for the desktop's panels: on a 1280x800 screen with a 44 px KDE panel
+/// a full-height window would put the bottom buttons (Download Source, Clear
+/// Log) under the panel. Each tab scrolls its content above those buttons,
+/// so a shorter window still reaches them.
+fn initial_window_size(usable: Option<gpui_kit::Size<Pixels>>) -> gpui_kit::Size<Pixels> {
+    const WANT: (f32, f32) = (860., 820.);
+    const MIN: (f32, f32) = (WINDOW_MIN.0, WINDOW_MIN.1);
+    let Some(usable) = usable else { return size(px(WANT.0), px(WANT.1)) };
+    let (w, h) = (usable.width.as_f32(), usable.height.as_f32());
+    // Panels are usually on the top or bottom edge; GPUI reports the whole
+    // display on Linux, so the margin is what keeps clear of them.
+    let width = WANT.0.min(w - 48.).max(MIN.0);
+    let height = WANT.1.min(h - (h * 0.12).max(96.)).max(MIN.1);
+    size(px(width), px(height))
+}
+
+/// The smallest window size the layout works in.
+const WINDOW_MIN: (f32, f32) = (520., 420.);
+
+/// Light or dark, as the desktop prefers, with radio buttons that can be seen.
+fn follow_appearance(window: &mut Window, cx: &mut App) {
+    Theme::sync_system_appearance(Some(window), cx);
+    let theme = Theme::global_mut(cx);
+    theme.input = input_border(theme.is_dark());
+}
+
+/// The colour of an unselected radio button's ring (and of checkbox and text
+/// field borders: the theme's `input` colour). The toolkit's own is barely
+/// different from the background (#2f2f2f on #0a0a0a in dark, #e5e5e5 on
+/// white in light), so an unselected choice on the Build and Install tabs
+/// looked like no choice at all. These keep at least 3:1 contrast, what a
+/// control's outline needs to be seen.
+fn input_border(dark: bool) -> Hsla {
+    gpui_kit::rgb(if dark { INPUT_BORDER_DARK } else { INPUT_BORDER_LIGHT }).into()
+}
+
+const INPUT_BORDER_DARK: u32 = 0x737373;
+const INPUT_BORDER_LIGHT: u32 = 0x8a8a8a;
+
 pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // With no display GPUI would run on with no window and no word about it.
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
         no_window("no display server to connect to");
     }
+    let usable = cx.primary_display().map(|display| display.visible_bounds().size);
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(860.), px(820.)), cx)),
-        window_min_size: Some(size(px(520.), px(420.))),
+        window_bounds: Some(WindowBounds::centered(initial_window_size(usable), cx)),
+        window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
         app_id: Some(crate::APP_ID.to_string()),
         // The app draws its own title bar, so it looks and works the same on
         // every desktop, including compositors with no server-side decorations.
@@ -807,12 +839,8 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title("Kernel Pop");
         // Follow the desktop's light/dark preference, now and when it changes.
-        Theme::sync_system_appearance(Some(window), cx);
-        window
-            .observe_window_appearance(|window, cx| {
-                Theme::sync_system_appearance(Some(window), cx);
-            })
-            .detach();
+        follow_appearance(window, cx);
+        window.observe_window_appearance(follow_appearance).detach();
         cx.new(|cx| MainView::new(window, cx))
     });
     let (window, view) = match opened {
@@ -837,13 +865,15 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // Wayland, GPUI's own request is what there is; a Wayland compositor then
     // marks the window as wanting attention instead of raising it.
     cx.spawn(async move |cx| {
-        while let Some(token) = activations.recv().await {
+        while let Some(activation) = activations.recv().await {
             let _ = window.update(cx, |_, window, _| {
-                let raised = token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
+                let raised = activation.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
                 if !raised {
                     window.activate_window();
                 }
             });
+            // The later launch waits for this; without it, it reports this copy as hung.
+            activation.handled();
         }
     })
     .detach();
@@ -981,6 +1011,11 @@ impl MainView {
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| this.update(cx, |this, cx| this.may_close(window, cx)).unwrap_or(true));
+        // Nothing downloads yet, so a `.part` file is one an earlier run left
+        // (killed, or crashed, mid-download).
+        for part in remove_stale_parts(&build::downloads_root()) {
+            self.log(format!("Removed {}, left by an unfinished download", part.display()));
+        }
         self.load_sysinfo(window, cx);
         self.load_releases(window, cx);
         self.refresh_requirements(window, cx);
@@ -1084,14 +1119,18 @@ impl MainView {
     /// to the app, and with nobody reading it the next write would end the
     /// script halfway (in dpkg, or with the ESP half updated).
     fn may_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let (busy, control) = {
+        let (busy, control, download) = {
             let s = self.state.borrow();
-            (s.busy, s.build_control.clone())
+            (s.busy, s.build_control.clone(), s.download_cancel.clone())
         };
-        let control = match close_decision(busy, control.is_some()) {
+        let control = match close_decision(busy, control.is_some(), download.is_some()) {
             CloseDecision::Close => return true,
             CloseDecision::Refuse(what) => {
                 toast(window, cx, &format!("Wait until the {what} has finished before closing"));
+                return false;
+            }
+            CloseDecision::StopDownloadFirst => {
+                self.stop_download_then_close(download.expect("a download runs"), window, cx);
                 return false;
             }
             CloseDecision::StopBuildFirst => control.expect("a build runs"),
@@ -1110,6 +1149,31 @@ impl MainView {
         })
         .detach();
         false
+    }
+
+    /// Cancels the running download and closes the window once it has stopped
+    /// and deleted its `.part` file. A download stuck in a network call that
+    /// does not end gets `DOWNLOAD_STOP_WAIT`; then its `.part` file is
+    /// deleted here and the window closes anyway.
+    fn stop_download_then_close(&mut self, flag: Arc<std::sync::atomic::AtomicBool>, window: &mut Window, cx: &mut Context<Self>) {
+        if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.log("Stopping the download before closing…");
+            toast(window, cx, "Stopping the download before closing…");
+        }
+        let state = self.state.clone();
+        let started = Instant::now();
+        cx.spawn_in(window, async move |_, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            let stopped = state.borrow().download_cancel.is_none();
+            if stopped || started.elapsed() >= DOWNLOAD_STOP_WAIT {
+                if !stopped {
+                    remove_stale_parts(&build::downloads_root());
+                }
+                let _ = cx.update(|window, _| window.remove_window());
+                break;
+            }
+        })
+        .detach();
     }
 
     // ── System tab ──────────────────────────────────────────────────────────
@@ -1157,7 +1221,7 @@ impl MainView {
             };
             if let Some(newest) = releases.iter().find(|r| r.moniker == Moniker::Stable) {
                 if compare_to_running(&running_kernel, &newest.version) == VersionRelation::Newer {
-                    this.update_banner = Some(format!("Linux {} (stable) is out — download it on the Browse tab to build it", newest.version));
+                    this.update_banner = Some(update_banner_text(&newest.version, this.state.borrow().sysinfo.unsupported_system));
                 }
             }
         });
@@ -3027,15 +3091,64 @@ mod tests {
     }
 
     #[test]
+    fn the_update_note_points_at_download_only_where_it_works() {
+        assert_eq!(update_banner_text("7.3.1", false), "Linux 7.3.1 (stable) is out — download it on the Browse tab to build it");
+        let elsewhere = update_banner_text("7.3.1", true);
+        assert!(elsewhere.contains("7.3.1") && !elsewhere.contains("download") && !elsewhere.contains("Browse"), "{elsewhere}");
+    }
+
+    #[test]
+    fn the_window_fits_the_screen() {
+        let fit = |w: f32, h: f32| {
+            let s = initial_window_size(Some(size(px(w), px(h))));
+            (s.width.as_f32(), s.height.as_f32())
+        };
+        assert_eq!(initial_window_size(None), size(px(860.), px(820.)));
+        assert_eq!(fit(2560., 1440.), (860., 820.));
+        // 1280x800 with a 44 px panel: the whole window stays above it.
+        let (w, h) = fit(1280., 800.);
+        assert!(w == 860. && h + 44. + 32. <= 800., "{h}");
+        // Smaller than the layout works in: the minimum, not less.
+        assert_eq!(fit(500., 400.), WINDOW_MIN);
+    }
+
+    /// WCAG contrast ratio of two sRGB colours given as 0xRRGGBB.
+    fn contrast(a: u32, b: u32) -> f32 {
+        let lum = |c: u32| {
+            let ch = |v: u32| {
+                let v = v as f32 / 255.;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(c >> 16 & 0xff) + 0.7152 * ch(c >> 8 & 0xff) + 0.0722 * ch(c & 0xff)
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn unselected_radio_buttons_stand_out_from_the_background() {
+        // The toolkit's default backgrounds: neutral-950 in dark, white in light.
+        assert!(contrast(INPUT_BORDER_DARK, 0x0a0a0a) >= 3.0, "{}", contrast(INPUT_BORDER_DARK, 0x0a0a0a));
+        assert!(contrast(INPUT_BORDER_LIGHT, 0xffffff) >= 3.0, "{}", contrast(INPUT_BORDER_LIGHT, 0xffffff));
+        // What the toolkit had: far below that.
+        assert!(contrast(0x2f2f2f, 0x0a0a0a) < 1.6 && contrast(0xe5e5e5, 0xffffff) < 1.3);
+        assert_eq!(input_border(true), gpui_kit::rgb(INPUT_BORDER_DARK).into());
+    }
+
+    #[test]
     fn closing_waits_for_privileged_runs_and_stops_a_build_first() {
         for what in PRIVILEGED_ACTIONS {
-            assert_eq!(close_decision(Some(what), false), CloseDecision::Refuse(what), "{what}");
+            assert_eq!(close_decision(Some(what), false, false), CloseDecision::Refuse(what), "{what}");
         }
-        assert_eq!(close_decision(Some("build"), true), CloseDecision::StopBuildFirst);
-        assert_eq!(close_decision(None, true), CloseDecision::StopBuildFirst, "the build summary is up: the tree is configured");
-        assert_eq!(close_decision(Some("download"), false), CloseDecision::Close);
-        assert_eq!(close_decision(Some("signature check"), false), CloseDecision::Close);
-        assert_eq!(close_decision(None, false), CloseDecision::Close);
+        assert_eq!(close_decision(Some("build"), true, false), CloseDecision::StopBuildFirst);
+        assert_eq!(close_decision(None, true, false), CloseDecision::StopBuildFirst, "the build summary is up: the tree is configured");
+        assert_eq!(close_decision(Some("download"), false, true), CloseDecision::StopDownloadFirst, "a download is stopped, and its .part deleted, first");
+        assert_eq!(close_decision(Some("signature check"), false, false), CloseDecision::Close);
+        assert_eq!(close_decision(None, false, false), CloseDecision::Close);
     }
 
     /// The title bar's close button must go through `may_close`: without
@@ -3064,7 +3177,6 @@ mod tests {
     fn the_no_window_message_names_the_real_cause() {
         assert!(no_window_message("x", true).contains("graphics driver"));
         assert!(no_window_message("x", false).contains("no display"));
-        assert!(helper_showed("zenity", Some(1)) && !helper_showed("notify-send", Some(1)) && !helper_showed("kdialog", None));
     }
 
     #[test]

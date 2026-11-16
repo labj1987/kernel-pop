@@ -140,7 +140,8 @@ First launch asks for authentication once to install the privileged
 helper script and the polkit policy to system paths. A new version asks
 once more to update them. If that authentication is cancelled, the app
 still opens but shows a banner, and installing, removing and signing
-kernels stay off until you restart it and authenticate.
+kernels stay off until you restart it and authenticate. If `pkexec` itself is
+missing, install it first (`sudo apt install pkexec`).
 
 If no password dialog ever appears and Kernel Pop says that no polkit authentication
 agent is running, start one and try again. KDE, GNOME and COSMIC include one; on

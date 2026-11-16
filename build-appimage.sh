@@ -299,16 +299,42 @@ libcheck_plain() {
     echo "${t//>/›}"
 }
 
+# libcheck_gvariant TEXT: TEXT as a GVariant text-format string, the way gdbus reads its arguments.
+libcheck_gvariant() {
+    local bs='\' q='"' nl=$'\n' t
+    t="${1//"$bs"/"$bs$bs"}"
+    t="${t//"$q"/"$bs$q"}"
+    printf '"%s"' "${t//"$nl"/"${bs}n"}"
+}
+
+# libcheck_show TITLE TEXT: TEXT on stderr and, on a desktop, through the first of these that
+# shows it: zenity, kdialog, notify-send, the desktop's notification service over D-Bus (gdbus:
+# Pop!_OS COSMIC has none of the others) and xmessage. A dialog ends with 0 or 1 once it was
+# seen; the others only with 0 (xmessage ends with 1 when it can't open the display).
 libcheck_show() {
+    local plain
     printf '%s: %s\n' "$1" "$2" >&2
     [[ "${LIBCHECK_DIALOG:-}" == none ]] && return 0
     [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
+    plain="$(libcheck_plain "$2")"
     if command -v zenity >/dev/null 2>&1; then
         zenity --error --no-markup --title="$1" --text="$2" --width=460 >/dev/null 2>&1
-    elif command -v kdialog >/dev/null 2>&1; then
-        kdialog --error "$(libcheck_plain "$2")" --title "$1" >/dev/null 2>&1
-    elif command -v notify-send >/dev/null 2>&1; then
-        notify-send -u critical "$1" "$(libcheck_plain "$2")" >/dev/null 2>&1
+        (($? <= 1)) && return 0
+    fi
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --error "$plain" --title "$1" >/dev/null 2>&1
+        (($? <= 1)) && return 0
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "$1" "$plain" >/dev/null 2>&1 && return 0
+    fi
+    if command -v gdbus >/dev/null 2>&1; then
+        gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+            --method org.freedesktop.Notifications.Notify "$(libcheck_gvariant "$1")" 0 '"dialog-error"' \
+            "$(libcheck_gvariant "$1")" "$(libcheck_gvariant "$plain")" '[]' "{'urgency': <byte 2>}" 0 >/dev/null 2>&1 && return 0
+    fi
+    if command -v xmessage >/dev/null 2>&1; then
+        xmessage -center "$1: $2" >/dev/null 2>&1
     fi
     return 0
 }
@@ -374,7 +400,96 @@ debian_based() {
 }
 # <<< debian_based
 
+# >>> instance_running: whether a copy of Kernel Pop already runs in this login. The running
+# copy holds flock on $XDG_RUNTIME_DIR/kernel-pop.sock.alive for its whole life (instance.rs);
+# flock -n gives up on it with 75 then. Anything else (no runtime dir, no flock(1), no file) means
+# no.
+instance_running() {
+    local alive="${XDG_RUNTIME_DIR:-}/kernel-pop.sock.alive" rc=0
+    [[ -n "${XDG_RUNTIME_DIR:-}" && -e "$alive" ]] || return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    flock -n -E 75 "$alive" true 2>/dev/null || rc=$?
+    ((rc == 75))
+}
+# <<< instance_running
+
+# A copy is already running: the binary hands this launch over to it straight away (its window
+# is raised with this launch's activation token). Library checks or a password prompt first
+# would only delay that, and could let the token go stale.
+if instance_running; then
+    export KERNEL_POP_BUNDLE="$HERE"
+    export PATH="$HERE/usr/bin:$PATH"
+    exec "$HERE/usr/bin/$APP" "$@"
+fi
+
 libcheck_run "Kernel Pop" "$HERE/usr/bin/$APP" || exit 1
+
+# >>> helper_install: installing the privileged script and the polkit policy with pkexec.
+# HELPER_PKEXEC exists for the tests.
+
+# helper_pkexec ARG...: pkexec ARG... in a session of its own, with no controlling terminal and
+# stdin from /dev/null. A desktop session started from a text console (Hyprland or sway run from
+# tty1) passes that console on to every app as its controlling terminal, and pkexec would put its
+# own text password prompt there, on a console nobody looks at, and wait for ever. Without one it
+# uses the desktop's polkit agent, or fails at once when there is none.
+helper_pkexec() {
+    local pkexec="${HELPER_PKEXEC:-pkexec}"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -w "$pkexec" "$@" </dev/null
+    else
+        "$pkexec" "$@" </dev/null
+    fi
+}
+
+# helper_failure RC: why the install through pkexec ended with RC. pkexec ends with 126 when the
+# password dialog was dismissed and 127 when authorization failed or no agent could ask (KDE's
+# agent's Cancel also gives 127).
+helper_failure() {
+    case $1 in
+        126|127) echo "authorization was cancelled or refused. If no password dialog appeared, no polkit authentication agent is running: start one (hyprpolkitagent on Hyprland, polkit-gnome or lxqt-policykit on sway or i3; policykit-1-gnome on Debian/Ubuntu) and try again" ;;
+        *)       echo "the install failed (exit code $1)" ;;
+    esac
+}
+
+# helper_install SRC_SCRIPT SRC_POLICY DST_SCRIPT DST_POLICY: installs both, or says on stderr why
+# not (and returns 1).
+helper_install() {
+    local stage h_script h_policy rc=0
+    if ! command -v "${HELPER_PKEXEC:-pkexec}" >/dev/null 2>&1; then
+        echo "kernel-pop: the privileged helper was not installed: pkexec (polkit) is missing." \
+             "Install it with: sudo apt install pkexec (policykit-1 on older releases), then restart Kernel Pop." \
+             "Until then installing, removing and signing kernels stay off." >&2
+        return 1
+    fi
+    # The AppImage's FUSE mount is normally not readable by root, so the
+    # files are staged in a private user dir. To close the stage-then-install
+    # TOCTOU window, hashes are taken from the read-only mounted originals and
+    # the root side copies the staged files into a root-owned dir and refuses
+    # to install anything that doesn't match those hashes.
+    stage="$(mktemp -d)"
+    cp "$1" "$stage/privileged-install.sh"
+    cp "$2" "$stage/policy"
+    h_script="$(sha256sum "$1" | cut -d' ' -f1)"
+    h_policy="$(sha256sum "$2" | cut -d' ' -f1)"
+    helper_pkexec bash -c '
+        set -euo pipefail
+        stage="$1"; hs="$2"; hp="$3"; dst_s="$4"; dst_p="$5"
+        safe="$(mktemp -d)"; trap "rm -rf \"$safe\"" EXIT
+        cp "$stage/privileged-install.sh" "$safe/s"
+        cp "$stage/policy" "$safe/p"
+        [[ "$(sha256sum "$safe/s" | cut -d" " -f1)" == "$hs" ]] || { echo "script hash mismatch" >&2; exit 1; }
+        [[ "$(sha256sum "$safe/p" | cut -d" " -f1)" == "$hp" ]] || { echo "policy hash mismatch" >&2; exit 1; }
+        install -D -m 755 "$safe/s" "$dst_s"
+        install -D -m 644 "$safe/p" "$dst_p"
+    ' _ "$stage" "$h_script" "$h_policy" "$3" "$4" || rc=$?
+    rm -rf "$stage"
+    if ((rc != 0)); then
+        echo "kernel-pop: the privileged helper was not installed or updated: $(helper_failure "$rc")." \
+             "Installing, removing and signing kernels stay off; restart Kernel Pop to try again." >&2
+        return 1
+    fi
+}
+# <<< helper_install
 
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
 SRC_POLICY="$HERE/usr/share/polkit-1/actions/io.github.labj1987.KernelPop.policy"
@@ -390,38 +505,7 @@ done
 
 # Not on a system Kernel Pop can't install kernels on: no password prompt for a helper nothing uses.
 if [[ $needs_install -eq 1 ]] && debian_based; then
-    # The AppImage's FUSE mount is normally not readable by root, so the
-    # files are staged in a private user dir. To close the stage-then-install
-    # TOCTOU window, hashes are taken from the read-only mounted originals and
-    # the root side copies the staged files into a root-owned dir and refuses
-    # to install anything that doesn't match those hashes.
-    STAGE="$(mktemp -d)"
-    cp "$SRC_SCRIPT" "$STAGE/privileged-install.sh"
-    cp "$SRC_POLICY" "$STAGE/policy"
-    H_SCRIPT="$(sha256sum "$SRC_SCRIPT" | cut -d' ' -f1)"
-    H_POLICY="$(sha256sum "$SRC_POLICY" | cut -d' ' -f1)"
-    pkexec bash -c '
-        set -euo pipefail
-        stage="$1"; hs="$2"; hp="$3"; dst_s="$4"; dst_p="$5"
-        safe="$(mktemp -d)"; trap "rm -rf \"$safe\"" EXIT
-        cp "$stage/privileged-install.sh" "$safe/s"
-        cp "$stage/policy" "$safe/p"
-        [[ "$(sha256sum "$safe/s" | cut -d" " -f1)" == "$hs" ]] || { echo "script hash mismatch" >&2; exit 1; }
-        [[ "$(sha256sum "$safe/p" | cut -d" " -f1)" == "$hp" ]] || { echo "policy hash mismatch" >&2; exit 1; }
-        install -D -m 755 "$safe/s" "$dst_s"
-        install -D -m 644 "$safe/p" "$dst_p"
-    ' _ "$STAGE" "$H_SCRIPT" "$H_POLICY" "$DST_SCRIPT" "$DST_POLICY"
-    rc=$?
-    rm -rf "$STAGE"
-    if [[ $rc -ne 0 ]]; then
-        case $rc in
-            126) why="authentication was cancelled" ;;
-            127) why="authorization failed. If no password dialog appeared, no polkit authentication agent is running: start one (hyprpolkitagent on Hyprland, polkit-gnome or lxqt-policykit on sway or i3; policykit-1-gnome on Debian/Ubuntu) and try again" ;;
-            *)   why="the install failed (exit code $rc)" ;;
-        esac
-        echo "kernel-pop: the privileged helper was not installed or updated: $why." \
-             "Installing, removing and signing kernels stay off; restart Kernel Pop to try again." >&2
-    fi
+    helper_install "$SRC_SCRIPT" "$SRC_POLICY" "$DST_SCRIPT" "$DST_POLICY"
 fi
 
 export KERNEL_POP_BUNDLE="$HERE"

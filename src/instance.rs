@@ -9,6 +9,10 @@
 //! Without `XDG_RUNTIME_DIR` there is no directory that is known to be the
 //! user's alone, so the app runs without the single-instance check rather
 //! than trust a socket in a shared place.
+//!
+//! The running copy answers each request once its window has handled it. A
+//! later launch that gets no answer in time says the running copy is not
+//! responding (with its PID) instead of exiting without a word.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -17,9 +21,32 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-/// Requests from later launches to show the running window, each with the
-/// activation token of that launch when it had one (see `launch_token`).
-pub type Activations = UnboundedReceiver<Option<String>>;
+/// One request from a later launch to show the running window.
+pub struct Activation {
+    /// The activation token of that launch, when it had one (see `launch_token`).
+    pub token: Option<String>,
+    reply: Option<UnixStream>,
+}
+
+impl Activation {
+    /// Tells the later launch that the request was handled, so it exits
+    /// quietly. Sent from the UI loop: a running copy whose window hangs
+    /// never sends it, and the later launch says so (see `NotResponding`).
+    pub fn handled(mut self) {
+        if let Some(mut stream) = self.reply.take() {
+            let _ = stream.write_all(REPLY);
+        }
+    }
+}
+
+/// Requests from later launches to show the running window.
+pub type Activations = UnboundedReceiver<Activation>;
+
+/// What the running copy answers once it has handled a request.
+const REPLY: &[u8] = b"ok\n";
+
+/// How long a later launch waits for that answer.
+const REPLY_WAIT: Duration = Duration::from_secs(2);
 
 fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)
@@ -44,12 +71,33 @@ fn valid_token(token: &str) -> bool {
     !token.is_empty() && token.len() <= MAX_TOKEN && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// How a launch went with the single-instance socket.
+enum Claim {
+    /// This is the primary copy; the receiver yields once per later launch.
+    Primary(Activations),
+    /// Another copy is running and has shown its window.
+    HandedOver,
+    /// Another copy is running but did not answer in time (its window is
+    /// hung); its process id when the socket tells it.
+    NotResponding(Option<i32>),
+}
+
 /// `None` when another copy is already running (it has been asked to show
 /// its window); otherwise this is the primary copy, and the receiver yields
-/// once per later launch.
+/// once per later launch. A running copy that does not answer is reported
+/// (on stderr and in a desktop message) and this launch exits with 1.
 pub fn claim() -> Option<Activations> {
     match runtime_dir() {
-        Some(dir) => claim_at(&dir.join("kernel-pop.sock"), launch_token()),
+        Some(dir) => match claim_at(&dir.join("kernel-pop.sock"), launch_token()) {
+            Claim::Primary(activations) => Some(activations),
+            Claim::HandedOver => None,
+            Claim::NotResponding(pid) => {
+                let message = not_responding_message(pid);
+                eprintln!("kernel-pop: {message}");
+                crate::notice::show_error(&message);
+                std::process::exit(1);
+            }
+        },
         None => {
             eprintln!("kernel-pop: XDG_RUNTIME_DIR is not set, so a second launch can't find this one");
             let (tx, rx) = unbounded_channel();
@@ -60,16 +108,39 @@ pub fn claim() -> Option<Activations> {
     }
 }
 
+fn not_responding_message(pid: Option<i32>) -> String {
+    let which = pid.map(|pid| format!(" (PID {pid})")).unwrap_or_default();
+    format!("Kernel Pop is already running but not responding; close it{which} and start again.")
+}
+
 /// Holds `flock` on the lock file next to the socket, so that of two copies
 /// started together only one looks at, removes and binds the socket at a time.
 struct Lock(#[allow(dead_code)] std::fs::File);
 
-fn lock(socket: &Path) -> Option<Lock> {
+fn sibling(socket: &Path, suffix: &str) -> PathBuf {
     let mut name = socket.as_os_str().to_owned();
-    name.push(".lock");
-    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(PathBuf::from(name)).ok()?;
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn lock(socket: &Path) -> Option<Lock> {
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(sibling(socket, ".lock")).ok()?;
     // SAFETY: flock on a file descriptor this function owns; released when the file closes.
     (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(Lock(file))
+}
+
+/// The primary copy holds `flock` on `<socket>.alive` for as long as it runs,
+/// so the AppImage's launcher can tell, without connecting, that a copy is
+/// running and skip its first-launch setup (`instance_running` in
+/// build-appimage.sh). The file stays open, and locked, until the process ends.
+fn hold_alive(socket: &Path) {
+    let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(sibling(socket, ".alive")) else {
+        return;
+    };
+    // SAFETY: flock on a file descriptor this function owns; the file is leaked below.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        std::mem::forget(file);
+    }
 }
 
 /// Whether a failed connect means "nobody is listening" (a socket file left
@@ -79,12 +150,36 @@ fn nobody_listening(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
 }
 
-fn claim_at(path: &Path, token: Option<String>) -> Option<Activations> {
-    let _lock = lock(path);
+/// The process id at the other end of a Unix socket.
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED fills a ucred of the given length on a socket this function borrows.
+    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &raw mut len) };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid)
+}
+
+/// After sending a request: waits up to `REPLY_WAIT` for the running copy's answer.
+fn await_reply(stream: UnixStream) -> Claim {
+    let pid = peer_pid(&stream);
+    let _ = stream.set_read_timeout(Some(REPLY_WAIT));
+    let mut line = Vec::new();
+    let _ = BufReader::new(&stream).take(64).read_until(b'\n', &mut line);
+    if line == REPLY {
+        Claim::HandedOver
+    } else {
+        Claim::NotResponding(pid)
+    }
+}
+
+fn claim_at(path: &Path, token: Option<String>) -> Claim {
+    let lock = lock(path);
     match UnixStream::connect(path) {
         Ok(mut stream) => {
             let _ = writeln!(stream, "activate {}", token.as_deref().unwrap_or(""));
-            return None;
+            // Others may look while this one waits for the answer.
+            drop(lock);
+            return await_reply(stream);
         }
         Err(e) if nobody_listening(&e) => {
             let _ = std::fs::remove_file(path);
@@ -98,9 +193,11 @@ fn claim_at(path: &Path, token: Option<String>) -> Option<Activations> {
     let (tx, rx) = unbounded_channel();
     match UnixListener::bind(path) {
         Ok(listener) => {
+            hold_alive(path);
             std::thread::spawn(move || {
                 for connection in listener.incoming().flatten() {
-                    if tx.send(read_request(connection)).is_err() {
+                    let token = read_request(&connection);
+                    if tx.send(Activation { token, reply: Some(connection) }).is_err() {
                         break;
                     }
                 }
@@ -113,12 +210,12 @@ fn claim_at(path: &Path, token: Option<String>) -> Option<Activations> {
             std::mem::forget(tx);
         }
     }
-    Some(rx)
+    Claim::Primary(rx)
 }
 
 /// The token a second launch sent with its request, if any. A launch that
 /// sends nothing readable still counts as a request.
-fn read_request(connection: UnixStream) -> Option<String> {
+fn read_request(connection: &UnixStream) -> Option<String> {
     let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
     let mut line = String::new();
     let _ = BufReader::new(connection).take(8192).read_line(&mut line);
@@ -132,7 +229,8 @@ fn parse_request(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_at, nobody_listening, parse_request, valid_token, MAX_TOKEN};
+    use super::{claim_at, nobody_listening, not_responding_message, parse_request, sibling, valid_token, Activations, Claim, MAX_TOKEN};
+    use std::os::fd::AsRawFd;
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("kernel-pop-{name}-{}", std::process::id()));
@@ -141,15 +239,74 @@ mod tests {
         dir
     }
 
+    fn primary(claim: Claim) -> Activations {
+        match claim {
+            Claim::Primary(rx) => rx,
+            _ => panic!("expected the primary copy"),
+        }
+    }
+
+    /// Answers every request like the UI loop does, passing on the tokens.
+    fn answer(mut first: Activations) -> std::sync::mpsc::Receiver<Option<String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Some(activation) = first.blocking_recv() {
+                let _ = tx.send(activation.token.clone());
+                activation.handled();
+            }
+        });
+        rx
+    }
+
     #[test]
     fn second_launch_reaches_the_first_with_its_token() {
         let dir = scratch("instance");
         let path = dir.join("test.sock");
-        let mut first = claim_at(&path, None).expect("the first copy is the primary");
-        assert!(claim_at(&path, Some("token-1".into())).is_none(), "a second copy finds the first and stands down");
-        assert_eq!(first.blocking_recv(), Some(Some("token-1".to_string())), "and the first is told, with the token to raise its window with");
-        assert!(claim_at(&path, None).is_none());
-        assert_eq!(first.blocking_recv(), Some(None), "no token: still a request");
+        let tokens = answer(primary(claim_at(&path, None)));
+        assert!(matches!(claim_at(&path, Some("token-1".into())), Claim::HandedOver), "a second copy finds the first and stands down");
+        assert_eq!(tokens.recv().unwrap(), Some("token-1".to_string()), "and the first is told, with the token to raise its window with");
+        assert!(matches!(claim_at(&path, None), Claim::HandedOver));
+        assert_eq!(tokens.recv().unwrap(), None, "no token: still a request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_running_copy_that_never_answers_is_reported_with_its_pid() {
+        let dir = scratch("hung");
+        let path = dir.join("test.sock");
+        // A copy whose window hangs: its socket takes the request, nobody answers.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let hold = std::thread::spawn(move || {
+            let connection = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            drop(connection);
+        });
+        let started = std::time::Instant::now();
+        match claim_at(&path, None) {
+            Claim::NotResponding(pid) => assert_eq!(pid, Some(std::process::id() as i32)),
+            _ => panic!("a silent copy must not count as handed over"),
+        }
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_millis(1900) && waited < std::time::Duration::from_secs(4), "{waited:?}");
+        assert_eq!(not_responding_message(Some(42)), "Kernel Pop is already running but not responding; close it (PID 42) and start again.");
+        drop(hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_primary_holds_the_alive_lock_for_the_launcher() {
+        let dir = scratch("alive");
+        let path = dir.join("test.sock");
+        let _first = primary(claim_at(&path, None));
+        let file = std::fs::File::open(sibling(&path, ".alive")).unwrap();
+        // SAFETY: flock on a file this test owns.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, -1, "a running copy must keep <socket>.alive locked");
+        // And the launcher's own check (flock(1), as build-appimage.sh runs it) sees it.
+        if std::process::Command::new("flock").arg("-V").output().is_ok() {
+            let out = std::process::Command::new("flock").args(["-n", "-E", "75"]).arg(sibling(&path, ".alive")).arg("true").status().unwrap();
+            assert_eq!(out.code(), Some(75));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -160,9 +317,9 @@ mod tests {
         // A socket nobody listens on any more.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
-        let mut first = claim_at(&path, None).expect("a dead socket does not block startup");
-        assert!(claim_at(&path, None).is_none(), "and the new one answers");
-        assert_eq!(first.blocking_recv(), Some(None));
+        let tokens = answer(primary(claim_at(&path, None)));
+        assert!(matches!(claim_at(&path, None), Claim::HandedOver), "and the new one answers");
+        assert_eq!(tokens.recv().unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -193,8 +350,9 @@ mod tests {
                 std::thread::spawn(move || claim_at(&path, None))
             })
             .collect();
+        // Kept until counted: a primary whose receiver is gone stops listening.
         let claims: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(claims.iter().filter(|c| c.is_some()).count(), 1);
+        assert_eq!(claims.iter().filter(|c| matches!(c, Claim::Primary(_))).count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -28,7 +28,13 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   (`KERNEL_POP_LOG`), the shared Tokio runtime, then GPUI.
 - `instance.rs` — one running copy per login: a socket in
   `$XDG_RUNTIME_DIR`; a second launch hands over its activation token and
-  exits. `activation.rs` raises the window with that token on Wayland
+  waits up to 2 s for the "ok" the UI loop sends once it handled it (no answer: it reports the
+  running copy as not responding, with its PID, through `notice.rs`, and exits 1). The primary
+  holds `flock` on `kernel-pop.sock.alive` for its life, so AppRun (`instance_running`) can skip
+  its setup and exec the binary at once.
+- `notice.rs` — errors with no window to show them in: kdialog, zenity, notify-send, the
+  notification service via `gdbus call` (Pop!_OS COSMIC has none of the others), xmessage, in that
+  order until one shows it. AppRun's `libcheck_show` keeps the same chain in bash. `activation.rs` raises the window with that token on Wayland
   (`xdg_activation_v1` on GPUI's own connection).
 - `ui.rs` — the GPUI Kit UI (see UI below): system/browse/build/install/log
   tabs, plus a window-wide drop target for tarballs. One global busy state
@@ -67,8 +73,9 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   runs in its own process group so `BuildControl::cancel` kills all of it.
   Refuses to run as root.
 - `download.rs` — downloads files with progress, cancel (the typed
-  `Cancelled` error) and retries, into `.part` files renamed when complete,
-  with explicit 0755/0644 modes; `sha256_file`.
+  `Cancelled` error, which also ends a hung request or read at once) and retries, into `.part`
+  files renamed when complete, with explicit 0755/0644 modes; `remove_stale_parts` (at startup:
+  no download runs then); `sha256_file`.
 - `system.rs` — inventories installed kernels and their boot health (the
   initrd/modules/boot-entry check described above; for kernelstub, whether
   the kernel is the `vmlinuz` or `vmlinuz.old` one and its ESP copy
@@ -80,7 +87,8 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   since `/boot/vmlinuz-*` is 0600, or Ubuntu's from the dpkg source
   package); install preflight warnings; which old kernels can be pruned.
 - `install.rs` — invokes `scripts/privileged-install.sh` via `pkexec` and
-  returns its output; refuses to run when the installed helper differs from
+  returns its output, in a session of its own (`without_terminal`: an app from a TTY-started
+  Hyprland inherits that console, and pkexec would prompt there unseen); refuses to run when the installed helper differs from
   the bundled one (`helper_problem`); tells a cancelled authentication from
   a refused one and from a failed script; parses the output protocol into
   a `ScriptReport`. `--install-build-deps` takes only names from the
@@ -128,11 +136,17 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   in a `Role::RadioGroup`.
 - Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit
   starts; without that GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at
-  warn level on a normal start (`KERNEL_POP_LOG=info` shows the renderer picked).
+  warn level on a normal start (`KERNEL_POP_LOG=info` shows the renderer picked; `main.rs` keeps
+  zbus and other chatty dependencies at warn whatever the level).
+- Theme: `follow_appearance` re-applies the light/dark theme and then sets the `input` colour
+  (radio rings, checkbox and field borders) to one with at least 3:1 contrast; the toolkit's is
+  nearly the background colour. The first window size is clamped to the display less room for
+  panels (`initial_window_size`); every tab scrolls above its bottom buttons.
 - File dialogs (portal) have no file-type filter and no starting folder in GPUI: `inspect` refuses
   anything that is not a kernel tarball after the pick and on drop.
 - Closing: `may_close` (from `on_window_should_close`) refuses while a privileged action runs,
-  and cancels a running build and closes the window once it has cleaned up.
+  cancels a running build and closes the window once it has cleaned up, and cancels a running
+  download and closes once its `.part` file is gone (after 5 s it deletes it itself).
 - Testing the UI without touching the machine: a scratch `HOME` whose
   `Downloads/kernel-pop/linux-<krel>/` holds small fake `.deb` files, a `SHA256SUMS` for them and
   a `build-info.txt` reaches the Install tab with a verified build; Browse, Download Source and
@@ -349,7 +363,9 @@ writes only inside the checkout:
    `usr/share/licenses/kernel-pop/THIRD-PARTY-LICENSES.txt`, next to the app's own `LICENSE`; CI
    runs it too. AppRun installs the script and policy to system paths through
    pkexec when they differ (only on a Debian-based system, `debian_based`),
-   says so on stderr when that is cancelled or fails, and exports
+   says so on stderr when that is cancelled or fails (`helper_install`: pkexec runs under
+   `setsid -w` with stdin from /dev/null, so it never prompts on an inherited console; a missing
+   pkexec is named with its package), and exports
    `KERNEL_POP_BUNDLE` so the app can detect the mismatch and refuse to
    run an old helper.
 4. Downloads `appimagetool` (pinned 1.9.1) and the AppImage type2 runtime

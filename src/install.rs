@@ -82,6 +82,7 @@ fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String
     let mut cmd = std::process::Command::new("pkexec");
     cmd.args(&full).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if secret.is_some() { Stdio::piped() } else { Stdio::null() });
+    without_terminal(&mut cmd);
     let mut child = cmd.spawn().context("Failed to launch pkexec — is polkit installed?")?;
     if let (Some(secret), Some(mut stdin)) = (secret, child.stdin.take()) {
         // A write error (the script exited early, e.g. on a cancelled
@@ -96,6 +97,24 @@ fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String
         bail!("{}", describe_failure(output.status.code(), &stdout, &stderr));
     }
     Ok(stdout)
+}
+
+/// Starts `cmd` in a session of its own, with no controlling terminal. An app
+/// started from a session that was itself started on a text console (Hyprland
+/// or sway run from tty1) inherits that console as its controlling terminal,
+/// and pkexec would then run its own text password prompt there, on a console
+/// nobody looks at, and wait for ever. Without a terminal it uses the
+/// desktop's polkit agent, or fails at once with "no agent" when there is none.
+fn without_terminal(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the child between fork and exec and only
+    // calls setsid(2), which is async-signal-safe and allocates nothing.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
 }
 
 /// pkexec's own complaint when no polkit authentication agent (the program
@@ -246,6 +265,19 @@ pub fn run_privileged_boot_once(version: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pkexec_runs_without_a_controlling_terminal() {
+        // The child leads a session of its own (its session id is its pid), so
+        // it has no controlling terminal, whatever this process has.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "read -r line < /proc/$$/stat; set -- ${line##*) }; [ \"$4\" = \"$$\" ] && ! (: < /dev/tty) 2>/dev/null"]);
+        super::without_terminal(&mut cmd);
+        assert!(cmd.status().unwrap().success());
+        // Without it, the child stays in this process's session.
+        let plain = std::process::Command::new("sh").args(["-c", "read -r line < /proc/$$/stat; set -- ${line##*) }; [ \"$4\" = \"$$\" ]"]).status().unwrap();
+        assert!(!plain.success());
+    }
+
     use super::*;
 
     #[test]

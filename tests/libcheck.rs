@@ -148,10 +148,13 @@ fn the_apprun_checks_the_libraries_before_setup_and_then_starts_the_one_binary()
     let apprun = &apprun[..apprun.find("\nAPPRUN\n").expect("AppRun heredoc end")];
     let check = apprun.find("\nlibcheck_run \"Kernel Pop\" \"$HERE/usr/bin/$APP\" || exit 1\n").expect("libcheck_run call in AppRun");
     // The library check comes before the password prompt that installs the privileged helper.
-    let prompt = apprun.find("pkexec bash -c").expect("pkexec install of the helper in AppRun");
-    let bundle = apprun.find("\nexport KERNEL_POP_BUNDLE=\"$HERE\"\n").expect("KERNEL_POP_BUNDLE export");
-    let exec = apprun.find("\nexec \"$HERE/usr/bin/$APP\" \"$@\"").expect("exec of the binary");
+    let prompt = apprun.find("\n    helper_install \"$SRC_SCRIPT\"").expect("pkexec install of the helper in AppRun");
+    let bundle = apprun.rfind("\nexport KERNEL_POP_BUNDLE=\"$HERE\"\n").expect("KERNEL_POP_BUNDLE export");
+    let exec = apprun.rfind("\nexec \"$HERE/usr/bin/$APP\" \"$@\"").expect("exec of the binary");
     assert!(check < prompt && prompt < bundle && bundle < exec);
+    // With a copy already running, nothing comes before the hand-over: no check, no prompt.
+    let running = apprun.find("\nif instance_running; then\n    export KERNEL_POP_BUNDLE=\"$HERE\"\n    export PATH=\"$HERE/usr/bin:$PATH\"\n    exec \"$HERE/usr/bin/$APP\" \"$@\"\nfi\n").expect("early hand-over");
+    assert!(running < check);
     assert!(!script[..script.find("<< 'APPRUN'").unwrap()].contains("\nlibcheck_run "));
     // Nothing is bundled or patched: one binary, as cargo built it.
     for gone in ["patchelf", "bundle_", "gtk_choice", "_GTK", "APPIMAGE_ORIG_", "usr/bin/bundled"] {
@@ -378,4 +381,166 @@ fn the_apprun_skips_the_launch_setup_off_debian() {
     let script = include_str!("../build-appimage.sh");
     let apprun = &script[script.find("<< 'APPRUN'").expect("AppRun heredoc")..];
     assert!(apprun.contains("\nif [[ $needs_install -eq 1 ]] && debian_based; then\n"));
+}
+
+/// A marked block of build-appimage.sh (`# >>> NAME` to `# <<< NAME`).
+fn marked(name: &str) -> String {
+    let script = include_str!("../build-appimage.sh");
+    let start = script.find(&format!("# >>> {name}")).unwrap_or_else(|| panic!("{name} block start"));
+    let end = script.find(&format!("# <<< {name}")).unwrap_or_else(|| panic!("{name} block end"));
+    script[start..end].to_string()
+}
+
+/// libcheck_show with only the fake programs `tools` (name, exit code) on PATH. Returns the
+/// calls, one line each: the program, then its arguments separated by '|'.
+fn show_with(name: &str, tools: &[(&str, i32)]) -> Vec<String> {
+    let dir = scratch(name);
+    let log = dir.join("calls");
+    for (tool, code) in tools {
+        // Newlines in an argument are logged as '~', so each call stays one line.
+        script_file(
+            &dir.join(tool),
+            &format!(
+                "#!/bin/bash\n{{ printf '%s' {tool}; for a in \"$@\"; do printf '|%s' \"${{a//$'\\n'/~}}\"; done; echo; }} >> '{}'\nexit {code}\n",
+                log.display()
+            ),
+        );
+    }
+    let script = format!("{}\nlibcheck_show 'Test App' \"$(printf 'can'\\''t start: <x> & \"y\"\\nnext')\"\n", block());
+    let out = Command::new("/bin/bash").args(["-c", &script]).env("PATH", &dir).env("DISPLAY", ":0").env_remove("LIBCHECK_DIALOG").output().unwrap();
+    assert!(out.status.success());
+    let calls = std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    calls
+}
+
+#[test]
+fn without_dialog_programs_the_message_goes_to_the_notification_service() {
+    // Pop!_OS COSMIC: no zenity, kdialog or notify-send, but gdbus and xmessage.
+    let calls = show_with("show-gdbus", &[("gdbus", 0), ("xmessage", 0)]);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let args: Vec<&str> = calls[0].split('|').collect();
+    assert_eq!(
+        &args[..9],
+        [
+            "gdbus",
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--method",
+            "org.freedesktop.Notifications.Notify"
+        ]
+    );
+    assert_eq!(
+        &args[9..],
+        ["\"Test App\"", "0", "\"dialog-error\"", "\"Test App\"", "\"can't start: ‹x› and \\\"y\\\"\\nnext\"", "[]", "{'urgency': <byte 2>}", "0"]
+    );
+    // No notification service either: xmessage.
+    let calls = show_with("show-xmessage", &[("gdbus", 1), ("xmessage", 0)]);
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[1].starts_with("xmessage|-center|Test App: can't start: <x> & \"y\""), "{calls:?}");
+    // A dialog that could not show anything (no display it can use) passes it on too.
+    let calls = show_with("show-zenity-fails", &[("zenity", 5), ("notify-send", 0), ("gdbus", 0)]);
+    assert_eq!(calls.iter().map(|c| c.split('|').next().unwrap()).collect::<Vec<_>>(), ["zenity", "notify-send"]);
+    // A dialog that was seen and closed is the end of it.
+    let calls = show_with("show-zenity", &[("zenity", 1), ("gdbus", 0)]);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+}
+
+/// instance_running with XDG_RUNTIME_DIR set to `dir` (or unset).
+fn instance_running(dir: Option<&Path>) -> bool {
+    let script = format!("{}\ninstance_running\n", marked("instance_running"));
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", &script]);
+    match dir {
+        Some(dir) => cmd.env("XDG_RUNTIME_DIR", dir),
+        None => cmd.env_remove("XDG_RUNTIME_DIR"),
+    };
+    cmd.status().unwrap().success()
+}
+
+#[test]
+fn a_running_copy_is_seen_by_its_lock() {
+    use std::io::BufRead;
+    if Command::new("flock").arg("-V").output().is_err() {
+        return;
+    }
+    let dir = scratch("alive");
+    assert!(!instance_running(Some(&dir)), "no lock file: nothing runs");
+    let alive = dir.join("kernel-pop.sock.alive");
+    std::fs::write(&alive, b"").unwrap();
+    assert!(!instance_running(Some(&dir)), "a lock file nobody holds: the last copy is gone");
+    // A running copy holds the lock (as instance.rs does).
+    let mut holder = Command::new("bash")
+        .args(["-c", "exec 9>\"$1\"; flock 9; echo locked; exec sleep 30", "_"])
+        .arg(&alive)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(holder.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    assert_eq!(line, "locked\n");
+    assert!(instance_running(Some(&dir)));
+    assert!(!instance_running(None), "no runtime dir: no way to tell");
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(!instance_running(Some(&dir)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// helper_install with a fake pkexec that records its session and stdin and exits with `code`
+/// (None: no pkexec at all). Returns (success, stderr, what the fake recorded).
+fn helper_install(name: &str, code: Option<i32>) -> (bool, String, String) {
+    let dir = scratch(name);
+    let record = dir.join("record");
+    let pkexec = dir.join("pkexec");
+    if code.is_some() {
+        // Field 6 of /proc/PID/stat is the session id: equal to the pid only for a session leader,
+        // which has no controlling terminal until it opens one.
+        script_file(
+            &pkexec,
+            &format!(
+                "#!/bin/bash\nread -r stat < /proc/$$/stat; set -- ${{stat##*) }}\necho \"leader=$([[ $4 == $$ ]] && echo yes || echo no) stdin=$(readlink /proc/$$/fd/0)\" > '{}'\nexit {}\n",
+                record.display(),
+                code.unwrap_or(0)
+            ),
+        );
+    }
+    for file in ["script", "policy"] {
+        std::fs::write(dir.join(file), file).unwrap();
+    }
+    let script = format!("{}\nhelper_install \"$1/script\" \"$1/policy\" /nonexistent/s /nonexistent/p\n", marked("helper_install"));
+    let out = Command::new("bash").args(["-c", &script, "_"]).arg(&dir).env("HELPER_PKEXEC", &pkexec).output().unwrap();
+    let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned(), recorded)
+}
+
+#[test]
+fn the_helper_install_never_waits_on_a_hidden_text_prompt() {
+    let (ok, err, recorded) = helper_install("pkexec-ok", Some(0));
+    assert!(ok && err.is_empty(), "{err}");
+    assert_eq!(recorded.trim(), "leader=yes stdin=/dev/null", "pkexec must run with no controlling terminal and nothing to read");
+}
+
+#[test]
+fn a_refused_or_cancelled_authorization_says_so() {
+    for code in [126, 127] {
+        let (ok, err, _) = helper_install("pkexec-refused", Some(code));
+        assert!(!ok);
+        assert!(err.contains("authorization was cancelled or refused") && err.contains("no polkit authentication agent is running"), "{code}: {err}");
+    }
+    let (ok, err, _) = helper_install("pkexec-fails", Some(1));
+    assert!(!ok && err.contains("the install failed (exit code 1)"), "{err}");
+}
+
+#[test]
+fn a_missing_pkexec_is_named_with_how_to_install_it() {
+    let (ok, err, _) = helper_install("pkexec-missing", None);
+    assert!(!ok);
+    assert!(err.contains("pkexec (polkit) is missing") && err.contains("sudo apt install pkexec"), "{err}");
+    assert!(!err.contains("authorization"), "a missing pkexec is not a refused authorization: {err}");
 }

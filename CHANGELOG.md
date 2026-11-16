@@ -28,6 +28,18 @@ graphics driver works at all, it says so in a dialog instead of showing nothing.
 - Screen readers: buttons, rows, dialog text and the release list are exposed, and messages are
   announced. A dialog has no name of its own (its title names the group the keyboard focus goes to
   when it opens), and the window's own buttons and the About links are not exposed yet.
+- Closing the window during a source download stops the download and deletes the partly downloaded
+  file. A partial `.part` file left in `~/Downloads/kernel-pop` by an earlier interrupted download
+  is deleted when Kernel Pop starts.
+- Starting Kernel Pop while it is already open goes straight to the open window, with no setup
+  prompt first. If the open copy has stopped responding, the second start says so, with its process
+  ID, instead of doing nothing.
+- The "missing libraries" message also appears on desktops without zenity, kdialog or notify-send
+  (Pop!_OS COSMIC): as a desktop notification, or with xmessage.
+- On Hyprland or sway started from a text console, the password prompt for the first-launch setup
+  and for installs no longer waits invisibly on that console: the desktop's polkit agent asks, or
+  Kernel Pop says no agent is running. Without pkexec installed, the first launch says so and how to
+  install it, and a cancelled password prompt reads as cancelled or refused.
 
 ## 2.4.0 — 2026-11-15
 
