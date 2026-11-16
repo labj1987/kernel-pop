@@ -17,8 +17,9 @@ headings.
   zenity or kdialog cannot open the display: the next way to show them is tried.
 - Harmless warnings from the D-Bus library ("Failed to populate properties cache") and, with a
   screen reader running, from the window's accessibility code no longer appear in the terminal.
-- Closing the window during a download deletes only that download's partial file, and no new
-  download can start while the window is closing.
+- Closing the window during a download deletes only that download's partial file, and nothing new
+  can start while the window is closing, after a download or while a build stops.
+- A second start is told Kernel Pop is ready only once its window is on screen.
 
 ## 2.5.0 — 2026-11-16
 

@@ -1009,20 +1009,27 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // that raises the window (see activation.rs). Without a token, or off
     // Wayland, GPUI's own request is what there is; a Wayland compositor then
     // marks the window as wanting attention instead of raising it.
-    // From the first drawn frame on, a later launch gets "ok" once its request
-    // is handled; until then the listener tells it this copy is still starting.
+    // Once the first frame has been drawn and presented, a later launch gets
+    // "ok" once its request is handled; until then the listener tells it this
+    // copy is still starting. GPUI runs next-frame callbacks at the start of a
+    // frame request, before that frame is drawn: the first callback only asks
+    // for the next frame, and the second one (after the first frame is up on
+    // screen) sets `up`.
     let up = activations.up_signal();
-    let _ = window.update(cx, |_, window, _| window.on_next_frame(move |_, _| up.set()));
+    let _ = window.update(cx, |_, window, _| window.on_next_frame(move |window, _| window.on_next_frame(move |_, _| up.set())));
     cx.spawn(async move |cx| {
         while let Some(activation) = activations.recv().await {
-            let _ = window.update(cx, |_, window, _| {
+            let shown = window.update(cx, |_, window, _| {
                 let raised = activation.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
                 if !raised {
                     window.activate_window();
                 }
             });
-            // The later launch waits for this; without it, it reports this copy as hung.
-            activation.handled();
+            // The later launch waits for this; without it, it reports this copy
+            // as hung. A window that is gone did not show anything: no "ok".
+            if shown.is_ok() {
+                activation.handled();
+            }
         }
     })
     .detach();
@@ -1291,6 +1298,9 @@ impl MainView {
             }
             CloseDecision::StopBuildFirst => control.expect("a build runs"),
         };
+        // Nothing new starts while the build stops and the window closes, as
+        // for a download.
+        self.state.borrow_mut().closing = true;
         if !control.is_cancelled() {
             control.cancel();
             toast(window, cx, "Stopping the build before closing…");
@@ -3380,6 +3390,11 @@ mod tests {
         let stop = &source[source.find("fn stop_download_then_close(").unwrap()..];
         let stop = &stop[..stop.find("\n    fn ").unwrap()];
         assert!(stop.contains("remove_parts(&parts)") && !stop.contains("remove_stale_parts"), "{stop}");
+        // Stopping a build to close counts as closing too.
+        let may_close = &source[source.find("fn may_close(").unwrap()..];
+        let may_close = &may_close[..may_close.find("\n    fn ").unwrap()];
+        let build = &may_close[may_close.find("CloseDecision::StopBuildFirst =>").unwrap()..];
+        assert!(build.contains("self.state.borrow_mut().closing = true;"), "{may_close}");
     }
 
     /// The single-instance wiring in `build_ui` and `no_window` needs a real
@@ -3400,7 +3415,12 @@ mod tests {
         let closed = &build_ui[build_ui.find("cx.on_window_closed(").unwrap()..];
         let closed = &closed[..closed.find(".detach()").unwrap()];
         assert!(closed.find("instance::release()").unwrap() < closed.find("cx.quit()").unwrap(), "{closed}");
-        assert!(build_ui.contains("window.on_next_frame(move |_, _| up.set())"), "up from the first drawn frame");
+        assert!(
+            build_ui.contains("window.on_next_frame(move |window, _| window.on_next_frame(move |_, _| up.set()))"),
+            "up from the second next-frame callback, after the first frame was presented"
+        );
+        let answer = &build_ui[build_ui.find("activations.recv().await").unwrap()..];
+        assert!(answer.contains("if shown.is_ok() {") && answer.find("if shown.is_ok() {") < answer.find("activation.handled()"), "\"ok\" only once shown");
         assert!(!build_ui.contains("ui_is_up"), "not from the first poll of a task");
         assert_eq!(build_ui.matches("no_window(").count(), 2);
         assert_eq!(build_ui.matches(", activations)").count(), 2, "both no_window calls get the requests to drop");

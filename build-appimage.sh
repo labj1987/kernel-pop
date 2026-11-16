@@ -420,7 +420,8 @@ debian_based() {
 # <<< debian_based
 
 # >>> instance_running: whether a copy of Kernel Pop already runs in this login. The running
-# copy holds an exclusive flock on $XDG_RUNTIME_DIR/kernel-pop.sock.alive for its whole life
+# copy holds an exclusive flock on $XDG_RUNTIME_DIR/kernel-pop.sock.alive from when it binds its
+# socket until it releases it (its last window closed, or none could be opened) or exits
 # (instance.rs); a shared flock -n gives up on it with 75 then. Shared, so two launchers checking
 # at once don't take each other for a running copy. Anything else (no runtime dir, no flock(1), no
 # file) means no.

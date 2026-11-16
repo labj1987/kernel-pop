@@ -11,7 +11,7 @@
 //! than trust a socket in a shared place.
 //!
 //! The running copy answers each request once its window has handled it, and
-//! at once with "starting" while its window has not drawn its first frame. A
+//! at once with "starting" until its window's first frame is on screen. A
 //! later launch that gets no answer in time says the running copy is not
 //! responding (an error, with its PID); one that only heard "starting" says
 //! the running copy is still starting (information: its window comes up on
@@ -95,9 +95,9 @@ impl Activations {
 /// Says the window is up and requests are being handled. Until then the
 /// listener answers each request with "starting", so a launch that comes
 /// while this copy is still starting (a cold start on a software renderer
-/// can take seconds) waits longer instead of calling it hung. Set from the
-/// window's first drawn frame: a window that exists but was never drawn is
-/// not up yet.
+/// can take seconds) waits longer instead of calling it hung. Set once the
+/// window's first frame has been drawn and presented: a window that exists
+/// but was never shown is not up yet.
 #[derive(Clone, Default)]
 pub struct UiUp(Arc<AtomicBool>);
 
@@ -124,22 +124,25 @@ struct Listening {
 }
 
 impl Listening {
-    /// Removes the socket file, then shuts the listener down (in that order: a
-    /// launch that finds the file still there then gets "refused", which means
-    /// nobody listens, and binds a new one). Harmless twice.
+    /// Drops the `.alive` lock, removes the socket file, then shuts the
+    /// listener down. In that order: the launcher must not see a copy running
+    /// once its socket is gone (it would skip its checks for a launch that
+    /// then becomes the primary copy itself), and a launch that finds the file
+    /// still there gets "refused", which means nobody listens, and binds a new
+    /// one. Harmless twice.
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = std::fs::remove_file(&self.path);
-        // Wakes the listening thread's accept with an error and refuses
-        // connections from here on; the thread then ends.
-        // SAFETY: shutdown on a socket this struct keeps open.
-        unsafe { libc::shutdown(self.listener.as_raw_fd(), libc::SHUT_RDWR) };
         if let Some(alive) = &self.alive {
             // SAFETY: flock on a file this struct keeps open.
             unsafe { libc::flock(alive.as_raw_fd(), libc::LOCK_UN) };
         }
+        let _ = std::fs::remove_file(&self.path);
+        // Wakes the listening thread's accept with an error once the backlog
+        // is empty, and refuses connections from here on; the thread then ends.
+        // SAFETY: shutdown on a socket this struct keeps open.
+        unsafe { libc::shutdown(self.listener.as_raw_fd(), libc::SHUT_RDWR) };
     }
 }
 
@@ -419,13 +422,17 @@ fn claim_once(path: &Path, token: Option<&str>, waits: Waits) -> Result<Claim, C
     Ok(Claim::Primary(activations))
 }
 
-/// The listening thread: one `Activation` per later launch, until `release`
-/// or until nobody takes them any more.
+/// The listening thread: one `Activation` per later launch. A connection
+/// accepted after `release`, or one the UI no longer takes, is dropped
+/// unanswered, so that launch hears the end of the connection and asks again.
+/// The loop goes on after one: every launch already waiting in the backlog is
+/// taken and dropped the same way, and only the accept error that `release`'s
+/// shutdown causes once the backlog is empty ends it.
 fn listen(listening: &Listening, ui_up: &UiUp, tx: &tokio::sync::mpsc::UnboundedSender<Activation>) {
     for connection in listening.listener.incoming() {
         let mut connection = match connection {
             Ok(connection) => connection,
-            // Shut down by `release`: no more requests.
+            // Shut down by `release`, and the backlog is empty: no more requests.
             Err(_) if listening.closed.load(Ordering::Acquire) => break,
             Err(_) => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -435,15 +442,14 @@ fn listen(listening: &Listening, ui_up: &UiUp, tx: &tokio::sync::mpsc::Unbounded
         // Released between the accept and now: dropped unanswered, so that
         // launch asks again and finds nobody.
         if listening.closed.load(Ordering::Acquire) {
-            break;
+            continue;
         }
         let token = read_request(&connection);
         if !ui_up.is_set() {
             let _ = connection.write_all(STARTING);
         }
-        if tx.send(Activation { token, reply: Some(connection) }).is_err() {
-            break;
-        }
+        // A UI that no longer takes requests drops this one, unanswered.
+        let _ = tx.send(Activation { token, reply: Some(connection) });
     }
 }
 
@@ -464,8 +470,8 @@ fn parse_request(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_at, claim_with, nobody_listening, not_responding_message, parse_request, sibling, starting_message, valid_token, Activations, Claim, Waits,
-        MAX_TOKEN, RETRY_STEP, WAITS,
+        claim_at, claim_with, listen, nobody_listening, not_responding_message, parse_request, sibling, starting_message, valid_token, Activations, Claim,
+        Listening, UiUp, Waits, MAX_TOKEN, RETRY_STEP, WAITS,
     };
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
@@ -691,6 +697,63 @@ mod tests {
         assert!(matches!(claim, Claim::HandedOver), "quiet, not 'not responding'");
         assert!(taken > 2, "asked again in short steps: {taken}");
         assert!(waited >= Duration::from_millis(500) && waited < Duration::from_secs(2), "{waited:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A primary copy's socket with nobody serving it yet.
+    fn bound(path: &std::path::Path) -> Listening {
+        Listening {
+            listener: std::sync::Arc::new(std::os::unix::net::UnixListener::bind(path).unwrap()),
+            path: path.to_path_buf(),
+            alive: None,
+            closed: Default::default(),
+        }
+    }
+
+    /// What a launch heard before its connection ended; `None` when it is
+    /// still open a second later (nobody took the connection).
+    fn heard(mut stream: std::os::unix::net::UnixStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).ok().map(|_| bytes)
+    }
+
+    #[test]
+    fn every_launch_queued_at_a_released_socket_hears_the_end_at_once() {
+        let dir = scratch("backlog");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        // Three launches wait in the backlog when the copy releases its socket.
+        let waiting: Vec<_> = (0..3).map(|_| std::os::unix::net::UnixStream::connect(&path).unwrap()).collect();
+        listening.close();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        listen(&listening, &UiUp::default(), &tx);
+        for stream in waiting {
+            assert_eq!(heard(stream), Some(Vec::new()), "dropped unanswered, so that launch asks again");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_request_the_ui_no_longer_takes_is_dropped_unanswered() {
+        use std::io::Write;
+        let dir = scratch("no-ui");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let serving = {
+            let listening = listening.clone();
+            std::thread::spawn(move || listen(&listening, &UiUp::default(), &tx))
+        };
+        for _ in 0..3 {
+            let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            writeln!(&stream, "activate").unwrap();
+            assert_eq!(heard(stream).as_deref(), Some(&b"starting\n"[..]));
+        }
+        listening.close();
+        serving.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
