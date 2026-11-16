@@ -128,6 +128,13 @@ Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC (Wayland), and X11; with
   refused with a message.
 - **The font is one your system already has** (Ubuntu, Adwaita Sans, Cantarell, Noto Sans
   or DejaVu Sans, whichever is found first), not necessarily the one your desktop is set to.
+- **Starting Kernel Pop a second time** shows the window that is already open. On Wayland it
+  comes to the front when the second start came from your launcher, dock or menu (GNOME shows a
+  "Kernel Pop is ready" notice instead, as it does for other apps); started from a terminal, the
+  desktop only marks the window as wanting attention. If the open copy is still starting, the
+  second start says so, and its window appears when it is ready. If the open copy does not
+  respond, the second start says so and names its process ID; close that process and start
+  Kernel Pop again.
 
 ## Install
 

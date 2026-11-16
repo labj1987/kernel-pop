@@ -406,12 +406,55 @@ fn show_with(name: &str, tools: &[(&str, i32)]) -> Vec<String> {
             ),
         );
     }
-    let script = format!("{}\nlibcheck_show 'Test App' \"$(printf 'can'\\''t start: <x> & \"y\"\\nnext')\"\n", block());
-    let out = Command::new("/bin/bash").args(["-c", &script]).env("PATH", &dir).env("DISPLAY", ":0").env_remove("LIBCHECK_DIALOG").output().unwrap();
-    assert!(out.status.success());
-    let calls = std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+    let calls = show_in(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     calls
+}
+
+/// libcheck_show with only the programs in `dir` on PATH (plus mktemp and rm, for
+/// libcheck_dialog's temporary file), on a display that does not exist (:9999), so nothing
+/// can reach a real one. Returns the calls the fakes logged to `dir/calls`.
+fn show_in(dir: &Path) -> Vec<String> {
+    for tool in ["mktemp", "rm"] {
+        let link = dir.join(tool);
+        if !link.exists() {
+            let real = ["/usr/bin", "/bin"].iter().map(|bin| Path::new(bin).join(tool)).find(|path| path.exists()).expect(tool);
+            std::os::unix::fs::symlink(real, link).unwrap();
+        }
+    }
+    let script = format!("{}\nlibcheck_show 'Test App' \"$(printf 'can'\\''t start: <x> & \"y\"\\nnext')\"\n", block());
+    let out = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("PATH", dir)
+        .env("DISPLAY", ":9999")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("XDG_RUNTIME_DIR", dir)
+        .env("TMPDIR", dir)
+        .env_remove("LIBCHECK_DIALOG")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    std::fs::read_to_string(dir.join("calls")).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+#[test]
+fn a_dialog_that_could_not_open_the_display_passes_the_message_on() {
+    let dir = scratch("show-no-display");
+    let log = dir.join("calls");
+    // zenity with no display ends with 1, as a closed dialog does, but says why on stderr; and it
+    // leaves a process holding that stderr, which must not be waited for.
+    script_file(&dir.join("zenity"), &format!("#!/bin/bash\necho zenity >> '{}'\necho 'cannot open display: :9999' >&2\nsleep 5 &\nexit 1\n", log.display()));
+    script_file(&dir.join("kdialog"), &format!("#!/bin/bash\necho kdialog >> '{}'\necho 'Failed to open display' >&2\nexit 1\n", log.display()));
+    script_file(&dir.join("notify-send"), &format!("#!/bin/bash\necho notify-send >> '{}'\nexit 0\n", log.display()));
+    let started = std::time::Instant::now();
+    let calls = show_in(&dir);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+    assert_eq!(calls, ["zenity", "kdialog", "notify-send"]);
+    // The temporary files for their stderr (TMPDIR is this folder here) are gone.
+    let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, ["calls", "kdialog", "mktemp", "notify-send", "rm", "zenity"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

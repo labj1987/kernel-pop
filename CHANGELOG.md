@@ -4,6 +4,23 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.5.1 — 2026-11-16
+
+- **A second start while Kernel Pop is still opening no longer looks like an error.** If the first
+  copy needs more than 15 seconds to show its window (a cold start on a software renderer), the
+  second start now says Kernel Pop is still starting and that its window will appear when it is
+  ready, as a normal notice. A copy that has really stopped responding is still reported as an
+  error, with its process ID.
+- Starting Kernel Pop again right after closing it, or after it could not open its window, starts
+  a new copy at once instead of waiting for the old one or calling it not responding.
+- Messages shown without a window (a missing library or graphics driver) no longer get lost when
+  zenity or kdialog cannot open the display: the next way to show them is tried.
+- Harmless warnings from the D-Bus library ("Failed to populate properties cache") and, with a
+  screen reader running, from the window's accessibility code no longer appear in the terminal.
+- Closing the window during a download deletes only that download's partial file, and nothing new
+  can start while the window is closing, after a download or while a build stops.
+- A second start is told Kernel Pop is ready only once its window is on screen.
+
 ## 2.5.0 — 2026-11-16
 
 **One look on every desktop, and no GTK needed.** Kernel Pop now draws its own window instead of

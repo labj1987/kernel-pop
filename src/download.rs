@@ -187,7 +187,7 @@ where
             bail!("Refusing an unusual file name from the server: {:?}", f.filename);
         }
         let dest = dest_dir.join(&f.filename);
-        let part = dest_dir.join(format!("{}.part", f.filename));
+        let part = part_path(&dest_dir, &f.filename);
         let filename = f.filename.clone();
 
         download_one(
@@ -209,12 +209,35 @@ where
     Ok(paths)
 }
 
+/// Where `download_files` writes `filename` in `dir` until it is complete.
+pub fn part_path(dir: &Path, filename: &str) -> PathBuf {
+    dir.join(format!("{filename}.part"))
+}
+
+/// The `.part` files a download of `files` into `dir` writes.
+pub fn part_paths(files: &[Remote], dir: &Path) -> Vec<PathBuf> {
+    files.iter().map(|f| part_path(dir, &f.filename)).collect()
+}
+
+/// Deletes `parts`, the `.part` files of one download (`part_paths`), when
+/// closing gave up waiting for that download to stop. Only those: another
+/// copy without the single-instance socket may be downloading into the same
+/// folder. Only regular files are touched. Returns the deleted paths.
+pub fn remove_parts(parts: &[PathBuf]) -> Vec<PathBuf> {
+    parts
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()))
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .cloned()
+        .collect()
+}
+
 /// Deletes the app's own `.part` files in `dir`: what a kernel.org download
-/// (`linux-<version>.tar.<xz|sign>`) writes before it is complete. Called
-/// when no download of this copy runs (at startup, and when closing gave up
-/// waiting for a cancelled one), so each is left over from an unfinished
-/// one. Anything else there (a browser's download, say) is left alone, and
-/// only regular files are touched. Returns the deleted paths.
+/// (`linux-<version>.tar.<xz|sign>`) writes before it is complete. Called at
+/// startup, before this copy downloads anything and only when it holds the
+/// single-instance socket, so each is left over from an unfinished one.
+/// Anything else there (a browser's download, say) is left alone, and only
+/// regular files are touched. Returns the deleted paths.
 pub fn remove_stale_parts(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
     entries
@@ -286,6 +309,30 @@ mod tests {
             assert!(dir.join(kept).exists(), "{kept}");
         }
         assert!(remove_stale_parts(&dir.join("missing")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_deletes_only_its_own_downloads_part_files() {
+        let dir = std::env::temp_dir().join(format!("kernel-pop-test-own-parts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<Remote> = ["linux-7.2.tar.xz", "linux-7.2.tar.sign"]
+            .into_iter()
+            .map(|name| Remote { url: format!("https://cdn.kernel.org/{name}"), filename: name.to_string() })
+            .collect();
+        let parts = part_paths(&files, &dir);
+        assert_eq!(parts, [dir.join("linux-7.2.tar.xz.part"), dir.join("linux-7.2.tar.sign.part")]);
+        // This download got as far as its tarball; another one (another copy) writes 7.1.
+        std::fs::write(&parts[0], b"x").unwrap();
+        std::fs::write(dir.join("linux-7.1.tar.xz.part"), b"x").unwrap();
+        assert_eq!(remove_parts(&parts), [parts[0].clone()], "the missing .sign.part is no error");
+        assert!(!parts[0].exists());
+        assert!(dir.join("linux-7.1.tar.xz.part").exists(), "another download's .part is left alone");
+        // A directory under that name is not a file to delete.
+        std::fs::create_dir(&parts[1]).unwrap();
+        assert!(remove_parts(&parts).is_empty());
+        assert!(parts[1].is_dir());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
