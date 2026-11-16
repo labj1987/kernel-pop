@@ -1,3 +1,4 @@
+mod accent;
 mod activation;
 mod build;
 mod download;

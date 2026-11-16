@@ -826,11 +826,13 @@ fn initial_window_size(usable: Option<gpui_kit::Size<Pixels>>) -> gpui_kit::Size
 /// The smallest window size the layout works in.
 const WINDOW_MIN: (f32, f32) = (520., 420.);
 
-/// Light or dark, as the desktop prefers, with radio buttons that can be seen.
+/// Light or dark, as the desktop prefers, with radio buttons that can be seen
+/// and the desktop's accent colour.
 fn follow_appearance(window: &mut Window, cx: &mut App) {
     Theme::sync_system_appearance(Some(window), cx);
     let theme = Theme::global_mut(cx);
     theme.input = input_border(theme.is_dark());
+    crate::accent::apply(cx);
 }
 
 /// The colour of an unselected radio button's ring (and of checkbox and text
@@ -932,9 +934,10 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
         ..TitleBar::window_options()
     };
     let exclusive = activations.is_exclusive();
+    crate::accent::follow(cx);
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title("Kernel Pop");
-        // Follow the desktop's light/dark preference, now and when it changes.
+        // Follow the desktop's light/dark preference and accent colour, now and when they change.
         follow_appearance(window, cx);
         window.observe_window_appearance(follow_appearance).detach();
         cx.new(|cx| MainView::new(window, cx))

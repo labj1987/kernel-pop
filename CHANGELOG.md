@@ -4,6 +4,15 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.5.2 — 2026-11-16
+
+- **The window takes your desktop's accent colour.** On GNOME, KDE Plasma and COSMIC, primary
+  buttons, switches, checkboxes and radio buttons, focus rings, links, text selection and progress
+  bars now use the accent colour you picked, in light and dark mode alike, and change with it at
+  once. Text on accent-coloured buttons stays readable: it is white or near-black, whichever stands
+  out. On desktops without an accent colour (Hyprland, sway, GNOME before 47) the colours stay as
+  they were.
+
 ## 2.5.1 — 2026-11-16
 
 - **A second start while Kernel Pop is still opening no longer looks like an error.** If the first

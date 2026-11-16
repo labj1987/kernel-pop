@@ -1,6 +1,6 @@
 [package]
 name = "kernel-pop"
-version = "2.5.1"
+version = "2.5.2"
 edition = "2021"
 rust-version = "1.100"
 description = "Kernel Pop — GUI that builds kernel.org kernels for this machine and installs them"
@@ -23,6 +23,9 @@ sha2 = "0.11"
 hex = "0.4"
 anyhow = "1"
 futures-util = "0.3"
+# The desktop's accent colour (accent.rs), from the XDG desktop portal: the portal client the toolkit
+# already uses for its file dialogs and light/dark setting, with the same features.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "settings"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"
