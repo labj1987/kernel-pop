@@ -853,6 +853,15 @@ fn rescaled_size(usable: gpui_kit::Size<Pixels>, scale: f32, from_wayland_output
 /// another monitor), not the start-up scale arriving.
 const REFIT_WINDOW: Duration = Duration::from_secs(3);
 
+/// When the refit is made after the scale is known: once after the first
+/// wait, and once more after the second only if the first size came back.
+const REFIT_WAITS: [Duration; 2] = [Duration::from_millis(300), Duration::from_millis(700)];
+
+/// Equal to within a pixel or so (sizes go through the scale and back).
+fn same_size(a: gpui_kit::Size<Pixels>, b: gpui_kit::Size<Pixels>) -> bool {
+    (a.width.as_f32() - b.width.as_f32()).abs() < 2. && (a.height.as_f32() - b.height.as_f32()).abs() < 2.
+}
+
 /// What a bounds change of the freshly opened window means for the one refit.
 #[derive(Debug, PartialEq)]
 enum Refit {
@@ -867,8 +876,7 @@ enum Refit {
 /// `now`: the window's size; `first`: the size it was opened with; `usable`:
 /// the one output's size as GPUI reported it.
 fn refit(elapsed: Duration, now: gpui_kit::Size<Pixels>, first: gpui_kit::Size<Pixels>, scale: f32, usable: gpui_kit::Size<Pixels>) -> Refit {
-    let untouched = (now.width.as_f32() - first.width.as_f32()).abs() < 2. && (now.height.as_f32() - first.height.as_f32()).abs() < 2.;
-    if elapsed > REFIT_WINDOW || !untouched {
+    if elapsed > REFIT_WINDOW || !same_size(now, first) {
         return Refit::Disarm;
     }
     if scale == 1. {
@@ -927,7 +935,7 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
             view.update(cx, |_, cx| {
                 let opened = Instant::now();
                 let mut armed = true;
-                cx.observe_window_bounds(window, move |_, window, _| {
+                cx.observe_window_bounds(window, move |_, window, cx| {
                     if !armed {
                         return;
                     }
@@ -937,7 +945,26 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
                         Refit::Resize(want) => {
                             armed = false;
                             log::info!("window: scale {} known, size {first_size:?} -> {want:?}", window.scale_factor());
-                            window.resize(want);
+                            // Not from inside this callback, where a resize is lost, and not at once:
+                            // a configure KWin sent before it heard of the new size undoes it. So a
+                            // moment later, and once more if the first size came back; then never again.
+                            cx.spawn_in(window, async move |_, cx| {
+                                for wait in REFIT_WAITS {
+                                    cx.background_executor().timer(wait).await;
+                                    let resized = cx.update(|window, _| {
+                                        let still_first = same_size(window.viewport_size(), first_size);
+                                        if still_first {
+                                            log::info!("window: resizing to {want:?} after {wait:?}");
+                                            window.resize(want);
+                                        }
+                                        still_first
+                                    });
+                                    if !matches!(resized, Ok(true)) {
+                                        break;
+                                    }
+                                }
+                            })
+                            .detach();
                         }
                     }
                 })

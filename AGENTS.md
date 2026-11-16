@@ -153,7 +153,9 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   worked out again (`wayland_logical`, `rescaled_size`) when the window first learns that scale (a
   bounds observer: right after opening it is still 1), and the window resized once if the user has
   not (`refit`: armed only for the first 3 s and while the window keeps its first size, and only
-  with a single output); never on X11, where GPUI already divides by the true scale. Every tab
+  with a single output). The resize itself runs 300 ms later from a task, and once more 700 ms after
+  that only if the first size came back: one made inside the bounds callback is lost, and KWin's
+  configure with the old size undoes an immediate one. Never on X11, where GPUI already divides by the true scale. Every tab
   scrolls above its bottom buttons.
 - File dialogs (portal) have no file-type filter and no starting folder in GPUI: `inspect` refuses
   anything that is not a kernel tarball after the pick and on drop.
