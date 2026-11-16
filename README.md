@@ -1,6 +1,6 @@
 # Kernel Pop
 
-GTK4 + libadwaita desktop app, written in Rust, that builds kernel.org
+Desktop app, written in Rust with GPUI Kit, that builds kernel.org
 kernels for this machine and installs them. Distributed as an AppImage.
 
 Pick a mainline, stable or longterm release on the Browse tab (or drop a
@@ -92,19 +92,42 @@ VFS-panics on boot. This app is built around not letting that happen:
 
 An x86_64 Debian- or Ubuntu-based system (apt and dpkg: Kernel Pop builds
 `.deb` packages and installs them with dpkg) with polkit, booting with GRUB,
-systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI. GTK 4.12+ and
-libadwaita 1.5+ from the system are used when they are there, so the window looks like
-the rest of your desktop (theme, accent colour); without them, or with older ones, the
-AppImage uses the GTK 4 and libadwaita it brings (libadwaita 1.5: dark mode, but not the
-desktop's accent colour). `KERNEL_POP_GTK=bundled` or `KERNEL_POP_GTK=host` forces one or the other.
-Either way it takes the basics every desktop has from the
-system: glibc 2.39 or newer, OpenGL/EGL drivers and the Vulkan loader, X11 or Wayland client libraries, and
-fontconfig, freetype, harfbuzz and fribidi; if one is missing, Kernel Pop names it before
-it asks for a password. On a system
-without dpkg and apt it shows a notice that only Debian- and Ubuntu-based systems are
-supported, and building and installing stay off.
+systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI.
 
-Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC. Other Wayland and X11 desktops should work too.
+Kernel Pop needs no GTK, Qt or other toolkit from the system: it draws its own window,
+the same on every desktop, and follows the desktop's light or dark setting. What it
+takes from the system is what every desktop has:
+
+- **glibc 2.39 or newer** (Ubuntu 24.04, Debian 13 and later).
+- **A graphics driver with Vulkan or OpenGL ES.** Any working GPU driver has one. With
+  no GPU, or after an update left the NVIDIA driver broken, Mesa's software renderer
+  (`mesa-vulkan-drivers`, installed on Ubuntu by default) is enough, so Kernel Pop still
+  opens to put things right.
+- The X11 and Wayland client libraries: `libxcb`, `libxkbcommon`, `libxkbcommon-x11`,
+  and `libwayland-client` on a Wayland session.
+
+If a library is missing or the system is too old, Kernel Pop says which before it asks
+for a password. File dialogs and the light or dark setting come through the desktop's
+portal (`xdg-desktop-portal`); without one, dropping a tarball on the window still works.
+On a system without dpkg and apt it shows a notice that only Debian- and Ubuntu-based
+systems are supported, and building and installing stay off.
+
+Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC (Wayland), and X11; with the NVIDIA driver and with software rendering only (lavapipe, llvmpipe).
+
+## Known issues
+
+- **While a dialog is open, move the window by the dialog's title**; the window's own title
+  bar does not respond until the dialog is closed.
+- **Screen readers.** Buttons, rows, the release list and all text in dialogs are exposed,
+  and messages are announced. A dialog itself has no name: its title names the group that
+  holds its content, where the keyboard focus goes when it opens. The window's minimise,
+  maximise and close buttons and the two links in About are not exposed (close the window
+  with your desktop's shortcut, such as Alt+F4). These are limits of the UI toolkit, GPUI Kit.
+- **The file dialogs show every file**, not only tarballs, and open in the folder the
+  desktop last used. Picking or dropping anything that is not a kernel source tarball is
+  refused with a message.
+- **The font is one your system already has** (Ubuntu, Adwaita Sans, Cantarell, Noto Sans
+  or DejaVu Sans, whichever is found first), not necessarily the one your desktop is set to.
 
 ## Install
 
@@ -117,7 +140,8 @@ First launch asks for authentication once to install the privileged
 helper script and the polkit policy to system paths. A new version asks
 once more to update them. If that authentication is cancelled, the app
 still opens but shows a banner, and installing, removing and signing
-kernels stay off until you restart it and authenticate.
+kernels stay off until you restart it and authenticate. If `pkexec` itself is
+missing, install it first (`sudo apt install pkexec`).
 
 If no password dialog ever appears and Kernel Pop says that no polkit authentication
 agent is running, start one and try again. KDE, GNOME and COSMIC include one; on
@@ -309,7 +333,7 @@ is not.
 
 ## Building from source
 
-    apt install -y libgtk-4-dev libadwaita-1-dev pkg-config
+    apt install -y build-essential pkg-config libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
     cargo build --release --locked
 
 The compiler is pinned in `rust-toolchain.toml` (Rust 1.100.0), which rustup
@@ -318,12 +342,11 @@ picks up automatically; a distribution's `cargo`/`rustc` may be older.
 Or build the AppImage. An ordinary user is enough once the build
 dependencies are installed:
 
-    apt install -y libgtk-4-dev libadwaita-1-dev pkg-config zsync wget file desktop-file-utils \
-        patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas
+    apt install -y build-essential pkg-config libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+        zsync wget file desktop-file-utils
     bash build-appimage.sh
 
-The AppImage bundles the build machine's GTK 4 and libadwaita as the fallback for systems without
-them (release builds run on Ubuntu 24.04, which sets the glibc 2.39 floor).
+The AppImage brings no libraries; release builds run on Ubuntu 24.04, which sets the glibc 2.39 floor.
 
 ## Acknowledgements
 
@@ -332,6 +355,11 @@ Development assistance: Claude Code (Anthropic) and Codex (OpenAI).
 ## License
 
 AGPL-3.0-or-later — see [LICENSE](LICENSE).
+
+The window is drawn with [GPUI Kit](https://github.com/longbridge/gpui-kit) and GPUI
+(Apache-2.0), with icons from [Lucide](https://lucide.dev) (ISC). The AppImage carries the
+licence notices of these and of every other Rust crate built into it, in
+`usr/share/licenses/kernel-pop/THIRD-PARTY-LICENSES.txt` (`--appimage-extract` shows it).
 
 Code at or before commit `8cb172eb68a8ed7c417ae0f04c4b2adaae858c34` remains available
 under the MIT License per its original release. From this commit forward,

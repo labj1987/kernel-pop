@@ -54,6 +54,24 @@ pub struct Progress {
     pub total: Option<u64>,
 }
 
+/// Resolves once `cancel` is set.
+async fn cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// `future`, or `Cancelled` as soon as `cancel` is set: a request or a read
+/// that hangs on the network must not hold up a cancel (closing the window
+/// waits for it).
+async fn or_cancel<T>(cancel: &AtomicBool, future: impl std::future::Future<Output = T>) -> Result<T> {
+    tokio::select! {
+        biased;
+        () = cancelled(cancel) => Err(Cancelled.into()),
+        value = future => Ok(value),
+    }
+}
+
 async fn download_one<F>(client: &reqwest::Client, url: &str, dest: &Path, mut progress_cb: F, cancel: &Arc<AtomicBool>) -> Result<()>
 where
     F: FnMut(u64, Option<u64>),
@@ -66,10 +84,10 @@ where
         }
         if attempt > 0 {
             let wait = RETRY_BASE_SECS * (2u64.pow(attempt - 1));
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            or_cancel(cancel, tokio::time::sleep(std::time::Duration::from_secs(wait))).await?;
         }
 
-        let resp = match client.get(url).send().await {
+        let resp = match or_cancel(cancel, client.get(url).send()).await? {
             Ok(r) => r,
             Err(e) => {
                 last_err = e.into();
@@ -94,12 +112,16 @@ where
         };
 
         let mut failed = false;
-        while let Some(chunk) = stream.next().await {
-            if cancel.load(Ordering::Relaxed) {
-                drop(file);
-                let _ = tokio::fs::remove_file(dest).await;
-                return Err(Cancelled.into());
-            }
+        loop {
+            let chunk = match or_cancel(cancel, stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(e);
+                }
+            };
             match chunk {
                 Ok(bytes) => {
                     if let Err(e) = file.write_all(&bytes).await {
@@ -187,6 +209,30 @@ where
     Ok(paths)
 }
 
+/// Deletes the app's own `.part` files in `dir`: what a kernel.org download
+/// (`linux-<version>.tar.<xz|sign>`) writes before it is complete. Called
+/// when no download of this copy runs (at startup, and when closing gave up
+/// waiting for a cancelled one), so each is left over from an unfinished
+/// one. Anything else there (a browser's download, say) is left alone, and
+/// only regular files are touched. Returns the deleted paths.
+pub fn remove_stale_parts(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_str().is_some_and(own_part))
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect()
+}
+
+/// Whether `name` is a `.part` file this app writes: `linux-*.tar.*.part`.
+fn own_part(name: &str) -> bool {
+    name.strip_suffix(".part")
+        .and_then(|name| name.strip_prefix("linux-"))
+        .is_some_and(|rest| rest.split_once(".tar.").is_some_and(|(version, ext)| !version.is_empty() && !ext.is_empty()))
+}
+
 /// SHA256 of a file as lowercase hex, streaming in 1 MiB chunks so large
 /// packages are never held in memory all at once.
 pub fn sha256_file(path: &Path) -> Result<String> {
@@ -214,6 +260,48 @@ mod tests {
         let wrapped = Err::<(), _>(e).context("Failed to download linux-7.2.12.tar.xz").context("outer").unwrap_err();
         assert!(is_cancelled(&wrapped));
         assert!(!is_cancelled(&anyhow::anyhow!("Download cancelled")));
+    }
+
+    #[test]
+    fn leftover_part_files_are_removed_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("kernel-pop-test-parts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build.part")).unwrap();
+        for name in [
+            "linux-7.2.tar.xz.part",
+            "linux-7.2.tar.sign.part",
+            "linux-7.1.tar.xz",
+            "notes.part.txt",
+            ".part",
+            "firefox-setup.tar.bz2.part",
+            "linux-.tar.xz.part",
+            "video.mp4.part",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut removed: Vec<_> = remove_stale_parts(&dir).into_iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        removed.sort();
+        assert_eq!(removed, ["linux-7.2.tar.sign.part", "linux-7.2.tar.xz.part"]);
+        for kept in ["linux-7.1.tar.xz", "notes.part.txt", ".part", "build.part", "firefox-setup.tar.bz2.part", "linux-.tar.xz.part", "video.mp4.part"] {
+            assert!(dir.join(kept).exists(), "{kept}");
+        }
+        assert!(remove_stale_parts(&dir.join("missing")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_ends_a_hung_request_at_once() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let result = or_cancel(&cancel, std::future::pending::<()>()).await;
+        assert!(is_cancelled(&result.unwrap_err()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(or_cancel(&AtomicBool::new(false), async { 7 }).await.unwrap(), 7);
     }
 
     #[test]

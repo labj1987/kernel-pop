@@ -1,6 +1,6 @@
 # Kernel Pop (formerly MKI / Mainline Kernel Installer)
 
-GTK4 + libadwaita GUI, written in Rust, that builds kernel.org kernels for
+GPUI Kit GUI, written in Rust, that builds kernel.org kernels for
 this machine and installs them. The user picks a release from kernel.org's
 releases.json (or drops a source tarball onto the window); Kernel Pop checks
 its signature against the kernel.org developers' keys (fetched over WKD),
@@ -24,18 +24,35 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
 
 ## Module layout (`src/`)
 
-- `main.rs` — entry point, sets up the shared Tokio runtime and wires up
-  the GTK application.
-- `ui.rs` — the GTK4/libadwaita UI: system/browse/build/install/log tabs,
-  plus a window-wide drop target for tarballs. One global busy state
-  (`AppState::busy`, `begin_busy`/`end_busy`, `refresh_controls`)
+- `main.rs` — entry point: the single-instance check, the stderr logger
+  (`KERNEL_POP_LOG`), the shared Tokio runtime, then GPUI.
+- `instance.rs` — one running copy per login: a socket in
+  `$XDG_RUNTIME_DIR`; a second launch hands over its activation token and
+  waits for the "ok" the UI loop sends once it handled it. Until the window is up the listener
+  answers "starting" at once; a launch waits 2 s for any answer and, after "starting", 15 s in all
+  for the "ok" (a cold start on a software renderer can take seconds). Otherwise it reports the
+  running copy as not responding, with its PID, through `notice.rs`, and exits 1. The primary
+  holds an exclusive `flock` on `kernel-pop.sock.alive` for its life, so AppRun (`instance_running`,
+  a shared non-blocking probe, so two launchers don't see each other) can skip
+  its setup and exec the binary at once. A running copy that closes the connection without an
+  answer (it was just exiting) means the claim is tried once more. Without a socket (no
+  `XDG_RUNTIME_DIR`, or the bind failed) the claim is not exclusive and startup leaves `.part`
+  files alone. `activation.rs` raises the window with that token on Wayland
+  (`xdg_activation_v1` on GPUI's own connection).
+- `notice.rs` — errors with no window to show them in: zenity, kdialog, notify-send, the
+  notification service via `gdbus call` (Pop!_OS COSMIC has none of the others), xmessage, in that
+  order until one shows it. AppRun's `libcheck_show` keeps the same chain, in the same order, in
+  bash.
+- `ui.rs` — the GPUI Kit UI (see UI below): system/browse/build/install/log
+  tabs, plus a window-wide drop target for tarballs. One global busy state
+  (`AppState::busy`, `MainView::begin_busy` and its `BusyGuard`)
   serialises downloads, signature checks, builds and every privileged
-  action: while one runs, nothing that starts another is sensitive,
-  including the per-kernel buttons (they live in `kernels_list`). Worker
-  threads report through the `UiMsg` channel, drained in batches so a
-  build's output cannot flood GTK; the Log tab keeps the last
-  `LOG_MAX_LINES` lines (the whole output is in build.log). Toasts for runs
-  that can report problems come from `report_run`/`outcome_message`.
+  action: while one runs, every control that starts another is disabled,
+  including the per-kernel buttons. Worker threads report through the
+  `UiMsg` channel, drained every `UI_TICK` so a build's output cannot flood
+  the window; the Log tab keeps the last `LOG_MAX_LINES` lines (the whole
+  output is in build.log). Toasts for runs that can report problems come
+  from `report_run`/`outcome_message`.
 - `kernelorg.rs` — kernel.org's releases.json (mainline, stable, longterm;
   linux-next is left out) and the cdn.kernel.org `.tar.sign` URL for a
   version (`fetch_signature`, for a dropped tarball without one).
@@ -63,8 +80,9 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   runs in its own process group so `BuildControl::cancel` kills all of it.
   Refuses to run as root.
 - `download.rs` — downloads files with progress, cancel (the typed
-  `Cancelled` error) and retries, into `.part` files renamed when complete,
-  with explicit 0755/0644 modes; `sha256_file`.
+  `Cancelled` error, which also ends a hung request or read at once) and retries, into `.part`
+  files renamed when complete, with explicit 0755/0644 modes; `remove_stale_parts` (only the app's
+  own `linux-*.tar.*.part` names, at startup when no download runs); `sha256_file`.
 - `system.rs` — inventories installed kernels and their boot health (the
   initrd/modules/boot-entry check described above; for kernelstub, whether
   the kernel is the `vmlinuz` or `vmlinuz.old` one and its ESP copy
@@ -76,12 +94,88 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   since `/boot/vmlinuz-*` is 0600, or Ubuntu's from the dpkg source
   package); install preflight warnings; which old kernels can be pruned.
 - `install.rs` — invokes `scripts/privileged-install.sh` via `pkexec` and
-  returns its output; refuses to run when the installed helper differs from
+  returns its output, in a session of its own (`without_terminal`: an app from a TTY-started
+  Hyprland inherits that console, and pkexec would prompt there unseen); refuses to run when the installed helper differs from
   the bundled one (`helper_problem`); tells a cancelled authentication from
   a refused one and from a failed script; parses the output protocol into
   a `ScriptReport`. `--install-build-deps` takes only names from the
   script's `BUILD_DEPS_ALLOWED`. The signing setup's MOK password goes to the script on
   stdin, never in argv.
+
+## UI (GPUI Kit)
+
+- The toolkit is `gpui-kit`, pinned to an exact version in Cargo.toml (0.9.x releases weekly and
+  pins GPUI itself as the `gpui-pre` snapshot crates). It draws with wgpu: Vulkan first, OpenGL ES
+  through EGL second; Mesa's software drivers count, which matters here: the app must still open
+  after a kernel or driver update left the NVIDIA driver broken (lavapipe, or GLES on llvmpipe).
+  Bump it on purpose, then re-run the checks below. Its sources are the reference:
+  `~/.cargo/registry/src/*/gpui-component-*`, `gpui-base-*`, `gpui-pre-*`.
+- Shape: one view (`MainView`) holding the shared `AppState` (`Rc<RefCell<..>>`, so a `BusyGuard`
+  dropped anywhere can clear it) and the per-tab display state, and one small view for dialog
+  content that changes while open (`SigningPrompt`). Dialog builders run on every frame (`Fn`), so
+  one-shot state travels in `Rc<RefCell<Option<..>>>`. `MainView::run` runs a future on Tokio and
+  hands the result to a `&mut MainView` callback on the UI thread; `MainView::later` wraps view
+  code for dialog buttons.
+- Dialogs: always through `window.open_dialog` with `.overlay(false)` (the toolkit's dimming layer
+  also paints the client-side shadow margin, a dark frame around the window on KDE and GNOME), the
+  content in `named_group(..)`, the buttons in `dialog_buttons()` inside that group (not the
+  toolkit's footer), the default button given the focus at opening, and the text above the
+  buttons capped with `dialog_room(window)` and scrollable: the toolkit cuts off a dialog taller
+  than the window. Yes/no questions go through `show_question` (`Question`: title, body, button
+  texts, default button, destructive); what a button starts runs through `window.defer` after
+  `close_dialog`, so a follow-up dialog is not the one that gets closed. A cancel action
+  (`on_cancel`) also runs on Escape and the close button (the build summary discards the
+  configured tree that way).
+- Enter in a dialog: the toolkit sends Enter to the dialog's `on_ok` before the focused button
+  sees it. Every dialog therefore sets `on_ok` and acts as the focused button (`enter_key`):
+  confirm only when the action button has the focus, cancel on Cancel, and return false (stay
+  open) anywhere else, which leaves Enter to a focused text field (the signing dialog's second
+  password field submits on Enter).
+- Nothing may show a notification before the window has the toolkit's root view (that is,
+  from `MainView::new`): `push_notification` panics there. `show_toast` returns false instead,
+  and the first reads run from `MainView::start`, called by `build_ui` after `open_window`.
+- Screen readers: GPUI reports only elements with an id and a role. Use `label(id, text)` for
+  text (never a bare string child in a dialog), `accessibility_label` on icon buttons and on
+  buttons that repeat per row (they name the kernel), `aria_label` on inputs, and `toast()` for
+  messages (it also feeds the `Announcer` live region; the toolkit's notifications are not
+  announced). The toolkit's dialog cannot be named in 0.9.1; `named_group` plus the initial focus
+  is the stand-in. Selectable lists (releases, built kernels, configuration mode) are `Radio`s
+  in a `Role::RadioGroup`.
+- Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit
+  starts; without that GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at
+  warn level on a normal start (`KERNEL_POP_LOG=info` shows the renderer picked; `main.rs` keeps
+  zbus and other chatty dependencies at warn whatever the level).
+- Theme: `follow_appearance` re-applies the light/dark theme and then sets the `input` colour
+  (radio rings, checkbox and field borders) to one with at least 3:1 contrast; the toolkit's is
+  nearly the background colour. The first window size is clamped to the display less room for
+  panels (`initial_window_size`). On Wayland GPUI's output size is the mode divided by the integer
+  `wl_output` scale (150% arrives as 2), so once the window knows its fractional scale the size is
+  worked out again (`wayland_logical`, `rescaled_size`) when the window first learns that scale (a
+  bounds observer: right after opening it is still 1), and the window resized once if the user has
+  not (`refit`: armed only for the first 3 s and while the window keeps its first size, and only
+  with a single output). The resize itself runs 300 ms later from a task, and once more 700 ms after
+  that only if the first size came back: one made inside the bounds callback is lost, and KWin's
+  configure with the old size undoes an immediate one. Never on X11, where GPUI already divides by the true scale. Every tab
+  scrolls above its bottom buttons.
+- File dialogs (portal) have no file-type filter and no starting folder in GPUI: `inspect` refuses
+  anything that is not a kernel tarball after the pick and on drop.
+- Closing: `may_close` (from `on_window_should_close`) refuses while a privileged action runs,
+  cancels a running build and closes the window once it has cleaned up, and cancels a running
+  download and closes once its `.part` file is gone (after 5 s it deletes it itself).
+- Testing the UI without touching the machine: a scratch `HOME` whose
+  `Downloads/kernel-pop/linux-<krel>/` holds small fake `.deb` files, a `SHA256SUMS` for them and
+  a `build-info.txt` reaches the Install tab with a verified build; Browse, Download Source and
+  Build reach the build summary dialog, whose Cancel (or Escape) deletes the configured tree. Never
+  press Install Kernel, Sign, Boot Next Time, Remove's confirm, Set Up or Install… (build tools)
+  on a dev machine: they run the privileged script for real. Run GUI checks on a private display
+  (Xvfb + `dbus-run-session`) with a private `XDG_RUNTIME_DIR`. Renderer checks:
+  `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` (lavapipe), and with no Vulkan ICD at
+  all plus `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json` (GLES on
+  llvmpipe); `KERNEL_POP_LOG=info` names the adapter picked.
+- Before a release, on GNOME, KDE Plasma, Hyprland and COSMIC: start, every tab, a drop, the
+  dialogs above, light/dark switch, polkit prompt and its cancel / no-agent messages; and with no
+  GPU: lavapipe, GLES only, no driver (the app's dialog), no loader (AppRun's message). Retake the
+  screenshots in `docs/screenshots/` when a tab's look changes.
 
 ## Source and build verification
 
@@ -249,48 +343,44 @@ boots once MOK Manager enrolls it.
 
 ## Build process
 
-GTK 4 and libadwaita come from the system when it has them, with a bundled copy as the fallback.
-The AppDir holds the binary twice: `usr/bin/kernel-pop` as cargo built it (no rpath; the build fails if it
-has one), which loads the system's GTK like releases before the bundle, and `usr/bin/bundled/kernel-pop`,
-patched to the bundled runtime. AppRun's `gtk_choice` picks one at launch: the plain binary when
-`ldd -r` on it prints no `not found` line and no unresolved symbol of the binary itself (`undefined
-symbol: X (binary)` or `symbol X version Y not defined ... (binary)`; a system library's own lazy
-symbols don't count) (that also catches a libadwaita
-older than 1.5), the bundled one otherwise and when ldd is absent. `KERNEL_POP_GTK=host|bundled` overrides the
-check; one stderr line names the copy taken and why. `libcheck_run` then checks the chosen binary
-before any password prompt. The bundle (`bundle_gtk_runtime` in `build-appimage.sh`) is the ldd closure of
-the bundled binary minus the AppImage excludelist (glibc, libstdc++/libgcc_s, GL/EGL/DRM, X11/xcb, Wayland,
-fonts; the script cites the excludelist version) and the Vulkan loader, which also come from the
-system; plus the SVG pixbuf loader only (Ubuntu builds PNG and JPEG into gdk-pixbuf; the build fails
-if that changes), the dconf GIO module and the IBus IM module, with compiled schemas. Licences go to
-`usr/share/doc/bundled-libraries`: each package's copyright file, the `common-licenses` texts they
-name, and `PACKAGES` (the Ubuntu 24.04 source packages and versions they come from; the only change is the ELF rpath). AppRun's
-`libcheck_run` fails on any `not found` line of `ldd -r`, and on unresolved symbols of the binary or of
-anything inside the AppImage (a system library's own lazy ones don't count); when ldd fails without
-naming anything, it asks the loader directly. It names the glibc version needed and found. `gio-launch-desktop` is copied into `usr/bin` (GLib runs every GIO launch
-through it; AppRun puts `usr/bin` on PATH), and `bundle_env` also saves and unsets the system's
-`GTK_PATH` and `GIO_EXTRA_MODULES` (restored for child programs like the others). Libraries are found through
-`$ORIGIN` rpaths set with patchelf, never `LD_LIBRARY_PATH`. On the bundled path only, AppRun's `bundle_env` sets
-`GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`, `GIO_MODULE_DIR` and `GSETTINGS_SCHEMA_DIR` and keeps the
-earlier values in `APPIMAGE_ORIG_*`; every program the app starts must be built with
-`host_env::command` (a test fails on a bare `Command::new` outside test code), which puts them back
-(on the host path nothing is set, so it changes nothing).
+The AppImage holds one binary, as cargo built it, and no libraries. The binary links glibc, libgcc_s,
+libxcb, libxkbcommon and libxkbcommon-x11, and loads by name at run time libwayland-client (Wayland
+sessions), libvulkan and/or libEGL (with libwayland-egl) and then the GPU driver's own libraries; it
+loads no GTK, GLib, Qt, fontconfig or freetype. AppRun's `libcheck_run` checks this before any
+password prompt: `ldd -r` on the binary must show no `not found` line and no unresolved symbol of the
+binary itself (a system library's own lazy ones don't count; when ldd fails without naming anything,
+it asks the loader directly), and `libcheck_runtime` looks in the loader cache (`ldconfig -p`, 64-bit
+entries, plus `LD_LIBRARY_PATH`) for libwayland-client on a Wayland session and for at least one of
+libvulkan and libEGL. A cache that does not list glibc (NixOS and the like) says nothing, so nothing
+is claimed. The message names the glibc version needed and found, or the missing libraries with the
+install command for dnf, zypper, apt or pacman (`libcheck_package` holds the package names: add a
+row when the binary gains a library). `tests/libcheck.rs` runs the block in bash with a fake ldd,
+ldconfig and os-release, and the `debian_based` block with stub dpkg/apt-get. Nothing sets
+`LD_LIBRARY_PATH` or any toolkit variable, so the programs the app starts (pkexec, make, dpkg, tar)
+get the user's environment as it is: plain `std::process::Command`.
 
 `build-appimage.sh` builds the AppImage. It runs as an ordinary user and
 writes only inside the checkout:
-1. Only on a machine with no toolchain (cargo or the gtk4 headers missing)
-   does it install build deps via apt (through sudo when not root), the
-   one part needing root:
-   cargo, rustc, gtk4/adwaita dev headers, pkg-config, `zsync`, `wget`,
-   `file` and `desktop-file-utils`. It then checks `wget`, `file` and
-   `desktop-file-validate` exist and fails clearly if one is missing.
+1. Only on a machine with no toolchain (no cargo, or pkg-config can't find xcb, xkbcommon,
+   xkbcommon-x11 and fontconfig) does it install build deps via apt (through sudo when not
+   root), the one part needing root: cargo, rustc, build-essential, pkg-config, `libxcb1-dev`,
+   `libxkbcommon-dev`, `libxkbcommon-x11-dev`, `libfontconfig1-dev` (one crate probes it at build
+   time; the binary does not load it), `zsync`, `wget`, `file` and `desktop-file-utils`. It then
+   checks `wget`, `file` and `desktop-file-validate` exist and fails clearly if one is missing.
 2. `cargo build --release --locked`, with the compiler pinned in
    `rust-toolchain.toml`.
 3. Assembles the AppDir (binary, privileged script, polkit policy, desktop
-   file, icon, appdata) and runs `desktop-file-validate` on the desktop
-   file. AppRun installs the script and policy to system paths through
-   pkexec when they differ,
-   says so on stderr when that is cancelled or fails, and exports
+   file, icon, appdata, generated `AppRun`) and runs `desktop-file-validate` on the desktop
+   file. `scripts/third_party_licenses.py` writes the notices of every crate in the build
+   (from `cargo metadata` and the crates' own licence files; for a crate without one, the standard
+   text of each licence its SPDX expression names, kept in `scripts/spdx/`: the build fails when
+   a text is missing there, so add it) to
+   `usr/share/licenses/kernel-pop/THIRD-PARTY-LICENSES.txt`, next to the app's own `LICENSE`; CI
+   runs it too. AppRun installs the script and policy to system paths through
+   pkexec when they differ (only on a Debian-based system, `debian_based`),
+   says so on stderr when that is cancelled or fails (`helper_install`: pkexec runs under
+   `setsid -w` with stdin from /dev/null, so it never prompts on an inherited console; a missing
+   pkexec is named with its package), and exports
    `KERNEL_POP_BUNDLE` so the app can detect the mismatch and refuse to
    run an old helper.
 4. Downloads `appimagetool` (pinned 1.9.1) and the AppImage type2 runtime
@@ -322,8 +412,8 @@ and a release without one cannot update); a local build only warns.
 
 Also note CI's "Set up Rust Toolchain" step means the script's
 `command -v cargo` guard evaluates false there, so nothing inside it runs
-in CI. The workflow's "Install build dependencies" step installs the GTK
-headers and the packaging tools (`zsync`, `wget`, `file`,
+in CI. The workflow's "Install build dependencies" step installs the UI toolkit's
+build headers and the packaging tools (`zsync`, `wget`, `file`,
 `desktop-file-utils`) instead, and the script checks the tools exist and
 fails clearly if one is missing.
 

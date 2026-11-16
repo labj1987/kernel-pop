@@ -119,7 +119,7 @@ pub enum BootPath {
 }
 
 pub fn detect_boot_path() -> BootPath {
-    match crate::host_env::command("efibootmgr").output() {
+    match std::process::Command::new("efibootmgr").output() {
         Ok(o) if o.status.success() => parse_boot_path(&String::from_utf8_lossy(&o.stdout)),
         _ => BootPath::Unknown,
     }
@@ -266,7 +266,7 @@ pub fn detect_bootloader() -> Bootloader {
         return Bootloader::Kernelstub;
     }
     if Path::new("/sys/firmware/efi").exists() {
-        if let Ok(out) = crate::host_env::command("bootctl").arg("--print-esp-path").output() {
+        if let Ok(out) = std::process::Command::new("bootctl").arg("--print-esp-path").output() {
             if out.status.success() {
                 let esp = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !esp.is_empty() && Path::new(&format!("{esp}/loader/loader.conf")).exists() {
@@ -501,7 +501,7 @@ const MOK_PENDING_LIST: &str = "/var/lib/mok-pending/list";
 const DKMS_MOK_DER: &str = "/var/lib/shim-signed/mok/MOK.der";
 
 fn cert_fingerprint(der: &Path) -> Option<String> {
-    stdout_of(crate::host_env::command("openssl").args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"]).arg(der))
+    stdout_of(std::process::Command::new("openssl").args(["x509", "-inform", "DER", "-noout", "-fingerprint", "-sha1", "-in"]).arg(der))
         .and_then(|t| parse_openssl_fingerprint(&t))
 }
 
@@ -519,7 +519,7 @@ fn key_pending(der: &Path) -> bool {
 /// `mokutil --test-key`; it prints "EFI variables are not supported" on
 /// stderr, so both streams are read.
 fn test_key(der: &Path) -> Option<TestKey> {
-    let out = crate::host_env::command("mokutil").arg("--test-key").arg(der).output().ok()?;
+    let out = std::process::Command::new("mokutil").arg("--test-key").arg(der).output().ok()?;
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     parse_mokutil_test_key(&text, Path::new("/sys/firmware/efi").exists())
 }
@@ -587,7 +587,7 @@ pub fn parse_distro_signed(text: &str) -> HashSet<String> {
 }
 
 fn distro_signed_kernels() -> HashSet<String> {
-    stdout_of(crate::host_env::command("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${source:Package}\n", "linux-image-*"]))
+    stdout_of(std::process::Command::new("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${source:Package}\n", "linux-image-*"]))
         .map(|t| parse_distro_signed(&t))
         .unwrap_or_default()
 }
@@ -650,7 +650,7 @@ fn detect_secure_boot() -> SecureBoot {
         .map(|raw| parse_secureboot_efivar(&raw))
         .unwrap_or(SecureBoot::Unknown);
     // mokutil may be missing; that is fine.
-    let mokutil = crate::host_env::command("mokutil").arg("--sb-state").output().ok().map(|o| parse_mokutil_sb_state(&String::from_utf8_lossy(&o.stdout)));
+    let mokutil = std::process::Command::new("mokutil").arg("--sb-state").output().ok().map(|o| parse_mokutil_sb_state(&String::from_utf8_lossy(&o.stdout)));
     combine_secure_boot(efi, mokutil)
 }
 
@@ -784,7 +784,7 @@ pub fn prune_candidates(kernels: &[InstalledKernel], keep: usize) -> Vec<String>
 
 /// uname -r
 fn get_running_kernel() -> String {
-    crate::host_env::command("uname")
+    std::process::Command::new("uname")
         .arg("-r")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -823,7 +823,7 @@ fn get_installed_kernels(running: &str, bootloader: &Bootloader, signing_key_pre
 
 /// Free space at a mount point via df -B1.
 fn get_free_disk(path: &str) -> Option<u64> {
-    let out = crate::host_env::command("df").args(["-B1", "--output=avail", path]).output().ok()?;
+    let out = std::process::Command::new("df").args(["-B1", "--output=avail", path]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok())
 }

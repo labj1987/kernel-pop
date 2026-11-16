@@ -32,12 +32,15 @@ jobs:
         run: grep -q '^channel = "1.100.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.100\.0 '
       # A failed index refresh fails the job: a stale index could install other versions, or
       # leave a test tool out so its tests are skipped.
-      - name: Install GTK4 / libadwaita headers
+      # What the UI toolkit (GPUI) links or probes at build time; nothing else comes from the system.
+      - name: Install the UI toolkit's build headers
         run: |
           sudo apt-get update -qq
           # gnupg/gpgv: the tarball signature tests make a throwaway key and run gpgv;
           # xz-utils/gzip: the tarball tests compress with them.
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config gnupg gpgv xz-utils gzip
+          sudo apt-get install -y -qq build-essential pkg-config \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            gnupg gpgv xz-utils gzip
       - name: Build
         env:
           CARGO_BUILD_WARNINGS: deny
@@ -50,6 +53,9 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Formatting
         run: cargo fmt --all --check
+      # The AppImage ships the notices of every crate in the build; this is what writes them.
+      - name: Third-party notices can be generated
+        run: python3 scripts/third_party_licenses.py --self-test && python3 scripts/third_party_licenses.py "$RUNNER_TEMP/third-party-licenses.txt"
 
   scripts:
     runs-on: ubuntu-24.04

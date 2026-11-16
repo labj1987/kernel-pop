@@ -4,6 +4,43 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.5.0 — 2026-11-16
+
+**One look on every desktop, and no GTK needed.** Kernel Pop now draws its own window instead of
+using GTK 4 and libadwaita, so it looks and works the same on GNOME, KDE Plasma, Hyprland, COSMIC
+and the rest, and it needs neither library from your system. The AppImage no longer carries its own
+copy of them, and `KERNEL_POP_GTK` no longer does anything. It follows your desktop's light or dark
+setting; it no longer takes your GTK theme or accent colour.
+
+**Requirements changed:** a graphics driver with Vulkan or OpenGL ES (any working GPU driver; with no
+GPU or a broken NVIDIA driver, Mesa's software renderer, `mesa-vulkan-drivers`, is enough, so Kernel
+Pop still opens after a kernel or driver update went wrong), glibc 2.39 or newer, and the X11 and
+Wayland client libraries every desktop has. If something is missing, Kernel Pop says what; if no
+graphics driver works at all, it says so in a dialog instead of showing nothing.
+
+- Starting Kernel Pop a second time brings the open window to the front, on Wayland too.
+- Messages now appear at the bottom of the window.
+- The file dialogs show every file, not only tarballs, and open in the folder the desktop last
+  used rather than in `~/Downloads/kernel-pop`; anything that is not a kernel source tarball is
+  refused with a message, as before.
+- The Log tab's text can be selected and copied.
+- Remove Old Kernels asks how many to keep with − and + buttons.
+- Screen readers: buttons, rows, dialog text and the release list are exposed, and messages are
+  announced. A dialog has no name of its own (its title names the group the keyboard focus goes to
+  when it opens), and the window's own buttons and the About links are not exposed yet.
+- Closing the window during a source download stops the download and deletes the partly downloaded
+  file. A partial `.part` file left in `~/Downloads/kernel-pop` by an earlier interrupted download
+  is deleted when Kernel Pop starts.
+- Starting Kernel Pop while it is already open goes straight to the open window, with no setup
+  prompt first. If the open copy has stopped responding, the second start says so, with its process
+  ID, instead of doing nothing.
+- The "missing libraries" message also appears on desktops without zenity, kdialog or notify-send
+  (Pop!_OS COSMIC): as a desktop notification, or with xmessage.
+- On Hyprland or sway started from a text console, the password prompt for the first-launch setup
+  and for installs no longer waits invisibly on that console: the desktop's polkit agent asks, or
+  Kernel Pop says no agent is running. Without pkexec installed, the first launch says so and how to
+  install it, and a cancelled password prompt reads as cancelled or refused.
+
 ## 2.4.0 — 2026-11-15
 
 **A missing password dialog is now named as the problem.** On a desktop with no polkit authentication
