@@ -79,7 +79,7 @@ fn run_script_with_stdin(args: &[String], secret: Option<&str>) -> Result<String
     let mut full = vec![SCRIPT.to_string()];
     full.extend_from_slice(args);
 
-    let mut cmd = crate::host_env::command("pkexec");
+    let mut cmd = std::process::Command::new("pkexec");
     cmd.args(&full).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if secret.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = cmd.spawn().context("Failed to launch pkexec — is polkit installed?")?;

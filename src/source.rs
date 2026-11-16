@@ -28,7 +28,7 @@ impl Compression {
 
     /// The command that writes the uncompressed tar of `path` to stdout.
     pub fn decompress_command(self, path: &Path) -> Command {
-        let mut cmd = crate::host_env::command(match self {
+        let mut cmd = std::process::Command::new(match self {
             Compression::Xz => "xz",
             Compression::Gzip => "gzip",
         });
@@ -196,7 +196,7 @@ pub fn private_copy(t: &Tarball) -> Result<Tarball> {
 /// Check that every member of the tarball is under its one top-level
 /// directory (the extraction strips that directory), by listing it in full.
 pub fn check_single_top_dir(t: &Tarball) -> Result<()> {
-    let out = crate::host_env::command("tar").arg("-tf").arg(&t.path).stderr(Stdio::null()).output().context("Could not run tar to list the tarball")?;
+    let out = std::process::Command::new("tar").arg("-tf").arg(&t.path).stderr(Stdio::null()).output().context("Could not run tar to list the tarball")?;
     if !out.status.success() {
         bail!("tar could not list {}", t.path.display());
     }

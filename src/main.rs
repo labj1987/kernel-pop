@@ -1,17 +1,20 @@
+mod activation;
 mod build;
 mod download;
-mod host_env;
 mod install;
+mod instance;
 mod kernelorg;
 mod source;
 mod system;
 mod ui;
 mod verify;
 
-use gtk4::prelude::*;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
+/// The Wayland app_id and X11 window class. It matches `StartupWMClass` in the
+/// .desktop file, so the running window is tied to the desktop file (name,
+/// icon) on either backend.
 const APP_ID: &str = "io.github.labj1987.KernelPop";
 
 static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
@@ -20,25 +23,38 @@ pub fn runtime() -> &'static Runtime {
     TOKIO_RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("Failed to build Tokio runtime"))
 }
 
+/// The UI toolkit reports renderer and display-server problems through the
+/// `log` crate; they go to stderr so a terminal or the journal shows them.
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("kernel-pop: {} [{}] {}", record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 fn main() {
+    // Only the primary copy goes on: a second launch has asked the running
+    // one to show its window.
+    let Some(activations) = instance::claim() else {
+        return;
+    };
+    log::set_logger(&StderrLog).ok();
+    // KERNEL_POP_LOG=info (or debug) also shows which renderer was picked.
+    let level = std::env::var("KERNEL_POP_LOG").ok().and_then(|level| level.parse().ok()).unwrap_or(log::LevelFilter::Warn);
+    log::set_max_level(level);
     let _ = runtime();
 
-    // Set program name before GTK init. On Wayland the app_id GNOME sees is
-    // the GApplication ID, not prgname; on X11 it's prgname. Setting both
-    // prgname and StartupWMClass (in the .desktop file) to the application
-    // ID makes the running window match the desktop file on either backend.
-    glib::set_prgname(Some(APP_ID));
-    glib::set_application_name("Kernel Pop");
-
-    let app = libadwaita::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::FLAGS_NONE).build();
-
-    app.connect_activate(|app| {
-        if let Some(window) = app.windows().first() {
-            window.present();
-            return;
-        }
-        ui::build_ui(app);
+    gpui_kit::application().with_assets(ui::Assets).run(move |cx| {
+        ui::init(cx);
+        ui::build_ui(cx, activations);
     });
-
-    std::process::exit(app.run().get() as i32);
 }
