@@ -45,12 +45,19 @@ impl Activation {
 pub struct Activations {
     rx: UnboundedReceiver<Activation>,
     ui_up: Arc<AtomicBool>,
+    exclusive: bool,
 }
 
 impl Activations {
     fn new(rx: UnboundedReceiver<Activation>) -> (Self, Arc<AtomicBool>) {
         let ui_up = Arc::new(AtomicBool::new(false));
-        (Activations { rx, ui_up: ui_up.clone() }, ui_up)
+        (Activations { rx, ui_up: ui_up.clone(), exclusive: false }, ui_up)
+    }
+
+    /// Whether this copy holds the single-instance socket, so no other copy
+    /// of this login runs (none can start a download, say, behind its back).
+    pub fn is_exclusive(&self) -> bool {
+        self.exclusive
     }
 
     /// The next request; `None` once nothing can send one any more.
@@ -120,6 +127,9 @@ enum Claim {
     /// Another copy is running but did not answer in time (its window is
     /// hung); its process id when the socket tells it.
     NotResponding(Option<i32>),
+    /// The running copy closed the connection without answering: it was
+    /// exiting. Its socket is gone or about to be, so the claim is tried again.
+    Gone,
 }
 
 /// `None` when another copy is already running (it has been asked to show
@@ -130,7 +140,7 @@ pub fn claim() -> Option<Activations> {
     match runtime_dir() {
         Some(dir) => match claim_at(&dir.join("kernel-pop.sock"), launch_token()) {
             Claim::Primary(activations) => Some(activations),
-            Claim::HandedOver => None,
+            Claim::HandedOver | Claim::Gone => None,
             Claim::NotResponding(pid) => {
                 let message = not_responding_message(pid);
                 eprintln!("kernel-pop: {message}");
@@ -177,10 +187,17 @@ fn hold_alive(socket: &Path) {
     let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(sibling(socket, ".alive")) else {
         return;
     };
-    // SAFETY: flock on a file descriptor this function owns; the file is leaked below.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        std::mem::forget(file);
+    // The AppImage's launcher holds it for a moment while it checks; wait
+    // that out (up to a second) rather than run without it.
+    for _ in 0..100 {
+        // SAFETY: flock on a file descriptor this function owns; the file is leaked below.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            std::mem::forget(file);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
+    eprintln!("kernel-pop: could not lock {}; the launcher will not see this copy", sibling(socket, ".alive").display());
 }
 
 /// Whether a failed connect means "nobody is listening" (a socket file left
@@ -209,7 +226,9 @@ fn await_reply(stream: UnixStream, waits: Waits) -> Claim {
     loop {
         let _ = stream.set_read_timeout(Some(wait));
         let mut line = Vec::new();
-        let _ = (&mut reader).take(64).read_until(b'\n', &mut line);
+        if let Ok(0) = (&mut reader).take(64).read_until(b'\n', &mut line) {
+            return Claim::Gone;
+        }
         if line == REPLY {
             return Claim::HandedOver;
         }
@@ -225,7 +244,17 @@ fn claim_at(path: &Path, token: Option<String>) -> Claim {
     claim_with(path, token, WAITS)
 }
 
+/// One claim, tried again once when the running copy was just exiting. If
+/// that happens twice, some copy is coming and going: this launch exits
+/// quietly (`Gone`).
 fn claim_with(path: &Path, token: Option<String>, waits: Waits) -> Claim {
+    match claim_once(path, token.clone(), waits) {
+        Claim::Gone => claim_once(path, token, waits),
+        claim => claim,
+    }
+}
+
+fn claim_once(path: &Path, token: Option<String>, waits: Waits) -> Claim {
     let lock = lock(path);
     match UnixStream::connect(path) {
         Ok(mut stream) => {
@@ -244,9 +273,10 @@ fn claim_with(path: &Path, token: Option<String>, waits: Waits) -> Claim {
         }
     }
     let (tx, rx) = unbounded_channel();
-    let (activations, ui_up) = Activations::new(rx);
+    let (mut activations, ui_up) = Activations::new(rx);
     match UnixListener::bind(path) {
         Ok(listener) => {
+            activations.exclusive = true;
             hold_alive(path);
             std::thread::spawn(move || {
                 for mut connection in listener.incoming().flatten() {
@@ -391,6 +421,39 @@ mod tests {
         assert!(matches!(claim_with(&path, None, SHORT), Claim::NotResponding(Some(_))));
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(1400) && waited < Duration::from_secs(3), "{waited:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_exits_while_asked_is_replaced() {
+        let dir = scratch("exiting");
+        let path = dir.join("test.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket = path.clone();
+        // It takes the request, then exits without an answer (its socket goes with it).
+        let exiting = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().unwrap();
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&connection), &mut String::new());
+            std::fs::remove_file(&socket).unwrap();
+            drop(listener);
+            drop(connection);
+        });
+        let started = Instant::now();
+        let claim = claim_with(&path, None, SHORT);
+        exiting.join().unwrap();
+        assert!(matches!(claim, Claim::Primary(ref first) if first.is_exclusive()), "the later launch takes over, not 'not responding'");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // A copy that keeps hanging up: quiet, not 'not responding' either.
+        let path = dir.join("flapping.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let flapping = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (connection, _) = listener.accept().unwrap();
+                let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&connection), &mut String::new());
+            }
+        });
+        assert!(matches!(claim_with(&path, None, SHORT), Claim::Gone));
+        flapping.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

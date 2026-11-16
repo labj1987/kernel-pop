@@ -33,11 +33,15 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   for the "ok" (a cold start on a software renderer can take seconds). Otherwise it reports the
   running copy as not responding, with its PID, through `notice.rs`, and exits 1. The primary
   holds `flock` on `kernel-pop.sock.alive` for its life, so AppRun (`instance_running`) can skip
-  its setup and exec the binary at once.
-- `notice.rs` — errors with no window to show them in: kdialog, zenity, notify-send, the
-  notification service via `gdbus call` (Pop!_OS COSMIC has none of the others), xmessage, in that
-  order until one shows it. AppRun's `libcheck_show` keeps the same chain in bash. `activation.rs` raises the window with that token on Wayland
+  its setup and exec the binary at once. A running copy that closes the connection without an
+  answer (it was just exiting) means the claim is tried once more. Without a socket (no
+  `XDG_RUNTIME_DIR`, or the bind failed) the claim is not exclusive and startup leaves `.part`
+  files alone. `activation.rs` raises the window with that token on Wayland
   (`xdg_activation_v1` on GPUI's own connection).
+- `notice.rs` — errors with no window to show them in: zenity, kdialog, notify-send, the
+  notification service via `gdbus call` (Pop!_OS COSMIC has none of the others), xmessage, in that
+  order until one shows it. AppRun's `libcheck_show` keeps the same chain, in the same order, in
+  bash.
 - `ui.rs` — the GPUI Kit UI (see UI below): system/browse/build/install/log
   tabs, plus a window-wide drop target for tarballs. One global busy state
   (`AppState::busy`, `MainView::begin_busy` and its `BusyGuard`)
@@ -76,8 +80,8 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   Refuses to run as root.
 - `download.rs` — downloads files with progress, cancel (the typed
   `Cancelled` error, which also ends a hung request or read at once) and retries, into `.part`
-  files renamed when complete, with explicit 0755/0644 modes; `remove_stale_parts` (at startup:
-  no download runs then); `sha256_file`.
+  files renamed when complete, with explicit 0755/0644 modes; `remove_stale_parts` (only the app's
+  own `linux-*.tar.*.part` names, at startup when no download runs); `sha256_file`.
 - `system.rs` — inventories installed kernels and their boot health (the
   initrd/modules/boot-entry check described above; for kernelstub, whether
   the kernel is the `vmlinuz` or `vmlinuz.old` one and its ESP copy
@@ -143,7 +147,10 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
 - Theme: `follow_appearance` re-applies the light/dark theme and then sets the `input` colour
   (radio rings, checkbox and field borders) to one with at least 3:1 contrast; the toolkit's is
   nearly the background colour. The first window size is clamped to the display less room for
-  panels (`initial_window_size`); every tab scrolls above its bottom buttons.
+  panels (`initial_window_size`). On Wayland GPUI's output size is the mode divided by the integer
+  `wl_output` scale (150% arrives as 2), so once the window knows its fractional scale the size is
+  worked out again (`wayland_logical`) and the window resized once if the user has not. Every tab
+  scrolls above its bottom buttons.
 - File dialogs (portal) have no file-type filter and no starting folder in GPUI: `inspect` refuses
   anything that is not a kernel tarball after the pick and on drop.
 - Closing: `may_close` (from `on_window_should_close`) refuses while a privileged action runs,

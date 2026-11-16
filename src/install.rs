@@ -265,6 +265,9 @@ pub fn run_privileged_boot_once(version: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    use super::*;
+
     #[test]
     fn pkexec_runs_without_a_controlling_terminal() {
         // The child leads a session of its own (its session id is its pid), so
@@ -277,8 +280,6 @@ mod tests {
         let plain = std::process::Command::new("sh").args(["-c", "read -r line < /proc/$$/stat; set -- ${line##*) }; [ \"$4\" = \"$$\" ]"]).status().unwrap();
         assert!(!plain.success());
     }
-
-    use super::*;
 
     #[test]
     fn report_counts_one_per_problem_line_and_ignores_summaries() {

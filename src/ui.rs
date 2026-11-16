@@ -169,6 +169,8 @@ struct AppState {
     /// privileged action at a time. While set, every control that would
     /// start another one is disabled (see `MainView::usable`).
     busy: Option<&'static str>,
+    /// The window closes once the running download has stopped.
+    closing: bool,
 }
 
 impl AppState {
@@ -822,6 +824,18 @@ fn input_border(dark: bool) -> Hsla {
 const INPUT_BORDER_DARK: u32 = 0x737373;
 const INPUT_BORDER_LIGHT: u32 = 0x8a8a8a;
 
+/// What GPUI reports as a Wayland output's size is its mode divided by the
+/// integer `wl_output` scale, which compositors round up: at 150% that is 2,
+/// so a 1920x1080 screen reads 960x540. Once the window knows its real
+/// (fractional) `scale`, this gives the output's size in its logical pixels.
+fn wayland_logical(reported: gpui_kit::Size<Pixels>, scale: f32) -> gpui_kit::Size<Pixels> {
+    if !(scale.is_finite() && scale > 0.) {
+        return reported;
+    }
+    let k = scale.ceil() / scale;
+    size(px(reported.width.as_f32() * k), px(reported.height.as_f32() * k))
+}
+
 pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // With no display GPUI would run on with no window and no word about it.
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
@@ -829,12 +843,14 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     }
     // GPUI has no primary display on Wayland; the smallest output is then the
     // one the window must fit on wherever the compositor puts it.
+    let from_outputs = cx.primary_display().is_none();
     let usable = cx
         .primary_display()
         .map(|display| display.visible_bounds().size)
         .or_else(|| cx.displays().iter().map(|display| display.visible_bounds().size).min_by(|a, b| a.height.cmp(&b.height)));
+    let first_size = initial_window_size(usable);
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(initial_window_size(usable), cx)),
+        window_bounds: Some(WindowBounds::centered(first_size, cx)),
         window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
         app_id: Some(crate::APP_ID.to_string()),
         // The app draws its own title bar, so it looks and works the same on
@@ -842,6 +858,7 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
         window_decorations: Some(WindowDecorations::Client),
         ..TitleBar::window_options()
     };
+    let exclusive = activations.is_exclusive();
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title("Kernel Pop");
         // Follow the desktop's light/dark preference, now and when it changes.
@@ -855,8 +872,26 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     };
     // The first reads, now that the window can show what goes wrong with them.
     let _ = window.update(cx, |_, window, cx| {
-        view.update(cx, |view, cx| view.start(window, cx));
+        view.update(cx, |view, cx| view.start(exclusive, window, cx));
     });
+
+    // On Wayland the output size above may be in the wrong units (see
+    // `wayland_logical`); once the window has its scale, size it again, unless
+    // the user already resized it.
+    if let (true, Some(usable)) = (from_outputs, usable) {
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(Duration::from_millis(500)).await;
+            let _ = window.update(cx, |_, window, _| {
+                let want = initial_window_size(Some(wayland_logical(usable, window.scale_factor())));
+                let now = window.viewport_size();
+                let untouched = (now.width.as_f32() - first_size.width.as_f32()).abs() < 2. && (now.height.as_f32() - first_size.height.as_f32()).abs() < 2.;
+                if untouched && want != first_size {
+                    window.resize(want);
+                }
+            });
+        })
+        .detach();
+    }
 
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
@@ -1017,13 +1052,17 @@ impl MainView {
     }
 
     /// The first reads, and the close guard; from `build_ui` once the window is up.
-    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `exclusive`: this is the only copy in this login (see instance.rs).
+    fn start(&mut self, exclusive: bool, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| this.update(cx, |this, cx| this.may_close(window, cx)).unwrap_or(true));
         // Nothing downloads yet, so a `.part` file is one an earlier run left
-        // (killed, or crashed, mid-download).
-        for part in remove_stale_parts(&build::downloads_root()) {
-            self.log(format!("Removed {}, left by an unfinished download", part.display()));
+        // (killed, or crashed, mid-download). Without the single-instance
+        // socket another copy might be downloading it right now.
+        if exclusive {
+            for part in remove_stale_parts(&build::downloads_root()) {
+                self.log(format!("Removed {}, left by an unfinished download", part.display()));
+            }
         }
         self.load_sysinfo(window, cx);
         self.load_releases(window, cx);
@@ -1165,10 +1204,14 @@ impl MainView {
     /// does not end gets `DOWNLOAD_STOP_WAIT`; then its `.part` file is
     /// deleted here and the window closes anyway.
     fn stop_download_then_close(&mut self, flag: Arc<std::sync::atomic::AtomicBool>, window: &mut Window, cx: &mut Context<Self>) {
-        if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            self.log("Stopping the download before closing…");
-            toast(window, cx, "Stopping the download before closing…");
+        if std::mem::replace(&mut self.state.borrow_mut().closing, true) {
+            // Already waiting: the loop started then closes the window.
+            return;
         }
+        // Cancel Download may have set the flag already; the wait is the same.
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.log("Stopping the download before closing…");
+        toast(window, cx, "Stopping the download before closing…");
         let state = self.state.clone();
         let started = Instant::now();
         cx.spawn_in(window, async move |_, cx| loop {
@@ -3104,6 +3147,18 @@ mod tests {
         assert_eq!(update_banner_text("7.3.1", false), "Linux 7.3.1 (stable) is out — download it on the Browse tab to build it");
         let elsewhere = update_banner_text("7.3.1", true);
         assert!(elsewhere.contains("7.3.1") && !elsewhere.contains("download") && !elsewhere.contains("Browse"), "{elsewhere}");
+    }
+
+    #[test]
+    fn fractional_scaling_is_undone_on_wayland_outputs() {
+        // 1920x1080 at 150%: wl_output scale 2, so GPUI reads 960x540.
+        let fixed = wayland_logical(size(px(960.), px(540.)), 1.5);
+        assert_eq!((fixed.width.as_f32(), fixed.height.as_f32()), (1280., 720.));
+        assert_eq!(wayland_logical(size(px(1280.), px(800.)), 1.), size(px(1280.), px(800.)));
+        assert_eq!(wayland_logical(size(px(1280.), px(720.)), 2.), size(px(1280.), px(720.)), "integer scales are exact");
+        assert_eq!(wayland_logical(size(px(800.), px(600.)), 0.), size(px(800.), px(600.)));
+        // And the window that comes of it: the full size, not the 420 px minimum.
+        assert_eq!(initial_window_size(Some(fixed)), size(px(860.), px(624.)));
     }
 
     #[test]

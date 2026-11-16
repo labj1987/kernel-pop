@@ -209,19 +209,28 @@ where
     Ok(paths)
 }
 
-/// Deletes the `<name>.part` files in `dir`: what downloads write before a
-/// file is complete. Called when no download runs (at startup, and when
-/// closing gave up waiting for a cancelled one), so each is left over from an
-/// unfinished one. Only regular files are touched. Returns the deleted paths.
+/// Deletes the app's own `.part` files in `dir`: what a kernel.org download
+/// (`linux-<version>.tar.<xz|sign>`) writes before it is complete. Called
+/// when no download of this copy runs (at startup, and when closing gave up
+/// waiting for a cancelled one), so each is left over from an unfinished
+/// one. Anything else there (a browser's download, say) is left alone, and
+/// only regular files are touched. Returns the deleted paths.
 pub fn remove_stale_parts(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
     entries
         .flatten()
-        .filter(|entry| entry.file_name().to_str().is_some_and(|name| name.ends_with(".part") && name.len() > ".part".len()))
+        .filter(|entry| entry.file_name().to_str().is_some_and(own_part))
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
         .filter(|path| std::fs::remove_file(path).is_ok())
         .collect()
+}
+
+/// Whether `name` is a `.part` file this app writes: `linux-*.tar.*.part`.
+fn own_part(name: &str) -> bool {
+    name.strip_suffix(".part")
+        .and_then(|name| name.strip_prefix("linux-"))
+        .is_some_and(|rest| rest.split_once(".tar.").is_some_and(|(version, ext)| !version.is_empty() && !ext.is_empty()))
 }
 
 /// SHA256 of a file as lowercase hex, streaming in 1 MiB chunks so large
@@ -258,13 +267,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kernel-pop-test-parts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("build.part")).unwrap();
-        for name in ["linux-7.2.tar.xz.part", "linux-7.2.tar.sign.part", "linux-7.1.tar.xz", "notes.part.txt", ".part"] {
+        for name in [
+            "linux-7.2.tar.xz.part",
+            "linux-7.2.tar.sign.part",
+            "linux-7.1.tar.xz",
+            "notes.part.txt",
+            ".part",
+            "firefox-setup.tar.bz2.part",
+            "linux-.tar.xz.part",
+            "video.mp4.part",
+        ] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         let mut removed: Vec<_> = remove_stale_parts(&dir).into_iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         removed.sort();
         assert_eq!(removed, ["linux-7.2.tar.sign.part", "linux-7.2.tar.xz.part"]);
-        for kept in ["linux-7.1.tar.xz", "notes.part.txt", ".part", "build.part"] {
+        for kept in ["linux-7.1.tar.xz", "notes.part.txt", ".part", "build.part", "firefox-setup.tar.bz2.part", "linux-.tar.xz.part", "video.mp4.part"] {
             assert!(dir.join(kept).exists(), "{kept}");
         }
         assert!(remove_stale_parts(&dir.join("missing")).is_empty());

@@ -1,7 +1,7 @@
 //! notice.rs — telling the user something when the app has no window to say
 //! it in: no working graphics driver, or a running copy that does not answer.
 //! It goes through whatever the desktop offers, tried in order until one
-//! shows it: a dialog (kdialog, zenity), a notification (notify-send, or the
+//! shows it: a dialog (zenity, kdialog), a notification (notify-send, or the
 //! notification service over D-Bus with gdbus, which desktops without
 //! notify-send such as Pop!_OS COSMIC still have), or xmessage.
 
@@ -31,8 +31,8 @@ fn commands(message: &str) -> Vec<(&'static str, Vec<String>)> {
         list
     };
     vec![
-        ("kdialog", with(args(&["--title", "Kernel Pop", "--error"]), &plain)),
         ("zenity", with(args(&["--error", "--no-markup", "--title=Kernel Pop", "--width=480", "--text"]), message)),
+        ("kdialog", with(args(&["--title", "Kernel Pop", "--error"]), &plain)),
         ("notify-send", with(args(&["--urgency=critical", "--app-name=Kernel Pop", "Kernel Pop"]), &plain)),
         (
             "gdbus",
@@ -90,7 +90,13 @@ mod tests {
     #[test]
     fn every_way_to_show_a_message_is_tried_in_order() {
         let names: Vec<_> = commands("x").into_iter().map(|(program, _)| program).collect();
-        assert_eq!(names, ["kdialog", "zenity", "notify-send", "gdbus", "xmessage"]);
+        assert_eq!(names, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"]);
+        // The AppRun's libcheck_show tries them in the same order.
+        let script = include_str!("../build-appimage.sh");
+        let show = &script[script.find("libcheck_show() {").unwrap()..];
+        let show = &show[..show.find("\n}\n").unwrap()];
+        let order: Vec<usize> = names.iter().map(|name| show.find(&format!("command -v {name} ")).expect(name)).collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
         assert!(showed("zenity", Some(1)) && !showed("notify-send", Some(1)) && !showed("kdialog", None));
         assert!(showed("gdbus", Some(0)) && !showed("gdbus", Some(1)) && !showed("xmessage", Some(1)));
     }
