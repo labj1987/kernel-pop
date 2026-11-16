@@ -836,6 +836,18 @@ fn wayland_logical(reported: gpui_kit::Size<Pixels>, scale: f32) -> gpui_kit::Si
     size(px(reported.width.as_f32() * k), px(reported.height.as_f32() * k))
 }
 
+/// The window size to switch to once the window's real `scale` is known, if
+/// any. Only Wayland outputs (`from_wayland_outputs`) need it: on X11 GPUI
+/// already divides the screen by the true scale, so correcting there would
+/// make the window larger than the screen.
+fn rescaled_size(usable: gpui_kit::Size<Pixels>, scale: f32, from_wayland_outputs: bool) -> Option<gpui_kit::Size<Pixels>> {
+    if !from_wayland_outputs || scale.fract() == 0. {
+        return None;
+    }
+    let want = initial_window_size(Some(wayland_logical(usable, scale)));
+    (want != initial_window_size(Some(usable))).then_some(want)
+}
+
 pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // With no display GPUI would run on with no window and no word about it.
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
@@ -876,21 +888,28 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     });
 
     // On Wayland the output size above may be in the wrong units (see
-    // `wayland_logical`); once the window has its scale, size it again, unless
-    // the user already resized it.
+    // `wayland_logical`), and the window learns its fractional scale only
+    // after the event loop runs. When the scale first changes, size the
+    // window again, once, unless the user already resized it.
     if let (true, Some(usable)) = (from_outputs, usable) {
-        cx.spawn(async move |cx| {
-            cx.background_executor().timer(Duration::from_millis(500)).await;
-            let _ = window.update(cx, |_, window, _| {
-                let want = initial_window_size(Some(wayland_logical(usable, window.scale_factor())));
-                let now = window.viewport_size();
-                let untouched = (now.width.as_f32() - first_size.width.as_f32()).abs() < 2. && (now.height.as_f32() - first_size.height.as_f32()).abs() < 2.;
-                if untouched && want != first_size {
-                    window.resize(want);
-                }
+        let _ = window.update(cx, |_, window, cx| {
+            view.update(cx, |_, cx| {
+                let mut done = false;
+                cx.observe_window_bounds(window, move |_, window, _| {
+                    if done || window.scale_factor() == 1. {
+                        return;
+                    }
+                    done = true;
+                    let now = window.viewport_size();
+                    let untouched =
+                        (now.width.as_f32() - first_size.width.as_f32()).abs() < 2. && (now.height.as_f32() - first_size.height.as_f32()).abs() < 2.;
+                    if let (true, Some(want)) = (untouched, rescaled_size(usable, window.scale_factor(), true)) {
+                        window.resize(want);
+                    }
+                })
+                .detach();
             });
-        })
-        .detach();
+        });
     }
 
     cx.on_window_closed(|cx, _| {
@@ -3158,7 +3177,12 @@ mod tests {
         assert_eq!(wayland_logical(size(px(1280.), px(720.)), 2.), size(px(1280.), px(720.)), "integer scales are exact");
         assert_eq!(wayland_logical(size(px(800.), px(600.)), 0.), size(px(800.), px(600.)));
         // And the window that comes of it: the full size, not the 420 px minimum.
-        assert_eq!(initial_window_size(Some(fixed)), size(px(860.), px(624.)));
+        assert_eq!(rescaled_size(size(px(960.), px(540.)), 1.5, true), Some(size(px(860.), px(624.))));
+        assert_eq!(rescaled_size(size(px(1280.), px(800.)), 2., true), None, "integer scale: already right");
+        // X11: GPUI already divided by the true scale (1920x1080 at 1.5 reads 1280x720);
+        // correcting again would make the window larger than the screen.
+        assert_eq!(rescaled_size(size(px(1280.), px(720.)), 1.5, false), None);
+        assert_eq!(rescaled_size(size(px(1536.), px(864.)), 1.25, false), None);
     }
 
     #[test]
