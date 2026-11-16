@@ -326,7 +326,8 @@ libcheck_show() {
         (($? <= 1)) && return 0
     fi
     if command -v notify-send >/dev/null 2>&1; then
-        notify-send -u critical "$1" "$plain" >/dev/null 2>&1 && return 0
+        # -t 0: no expiry (COSMIC drops a default one after a few seconds).
+        notify-send -u critical -t 0 "$1" "$plain" >/dev/null 2>&1 && return 0
     fi
     if command -v gdbus >/dev/null 2>&1; then
         gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
@@ -401,14 +402,15 @@ debian_based() {
 # <<< debian_based
 
 # >>> instance_running: whether a copy of Kernel Pop already runs in this login. The running
-# copy holds flock on $XDG_RUNTIME_DIR/kernel-pop.sock.alive for its whole life (instance.rs);
-# flock -n gives up on it with 75 then. Anything else (no runtime dir, no flock(1), no file) means
-# no.
+# copy holds an exclusive flock on $XDG_RUNTIME_DIR/kernel-pop.sock.alive for its whole life
+# (instance.rs); a shared flock -n gives up on it with 75 then. Shared, so two launchers checking
+# at once don't take each other for a running copy. Anything else (no runtime dir, no flock(1), no
+# file) means no.
 instance_running() {
     local alive="${XDG_RUNTIME_DIR:-}/kernel-pop.sock.alive" rc=0
     [[ -n "${XDG_RUNTIME_DIR:-}" && -e "$alive" ]] || return 1
     command -v flock >/dev/null 2>&1 || return 1
-    flock -n -E 75 "$alive" true 2>/dev/null || rc=$?
+    flock -n -s -E 75 "$alive" true 2>/dev/null || rc=$?
     ((rc == 75))
 }
 # <<< instance_running

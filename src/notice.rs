@@ -11,7 +11,8 @@ pub fn show_error(message: &str) {
         return;
     }
     for (program, args) in commands(message) {
-        let status = std::process::Command::new(program).args(&args).stdin(std::process::Stdio::null()).status();
+        // gdbus prints the notification id; nobody needs it on the terminal.
+        let status = std::process::Command::new(program).args(&args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).status();
         if status.is_ok_and(|status| showed(program, status.code())) {
             break;
         }
@@ -33,7 +34,7 @@ fn commands(message: &str) -> Vec<(&'static str, Vec<String>)> {
     vec![
         ("zenity", with(args(&["--error", "--no-markup", "--title=Kernel Pop", "--width=480", "--text"]), message)),
         ("kdialog", with(args(&["--title", "Kernel Pop", "--error"]), &plain)),
-        ("notify-send", with(args(&["--urgency=critical", "--app-name=Kernel Pop", "Kernel Pop"]), &plain)),
+        ("notify-send", with(args(&["--urgency=critical", "--expire-time=0", "--app-name=Kernel Pop", "Kernel Pop"]), &plain)),
         (
             "gdbus",
             vec![

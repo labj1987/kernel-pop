@@ -32,7 +32,8 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   answers "starting" at once; a launch waits 2 s for any answer and, after "starting", 15 s in all
   for the "ok" (a cold start on a software renderer can take seconds). Otherwise it reports the
   running copy as not responding, with its PID, through `notice.rs`, and exits 1. The primary
-  holds `flock` on `kernel-pop.sock.alive` for its life, so AppRun (`instance_running`) can skip
+  holds an exclusive `flock` on `kernel-pop.sock.alive` for its life, so AppRun (`instance_running`,
+  a shared non-blocking probe, so two launchers don't see each other) can skip
   its setup and exec the binary at once. A running copy that closes the connection without an
   answer (it was just exiting) means the claim is tried once more. Without a socket (no
   `XDG_RUNTIME_DIR`, or the bind failed) the claim is not exclusive and startup leaves `.part`

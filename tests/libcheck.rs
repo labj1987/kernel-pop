@@ -488,6 +488,19 @@ fn a_running_copy_is_seen_by_its_lock() {
     let _ = holder.kill();
     let _ = holder.wait();
     assert!(!instance_running(Some(&dir)));
+    // Another launcher checking at the same moment (a shared lock) is not a running copy.
+    let mut prober = Command::new("bash")
+        .args(["-c", "exec 9<\"$1\"; flock -s 9; echo locked; exec sleep 30", "_"])
+        .arg(&alive)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(prober.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    assert_eq!(line, "locked\n");
+    assert!(!instance_running(Some(&dir)), "a shared lock is another launcher, not a running copy");
+    let _ = prober.kill();
+    let _ = prober.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
