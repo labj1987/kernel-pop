@@ -95,7 +95,7 @@ An x86_64 Debian- or Ubuntu-based system (apt and dpkg: Kernel Pop builds
 systemd-boot or kernelstub (Pop!_OS). Kernel signing needs UEFI.
 
 Kernel Pop needs no GTK, Qt or other toolkit from the system: it draws its own window,
-the same on every desktop, and follows the desktop's light or dark setting. What it
+the same on every desktop, and follows the desktop's light or dark setting and accent colour. What it
 takes from the system is what every desktop has:
 
 - **glibc 2.39 or newer** (Ubuntu 24.04, Debian 13 and later).
@@ -107,7 +107,7 @@ takes from the system is what every desktop has:
   and `libwayland-client` on a Wayland session.
 
 If a library is missing or the system is too old, Kernel Pop says which before it asks
-for a password. File dialogs and the light or dark setting come through the desktop's
+for a password. File dialogs, the light or dark setting and the accent colour come through the desktop's
 portal (`xdg-desktop-portal`); without one, dropping a tarball on the window still works.
 On a system without dpkg and apt it shows a notice that only Debian- and Ubuntu-based
 systems are supported, and building and installing stay off.

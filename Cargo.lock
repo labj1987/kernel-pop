@@ -3386,9 +3386,10 @@ dependencies = [
 
 [[package]]
 name = "kernel-pop"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "anyhow",
+ "ashpd",
  "futures-util",
  "gpui-kit",
  "hex",
