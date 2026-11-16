@@ -317,6 +317,12 @@ mod tests {
         // A socket nobody listens on any more.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
+        // Another test forking a process at that moment holds the listener
+        // until its exec; wait until the socket is really dead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::os::unix::net::UnixStream::connect(&path).is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let tokens = answer(primary(claim_at(&path, None)));
         assert!(matches!(claim_at(&path, None), Claim::HandedOver), "and the new one answers");
         assert_eq!(tokens.recv().unwrap(), None);

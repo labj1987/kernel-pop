@@ -781,7 +781,8 @@ pub fn init(cx: &mut App) {
 }
 
 /// The size the window asks for: room for every tab's content, but never
-/// more than the display's usable area (`usable`, when GPUI knows it) less
+/// more than the display's usable area (`usable`, when GPUI knows it: on
+/// Wayland, the smallest output) less
 /// room for the desktop's panels: on a 1280x800 screen with a 44 px KDE panel
 /// a full-height window would put the bottom buttons (Download Source, Clear
 /// Log) under the panel. Each tab scrolls its content above those buttons,
@@ -826,7 +827,12 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
         no_window("no display server to connect to");
     }
-    let usable = cx.primary_display().map(|display| display.visible_bounds().size);
+    // GPUI has no primary display on Wayland; the smallest output is then the
+    // one the window must fit on wherever the compositor puts it.
+    let usable = cx
+        .primary_display()
+        .map(|display| display.visible_bounds().size)
+        .or_else(|| cx.displays().iter().map(|display| display.visible_bounds().size).min_by(|a, b| a.height.cmp(&b.height)));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(initial_window_size(usable), cx)),
         window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
