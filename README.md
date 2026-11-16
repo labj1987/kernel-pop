@@ -112,7 +112,7 @@ portal (`xdg-desktop-portal`); without one, dropping a tarball on the window sti
 On a system without dpkg and apt it shows a notice that only Debian- and Ubuntu-based
 systems are supported, and building and installing stay off.
 
-Tested desktops: GNOME. Other Wayland and X11 desktops should work too.
+Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC (Wayland), and X11; with the NVIDIA driver and with software rendering only (lavapipe, llvmpipe).
 
 ## Known issues
 

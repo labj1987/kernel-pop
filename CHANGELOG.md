@@ -4,7 +4,7 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
-## 2.5.0 — 2026-11-15
+## 2.5.0 — 2026-11-16
 
 **One look on every desktop, and no GTK needed.** Kernel Pop now draws its own window instead of
 using GTK 4 and libadwaita, so it looks and works the same on GNOME, KDE Plasma, Hyprland, COSMIC
