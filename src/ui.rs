@@ -78,6 +78,24 @@ impl AssetSource for Assets {
 /// The busy states that run the privileged script: the window is not closed under them.
 const PRIVILEGED_ACTIONS: &[&str] = &["signing", "boot selection", "kernel removal", "signing setup", "build tools install", "kernel install"];
 
+/// What closing the window does, from what is running.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CloseDecision {
+    /// A privileged action runs: closing would cut the script off halfway.
+    Refuse(&'static str),
+    /// A build (or its preparation) runs: stop it, then close.
+    StopBuildFirst,
+    Close,
+}
+
+fn close_decision(busy: Option<&'static str>, build_running: bool) -> CloseDecision {
+    match busy {
+        Some(what) if PRIVILEGED_ACTIONS.contains(&what) => CloseDecision::Refuse(what),
+        _ if build_running => CloseDecision::StopBuildFirst,
+        _ => CloseDecision::Close,
+    }
+}
+
 /// The busy state of one download, build or privileged action. It lasts as
 /// long as this guard: it is moved into the action's completion callback, so
 /// it is released even when that callback never runs (a panicking task drops
@@ -1066,13 +1084,17 @@ impl MainView {
     /// to the app, and with nobody reading it the next write would end the
     /// script halfway (in dpkg, or with the ESP half updated).
     fn may_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let busy = self.state.borrow().busy;
-        if let Some(what) = busy.filter(|what| PRIVILEGED_ACTIONS.contains(what)) {
-            toast(window, cx, &format!("Wait until the {what} has finished before closing"));
-            return false;
-        }
-        let Some(control) = self.state.borrow().build_control.clone() else {
-            return true;
+        let (busy, control) = {
+            let s = self.state.borrow();
+            (s.busy, s.build_control.clone())
+        };
+        let control = match close_decision(busy, control.is_some()) {
+            CloseDecision::Close => return true,
+            CloseDecision::Refuse(what) => {
+                toast(window, cx, &format!("Wait until the {what} has finished before closing"));
+                return false;
+            }
+            CloseDecision::StopBuildFirst => control.expect("a build runs"),
         };
         if !control.is_cancelled() {
             control.cancel();
@@ -1485,6 +1507,11 @@ impl MainView {
                     msg = newer;
                 }
                 let alive = this.update(cx, |this, cx| {
+                    // A report that arrives after the download ended (its busy
+                    // guard clears download_cancel) must not bring the bar back.
+                    if this.state.borrow().download_cancel.is_none() {
+                        return;
+                    }
                     let prefix = format!("[{}/{}] {}", msg.file_index + 1, msg.file_count, msg.filename);
                     let bar = match msg.total {
                         Some(t) => {
@@ -2785,6 +2812,13 @@ impl Render for MainView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let page_index = PAGES.iter().position(|(p, _)| *p == self.page).unwrap_or(0);
         let title_bar = TitleBar::new()
+            // The close button goes through the same guard as the desktop's close
+            // request; left alone the toolkit removes the window straight away.
+            .on_close_window(cx.listener(|this, _, window, cx| {
+                if this.may_close(window, cx) {
+                    window.remove_window();
+                }
+            }))
             .child(
                 h_flex()
                     .gap_2()
@@ -2990,6 +3024,33 @@ mod tests {
             let unprivileged = ["download", "signature check", "build"].contains(&label);
             assert_eq!(PRIVILEGED_ACTIONS.contains(&label), !unprivileged, "{label}");
         }
+    }
+
+    #[test]
+    fn closing_waits_for_privileged_runs_and_stops_a_build_first() {
+        for what in PRIVILEGED_ACTIONS {
+            assert_eq!(close_decision(Some(what), false), CloseDecision::Refuse(what), "{what}");
+        }
+        assert_eq!(close_decision(Some("build"), true), CloseDecision::StopBuildFirst);
+        assert_eq!(close_decision(None, true), CloseDecision::StopBuildFirst, "the build summary is up: the tree is configured");
+        assert_eq!(close_decision(Some("download"), false), CloseDecision::Close);
+        assert_eq!(close_decision(Some("signature check"), false), CloseDecision::Close);
+        assert_eq!(close_decision(None, false), CloseDecision::Close);
+    }
+
+    /// The title bar's close button must go through `may_close`: without
+    /// `on_close_window` the toolkit removes the window itself. GPUI's test
+    /// platform draws no window controls (it reports server-side decorations,
+    /// and the toolkit shows its buttons only with client-side ones), so the
+    /// click cannot be simulated; the wiring is checked in the source instead.
+    #[test]
+    fn the_close_button_asks_may_close() {
+        let source = include_str!("ui.rs");
+        let bar = source.split("let title_bar = TitleBar::new()").nth(1).expect("the title bar");
+        let close = bar.split(".on_close_window(").nth(1).expect("the title bar sets on_close_window");
+        let handler = &close[..close.find("}))").expect("the handler's end")];
+        assert!(handler.contains("this.may_close(window, cx)") && handler.contains("window.remove_window()"), "{handler}");
+        assert_eq!(source.matches("TitleBar::new()").count(), 3, "one title bar (the other two are this test's)");
     }
 
     #[test]
