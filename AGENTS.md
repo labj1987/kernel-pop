@@ -28,21 +28,33 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   (`KERNEL_POP_LOG`), the shared Tokio runtime, then GPUI.
 - `instance.rs` — one running copy per login: a socket in
   `$XDG_RUNTIME_DIR`; a second launch hands over its activation token and
-  waits for the "ok" the UI loop sends once it handled it. Until the window is up the listener
-  answers "starting" at once; a launch waits 2 s for any answer and, after "starting", 15 s in all
-  for the "ok" (a cold start on a software renderer can take seconds). Otherwise it reports the
-  running copy as not responding, with its PID, through `notice.rs`, and exits 1. The primary
-  holds an exclusive `flock` on `kernel-pop.sock.alive` for its life, so AppRun (`instance_running`,
-  a shared non-blocking probe, so two launchers don't see each other) can skip
-  its setup and exec the binary at once. A running copy that closes the connection without an
-  answer (it was just exiting) means the claim is tried once more. Without a socket (no
-  `XDG_RUNTIME_DIR`, or the bind failed) the claim is not exclusive and startup leaves `.part`
-  files alone. `activation.rs` raises the window with that token on Wayland
+  waits for the "ok" the UI loop sends once it handled it. Until the window has drawn its first
+  frame (`UiUp`, set from `window.on_next_frame` in `build_ui`) the listener answers "starting" at
+  once; a launch waits 2 s for any answer and, after "starting", 15 s in all for the "ok" (a cold
+  start on a software renderer can take seconds). No answer at all: the running copy is reported as
+  not responding, with its PID, through `notice.rs` as an error, exit 1. Only "starting" in those
+  15 s: it is still starting, reported as information (`notice::show_info`), exit 0. A running copy
+  that closes the connection unanswered (end of file, ECONNRESET, EPIPE: it was exiting) is asked
+  again every 75 ms until nobody listens (this launch becomes the primary) or a copy answers; after
+  2 s counted from the first such close, the launch exits quietly. `instance::release()` removes the
+  socket file, then `shutdown(SHUT_RDWR)`s the listener (that order) and drops the `.alive` lock; it
+  runs when the last window closes and at the start of `ui::no_window`, which then drops the
+  `Activations` so queued launches get end of file and start afresh. The listener thread drops a
+  connection accepted after the release. The primary holds an exclusive `flock` on
+  `kernel-pop.sock.alive` until then, so AppRun (`instance_running`, a shared non-blocking probe, so
+  two launchers don't see each other) can skip its setup and exec the binary at once. Without a
+  socket (no `XDG_RUNTIME_DIR`, or the bind failed) the claim is not exclusive and startup leaves
+  `.part` files alone. `activation.rs` raises the window with that token on Wayland
   (`xdg_activation_v1` on GPUI's own connection).
-- `notice.rs` — errors with no window to show them in: zenity, kdialog, notify-send, the
-  notification service via `gdbus call` (Pop!_OS COSMIC has none of the others), xmessage, in that
-  order until one shows it. AppRun's `libcheck_show` keeps the same chain, in the same order, in
-  bash.
+- `notice.rs` — errors and information with no window to show them in: zenity, kdialog,
+  notify-send, the notification service via `gdbus call` (Pop!_OS COSMIC has none of the others),
+  xmessage, in that order until one shows it. Errors: `--error` dialogs, critical notifications with
+  no expiry. Information: `zenity --info`, `kdialog --msgbox`, normal urgency with the desktop's
+  default expiry (`int32 -1` over gdbus). A dialog's stderr goes to an unlinked 0600 temporary file
+  read after it exits (never a pipe read to its end: a child it left running would hold it), and
+  "cannot open display" there means it showed nothing even though it ended with 1. AppRun's
+  `libcheck_show` keeps the same chain, in the same order, in bash (`libcheck_dialog`: stderr to a
+  `mktemp` file). Tests run every dialog program as a stub on a private PATH with `DISPLAY=:9999`.
 - `ui.rs` — the GPUI Kit UI (see UI below): system/browse/build/install/log
   tabs, plus a window-wide drop target for tarballs. One global busy state
   (`AppState::busy`, `MainView::begin_busy` and its `BusyGuard`)
@@ -82,7 +94,8 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
 - `download.rs` — downloads files with progress, cancel (the typed
   `Cancelled` error, which also ends a hung request or read at once) and retries, into `.part`
   files renamed when complete, with explicit 0755/0644 modes; `remove_stale_parts` (only the app's
-  own `linux-*.tar.*.part` names, at startup when no download runs); `sha256_file`.
+  own `linux-*.tar.*.part` names, at startup when no download runs); `part_paths`/`remove_parts` (one
+  download's own `.part` files, for closing); `sha256_file`.
 - `system.rs` — inventories installed kernels and their boot health (the
   initrd/modules/boot-entry check described above; for kernelstub, whether
   the kernel is the `vmlinuz` or `vmlinuz.old` one and its ESP copy
@@ -144,7 +157,9 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
 - Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit
   starts; without that GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at
   warn level on a normal start (`KERNEL_POP_LOG=info` shows the renderer picked; `main.rs` keeps
-  zbus and other chatty dependencies at warn whatever the level).
+  chatty dependencies at warn whatever the level, and `zbus` (its harmless "Failed to populate
+  properties cache") and `gpui::window::a11y` ("set_focus called more than once" with a screen
+  reader) at error).
 - Theme: `follow_appearance` re-applies the light/dark theme and then sets the `input` colour
   (radio rings, checkbox and field borders) to one with at least 3:1 contrast; the toolkit's is
   nearly the background colour. The first window size is clamped to the display less room for
@@ -161,7 +176,9 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   anything that is not a kernel tarball after the pick and on drop.
 - Closing: `may_close` (from `on_window_should_close`) refuses while a privileged action runs,
   cancels a running build and closes the window once it has cleaned up, and cancels a running
-  download and closes once its `.part` file is gone (after 5 s it deletes it itself).
+  download and closes once its `.part` file is gone (after 5 s it deletes that download's own
+  `.part` files itself, `AppState::download_parts`, never a sweep of the folder). While closing,
+  `begin_busy` starts nothing new (`busy_refusal`).
 - Testing the UI without touching the machine: a scratch `HOME` whose
   `Downloads/kernel-pop/linux-<krel>/` holds small fake `.deb` files, a `SHA256SUMS` for them and
   a `build-info.txt` reaches the Install tab with a verified build; Browse, Download Source and

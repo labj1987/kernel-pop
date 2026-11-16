@@ -2,7 +2,7 @@ use crate::build::{
     self, built_sets, free_bytes, is_build_cancelled, missing_build_deps, space_problem, verify_built_set, BuildControl, BuildEvent, BuildRequest, BuiltSet,
     ConfigMode, EventSink, Prepared, SourceTrust, Stage,
 };
-use crate::download::{download_files, is_cancelled, remove_stale_parts, Progress as DownloadProgress, Remote};
+use crate::download::{download_files, is_cancelled, part_paths, remove_parts, remove_stale_parts, Progress as DownloadProgress, Remote};
 use crate::install::{
     helper_problem, run_privileged_boot_once, run_privileged_install, run_privileged_install_build_deps, run_privileged_remove, run_privileged_remove_many,
     run_privileged_setup_signing, run_privileged_sign, validate_mok_password, BootOutlook, ScriptReport,
@@ -99,6 +99,17 @@ fn close_decision(busy: Option<&'static str>, build_running: bool, download_runn
     }
 }
 
+/// Why nothing new may start now, if so: one download, build or privileged
+/// action runs at a time, and nothing starts while the window is closing (a
+/// download started then would be cut off, its `.part` file left behind).
+fn busy_refusal(running: Option<&'static str>, closing: bool) -> Option<String> {
+    if closing {
+        Some("Kernel Pop is closing".to_string())
+    } else {
+        running.map(|running| format!("Wait until the {running} has finished"))
+    }
+}
+
 /// How long closing waits for a cancelled download to stop and delete its
 /// `.part` file before deleting it itself and closing anyway.
 const DOWNLOAD_STOP_WAIT: Duration = Duration::from_secs(5);
@@ -117,6 +128,7 @@ impl Drop for BusyGuard {
         if let Ok(mut s) = self.state.try_borrow_mut() {
             s.busy = None;
             s.download_cancel = None;
+            s.download_parts.clear();
             s.build_control = None;
             s.build_started = None;
         }
@@ -163,13 +175,17 @@ struct AppState {
     staged_verified: bool,
     sysinfo: SystemInfo,
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The `.part` files of the running download, the only ones closing may
+    /// delete when that download does not stop in time.
+    download_parts: Vec<PathBuf>,
     build_control: Option<Arc<BuildControl>>,
     build_started: Option<Instant>,
     /// What is running right now, if anything: one download, build or
     /// privileged action at a time. While set, every control that would
     /// start another one is disabled (see `MainView::usable`).
     busy: Option<&'static str>,
-    /// The window closes once the running download has stopped.
+    /// The window closes once the running download has stopped. Nothing new
+    /// starts meanwhile (see `busy_refusal`).
     closing: bool,
 }
 
@@ -691,7 +707,13 @@ fn show_question(question: Question, on_ok: Continuation, on_cancel: Option<Cont
 /// driver (not even Mesa's software ones) there is nothing to draw an error
 /// in. Says so through whatever the desktop offers, then exits: a process
 /// left behind with no window would also keep later launches from starting.
-fn no_window(error: &str) -> ! {
+///
+/// First the single-instance socket is closed and the requests already queued
+/// dropped, so later launches see the connection close and start a copy of
+/// their own instead of waiting for this one while its message is up.
+fn no_window(error: &str, activations: Activations) -> ! {
+    crate::instance::release();
+    drop(activations);
     let message = no_window_message(error, crate::notice::has_display());
     eprintln!("kernel-pop: {message}");
     // With no display there is nowhere to show a dialog either.
@@ -887,8 +909,8 @@ fn refit(elapsed: Duration, now: gpui_kit::Size<Pixels>, first: gpui_kit::Size<P
 
 pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // With no display GPUI would run on with no window and no word about it.
-    if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
-        no_window("no display server to connect to");
+    if !crate::notice::has_display() {
+        no_window("no display server to connect to", activations);
     }
     // GPUI has no primary display on Wayland; the smallest output is then the
     // one the window must fit on wherever the compositor puts it.
@@ -919,7 +941,7 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     });
     let (window, view) = match opened {
         Ok(opened) => opened,
-        Err(e) => no_window(&format!("{e:#}")),
+        Err(e) => no_window(&format!("{e:#}"), activations),
     };
     // The first reads, now that the window can show what goes wrong with them.
     let _ = window.update(cx, |_, window, cx| {
@@ -975,6 +997,8 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
 
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
+            // A launch from now on starts a new copy instead of asking this one.
+            crate::instance::release();
             cx.quit();
         }
     })
@@ -985,10 +1009,11 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // that raises the window (see activation.rs). Without a token, or off
     // Wayland, GPUI's own request is what there is; a Wayland compositor then
     // marks the window as wanting attention instead of raising it.
+    // From the first drawn frame on, a later launch gets "ok" once its request
+    // is handled; until then the listener tells it this copy is still starting.
+    let up = activations.up_signal();
+    let _ = window.update(cx, |_, window, _| window.on_next_frame(move |_, _| up.set()));
     cx.spawn(async move |cx| {
-        // From here a later launch gets "ok" once its request is handled;
-        // until now the listener told it this copy was still starting.
-        activations.ui_is_up();
         while let Some(activation) = activations.recv().await {
             let _ = window.update(cx, |_, window, _| {
                 let raised = activation.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
@@ -1219,9 +1244,12 @@ impl MainView {
     /// Starts a download, build or privileged action under the global busy
     /// state, or returns None (with a toast) when another one is still running.
     fn begin_busy(&mut self, what: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Option<BusyGuard> {
-        let running = self.state.borrow().busy;
-        if let Some(running) = running {
-            toast(window, cx, &format!("Wait until the {running} has finished"));
+        let refusal = {
+            let s = self.state.borrow();
+            busy_refusal(s.busy, s.closing)
+        };
+        if let Some(refusal) = refusal {
+            toast(window, cx, &refusal);
             return None;
         }
         self.state.borrow_mut().busy = Some(what);
@@ -1293,13 +1321,16 @@ impl MainView {
         self.log("Stopping the download before closing…");
         toast(window, cx, "Stopping the download before closing…");
         let state = self.state.clone();
+        // Only this download's own files: another copy (without the
+        // single-instance socket) may be downloading into the same folder.
+        let parts = state.borrow().download_parts.clone();
         let started = Instant::now();
         cx.spawn_in(window, async move |_, cx| loop {
             cx.background_executor().timer(Duration::from_millis(200)).await;
             let stopped = state.borrow().download_cancel.is_none();
             if stopped || started.elapsed() >= DOWNLOAD_STOP_WAIT {
                 if !stopped {
-                    remove_stale_parts(&build::downloads_root());
+                    remove_parts(&parts);
                 }
                 let _ = cx.update(|window, _| window.remove_window());
                 break;
@@ -1692,7 +1723,11 @@ impl MainView {
         self.page = Page::Build;
         self.log(format!("Downloading Linux {} from cdn.kernel.org…", rel.version));
         let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.state.borrow_mut().download_cancel = Some(cancel_flag.clone());
+        {
+            let mut s = self.state.borrow_mut();
+            s.download_cancel = Some(cancel_flag.clone());
+            s.download_parts = part_paths(&files, &build::downloads_root());
+        }
 
         // Progress reports, from the Tokio side; the loop ends when the sender drops.
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadProgress>();
@@ -3327,6 +3362,48 @@ mod tests {
         let handler = &close[..close.find("}))").expect("the handler's end")];
         assert!(handler.contains("this.may_close(window, cx)") && handler.contains("window.remove_window()"), "{handler}");
         assert_eq!(source.matches("TitleBar::new()").count(), 3, "one title bar (the other two are this test's)");
+    }
+
+    #[test]
+    fn nothing_new_starts_while_the_window_is_closing() {
+        assert_eq!(busy_refusal(None, false), None);
+        assert_eq!(busy_refusal(Some("download"), false).as_deref(), Some("Wait until the download has finished"));
+        // The cancelled download has stopped (nothing busy) but the window has not closed yet.
+        assert_eq!(busy_refusal(None, true).as_deref(), Some("Kernel Pop is closing"));
+        assert_eq!(busy_refusal(Some("download"), true).as_deref(), Some("Kernel Pop is closing"));
+        // Every action, the download included, goes through begin_busy.
+        let source = include_str!("ui.rs");
+        let download = &source[source.find("fn download_clicked(").unwrap()..];
+        let download = &download[..download.find("\n    fn ").unwrap()];
+        assert!(download.contains("self.begin_busy(\"download\""), "{download}");
+        // Closing deletes this download's .part files only, never a sweep of the folder.
+        let stop = &source[source.find("fn stop_download_then_close(").unwrap()..];
+        let stop = &stop[..stop.find("\n    fn ").unwrap()];
+        assert!(stop.contains("remove_parts(&parts)") && !stop.contains("remove_stale_parts"), "{stop}");
+    }
+
+    /// The single-instance wiring in `build_ui` and `no_window` needs a real
+    /// window, which tests never open; it is checked in the source instead.
+    #[test]
+    fn the_socket_is_released_when_the_app_is_done_and_up_from_the_first_frame() {
+        let source = include_str!("ui.rs");
+        let body = |name: &str| {
+            let start = source.find(name).unwrap_or_else(|| panic!("{name}"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let no_window = body("fn no_window(error: &str, activations: Activations) -> ! {");
+        let (release, drop, show) =
+            (no_window.find("instance::release()").unwrap(), no_window.find("drop(activations)").unwrap(), no_window.find("show_error").unwrap());
+        assert!(release < drop && drop < show, "release and drop the queued requests before the message: {no_window}");
+        let build_ui = body("pub fn build_ui(");
+        let closed = &build_ui[build_ui.find("cx.on_window_closed(").unwrap()..];
+        let closed = &closed[..closed.find(".detach()").unwrap()];
+        assert!(closed.find("instance::release()").unwrap() < closed.find("cx.quit()").unwrap(), "{closed}");
+        assert!(build_ui.contains("window.on_next_frame(move |_, _| up.set())"), "up from the first drawn frame");
+        assert!(!build_ui.contains("ui_is_up"), "not from the first poll of a task");
+        assert_eq!(build_ui.matches("no_window(").count(), 2);
+        assert_eq!(build_ui.matches(", activations)").count(), 2, "both no_window calls get the requests to drop");
     }
 
     #[test]

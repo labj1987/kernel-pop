@@ -307,10 +307,30 @@ libcheck_gvariant() {
     printf '"%s"' "${t//"$nl"/"${bs}n"}"
 }
 
+# libcheck_no_display TEXT: whether a dialog program's stderr TEXT says it could not open the display.
+libcheck_no_display() {
+    [[ "$1" == *"Failed to open display"* || "$1" == *"annot open display"* ]]
+}
+
+# libcheck_dialog PROGRAM ARG...: runs a dialog program; 0 when it showed its message (it ended
+# with 0 or 1 and did not say it could not open the display: zenity then ends with 1 too). Its
+# stderr goes to a temporary file read once it has ended: reading a pipe to its end would also
+# wait for anything it left running.
+libcheck_dialog() {
+    local rc=0 errf err=""
+    errf="$(mktemp 2>/dev/null)" || errf=""
+    "$@" </dev/null >/dev/null 2>"${errf:-/dev/null}" || rc=$?
+    if [[ -n "$errf" ]]; then
+        err="$(<"$errf")"
+        rm -f "$errf"
+    fi
+    ((rc <= 1)) && ! libcheck_no_display "$err"
+}
+
 # libcheck_show TITLE TEXT: TEXT on stderr and, on a desktop, through the first of these that
 # shows it: zenity, kdialog, notify-send, the desktop's notification service over D-Bus (gdbus:
 # Pop!_OS COSMIC has none of the others) and xmessage. A dialog ends with 0 or 1 once it was
-# seen; the others only with 0 (xmessage ends with 1 when it can't open the display).
+# seen (libcheck_dialog); the others only with 0 (xmessage ends with 1 when it can't open the display).
 libcheck_show() {
     local plain
     printf '%s: %s\n' "$1" "$2" >&2
@@ -318,12 +338,10 @@ libcheck_show() {
     [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
     plain="$(libcheck_plain "$2")"
     if command -v zenity >/dev/null 2>&1; then
-        zenity --error --no-markup --title="$1" --text="$2" --width=460 >/dev/null 2>&1
-        (($? <= 1)) && return 0
+        libcheck_dialog zenity --error --no-markup --title="$1" --text="$2" --width=460 && return 0
     fi
     if command -v kdialog >/dev/null 2>&1; then
-        kdialog --error "$plain" --title "$1" >/dev/null 2>&1
-        (($? <= 1)) && return 0
+        libcheck_dialog kdialog --error "$plain" --title "$1" && return 0
     fi
     if command -v notify-send >/dev/null 2>&1; then
         # -t 0: no expiry (COSMIC drops a default one after a few seconds).
