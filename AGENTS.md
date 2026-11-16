@@ -28,8 +28,10 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   (`KERNEL_POP_LOG`), the shared Tokio runtime, then GPUI.
 - `instance.rs` — one running copy per login: a socket in
   `$XDG_RUNTIME_DIR`; a second launch hands over its activation token and
-  waits up to 2 s for the "ok" the UI loop sends once it handled it (no answer: it reports the
-  running copy as not responding, with its PID, through `notice.rs`, and exits 1). The primary
+  waits for the "ok" the UI loop sends once it handled it. Until the window is up the listener
+  answers "starting" at once; a launch waits 2 s for any answer and, after "starting", 15 s in all
+  for the "ok" (a cold start on a software renderer can take seconds). Otherwise it reports the
+  running copy as not responding, with its PID, through `notice.rs`, and exits 1. The primary
   holds `flock` on `kernel-pop.sock.alive` for its life, so AppRun (`instance_running`) can skip
   its setup and exec the binary at once.
 - `notice.rs` — errors with no window to show them in: kdialog, zenity, notify-send, the

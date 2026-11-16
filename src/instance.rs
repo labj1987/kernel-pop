@@ -18,6 +18,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
@@ -40,13 +42,51 @@ impl Activation {
 }
 
 /// Requests from later launches to show the running window.
-pub type Activations = UnboundedReceiver<Activation>;
+pub struct Activations {
+    rx: UnboundedReceiver<Activation>,
+    ui_up: Arc<AtomicBool>,
+}
+
+impl Activations {
+    fn new(rx: UnboundedReceiver<Activation>) -> (Self, Arc<AtomicBool>) {
+        let ui_up = Arc::new(AtomicBool::new(false));
+        (Activations { rx, ui_up: ui_up.clone() }, ui_up)
+    }
+
+    /// The next request; `None` once nothing can send one any more.
+    pub async fn recv(&mut self) -> Option<Activation> {
+        self.rx.recv().await
+    }
+
+    #[cfg(test)]
+    fn blocking_recv(&mut self) -> Option<Activation> {
+        self.rx.blocking_recv()
+    }
+
+    /// The window is up and requests are being handled. Until then the
+    /// listener answers each request with "starting", so a launch that comes
+    /// while this copy is still starting (a cold start on a software renderer
+    /// can take seconds) waits longer instead of calling it hung.
+    pub fn ui_is_up(&self) {
+        self.ui_up.store(true, Ordering::Relaxed);
+    }
+}
 
 /// What the running copy answers once it has handled a request.
 const REPLY: &[u8] = b"ok\n";
 
-/// How long a later launch waits for that answer.
-const REPLY_WAIT: Duration = Duration::from_secs(2);
+/// What it answers at once while its window is not up yet.
+const STARTING: &[u8] = b"starting\n";
+
+/// How long a later launch waits for any answer, and, after "starting", for
+/// the "ok" in all.
+#[derive(Clone, Copy)]
+struct Waits {
+    first: Duration,
+    total: Duration,
+}
+
+const WAITS: Waits = Waits { first: Duration::from_secs(2), total: Duration::from_secs(15) };
 
 fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)
@@ -103,7 +143,7 @@ pub fn claim() -> Option<Activations> {
             let (tx, rx) = unbounded_channel();
             // Kept open for the life of the process: the receiver never ends.
             std::mem::forget(tx);
-            Some(rx)
+            Some(Activations::new(rx).0)
         }
     }
 }
@@ -159,27 +199,40 @@ fn peer_pid(stream: &UnixStream) -> Option<i32> {
     (rc == 0 && cred.pid > 0).then_some(cred.pid)
 }
 
-/// After sending a request: waits up to `REPLY_WAIT` for the running copy's answer.
-fn await_reply(stream: UnixStream) -> Claim {
+/// After sending a request: waits `waits.first` for the running copy's
+/// answer; after "starting", up to `waits.total` in all for its "ok".
+fn await_reply(stream: UnixStream, waits: Waits) -> Claim {
+    let started = std::time::Instant::now();
     let pid = peer_pid(&stream);
-    let _ = stream.set_read_timeout(Some(REPLY_WAIT));
-    let mut line = Vec::new();
-    let _ = BufReader::new(&stream).take(64).read_until(b'\n', &mut line);
-    if line == REPLY {
-        Claim::HandedOver
-    } else {
-        Claim::NotResponding(pid)
+    let mut reader = BufReader::new(&stream);
+    let mut wait = waits.first;
+    loop {
+        let _ = stream.set_read_timeout(Some(wait));
+        let mut line = Vec::new();
+        let _ = (&mut reader).take(64).read_until(b'\n', &mut line);
+        if line == REPLY {
+            return Claim::HandedOver;
+        }
+        let left = waits.total.saturating_sub(started.elapsed());
+        if line != STARTING || left.is_zero() {
+            return Claim::NotResponding(pid);
+        }
+        wait = left;
     }
 }
 
 fn claim_at(path: &Path, token: Option<String>) -> Claim {
+    claim_with(path, token, WAITS)
+}
+
+fn claim_with(path: &Path, token: Option<String>, waits: Waits) -> Claim {
     let lock = lock(path);
     match UnixStream::connect(path) {
         Ok(mut stream) => {
             let _ = writeln!(stream, "activate {}", token.as_deref().unwrap_or(""));
             // Others may look while this one waits for the answer.
             drop(lock);
-            return await_reply(stream);
+            return await_reply(stream, waits);
         }
         Err(e) if nobody_listening(&e) => {
             let _ = std::fs::remove_file(path);
@@ -191,12 +244,16 @@ fn claim_at(path: &Path, token: Option<String>) -> Claim {
         }
     }
     let (tx, rx) = unbounded_channel();
+    let (activations, ui_up) = Activations::new(rx);
     match UnixListener::bind(path) {
         Ok(listener) => {
             hold_alive(path);
             std::thread::spawn(move || {
-                for connection in listener.incoming().flatten() {
+                for mut connection in listener.incoming().flatten() {
                     let token = read_request(&connection);
+                    if !ui_up.load(Ordering::Relaxed) {
+                        let _ = connection.write_all(STARTING);
+                    }
                     if tx.send(Activation { token, reply: Some(connection) }).is_err() {
                         break;
                     }
@@ -210,7 +267,7 @@ fn claim_at(path: &Path, token: Option<String>) -> Claim {
             std::mem::forget(tx);
         }
     }
-    Claim::Primary(rx)
+    Claim::Primary(activations)
 }
 
 /// The token a second launch sent with its request, if any. A launch that
@@ -229,8 +286,11 @@ fn parse_request(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_at, nobody_listening, not_responding_message, parse_request, sibling, valid_token, Activations, Claim, MAX_TOKEN};
+    use super::{
+        claim_at, claim_with, nobody_listening, not_responding_message, parse_request, sibling, valid_token, Activations, Claim, Waits, MAX_TOKEN, WAITS,
+    };
     use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("kernel-pop-{name}-{}", std::process::id()));
@@ -248,6 +308,7 @@ mod tests {
 
     /// Answers every request like the UI loop does, passing on the tokens.
     fn answer(mut first: Activations) -> std::sync::mpsc::Receiver<Option<String>> {
+        first.ui_is_up();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             while let Some(activation) = first.blocking_recv() {
@@ -290,6 +351,46 @@ mod tests {
         assert!(waited >= std::time::Duration::from_millis(1900) && waited < std::time::Duration::from_secs(4), "{waited:?}");
         assert_eq!(not_responding_message(Some(42)), "Kernel Pop is already running but not responding; close it (PID 42) and start again.");
         drop(hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const SHORT: Waits = Waits { first: Duration::from_millis(300), total: Duration::from_millis(1500) };
+
+    #[test]
+    fn the_waits_are_two_seconds_then_fifteen_while_starting() {
+        assert_eq!((WAITS.first, WAITS.total), (Duration::from_secs(2), Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn a_launch_during_start_up_waits_for_the_window() {
+        let dir = scratch("starting");
+        let path = dir.join("test.sock");
+        // The window comes up after the first wait has passed: "starting" keeps the later launch waiting.
+        let mut first = primary(claim_with(&path, None, SHORT));
+        let ui = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            first.ui_is_up();
+            let activation = first.blocking_recv().unwrap();
+            activation.handled();
+            first
+        });
+        let started = Instant::now();
+        assert!(matches!(claim_with(&path, None, SHORT), Claim::HandedOver));
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        let _first = ui.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_stuck_in_start_up_is_reported_after_the_long_wait() {
+        let dir = scratch("stuck");
+        let path = dir.join("test.sock");
+        // Its window never comes up: only "starting", never "ok".
+        let _first = primary(claim_with(&path, None, SHORT));
+        let started = Instant::now();
+        assert!(matches!(claim_with(&path, None, SHORT), Claim::NotResponding(Some(_))));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(1400) && waited < Duration::from_secs(3), "{waited:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -353,7 +454,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let path = path.clone();
-                std::thread::spawn(move || claim_at(&path, None))
+                std::thread::spawn(move || claim_with(&path, None, SHORT))
             })
             .collect();
         // Kept until counted: a primary whose receiver is gone stops listening.
