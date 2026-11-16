@@ -151,7 +151,8 @@ and the debug-info measurement are in `docs/SOURCE_BUILD.md`.
   `wl_output` scale (150% arrives as 2), so once the window knows its fractional scale the size is
   worked out again (`wayland_logical`, `rescaled_size`) when the window first learns that scale (a
   bounds observer: right after opening it is still 1), and the window resized once if the user has
-  not; never on X11, where GPUI already divides by the true scale. Every tab
+  not (`refit`: armed only for the first 3 s and while the window keeps its first size, and only
+  with a single output); never on X11, where GPUI already divides by the true scale. Every tab
   scrolls above its bottom buttons.
 - File dialogs (portal) have no file-type filter and no starting folder in GPUI: `inspect` refuses
   anything that is not a kernel tarball after the pick and on drop.

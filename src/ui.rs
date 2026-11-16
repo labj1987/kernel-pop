@@ -848,6 +848,35 @@ fn rescaled_size(usable: gpui_kit::Size<Pixels>, scale: f32, from_wayland_output
     (want != initial_window_size(Some(usable))).then_some(want)
 }
 
+/// How long after opening the window the fractional-scale refit may still
+/// happen: later scale changes are the user's (a new desktop scale, a move to
+/// another monitor), not the start-up scale arriving.
+const REFIT_WINDOW: Duration = Duration::from_secs(3);
+
+/// What a bounds change of the freshly opened window means for the one refit.
+#[derive(Debug, PartialEq)]
+enum Refit {
+    /// Nothing known yet (the scale is still 1): keep watching.
+    Wait,
+    /// Stop watching for good.
+    Disarm,
+    /// Resize to this, then stop watching.
+    Resize(gpui_kit::Size<Pixels>),
+}
+
+/// `now`: the window's size; `first`: the size it was opened with; `usable`:
+/// the one output's size as GPUI reported it.
+fn refit(elapsed: Duration, now: gpui_kit::Size<Pixels>, first: gpui_kit::Size<Pixels>, scale: f32, usable: gpui_kit::Size<Pixels>) -> Refit {
+    let untouched = (now.width.as_f32() - first.width.as_f32()).abs() < 2. && (now.height.as_f32() - first.height.as_f32()).abs() < 2.;
+    if elapsed > REFIT_WINDOW || !untouched {
+        return Refit::Disarm;
+    }
+    if scale == 1. {
+        return Refit::Wait;
+    }
+    rescaled_size(usable, scale, true).map_or(Refit::Disarm, Refit::Resize)
+}
+
 pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // With no display GPUI would run on with no window and no word about it.
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
@@ -855,12 +884,14 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     }
     // GPUI has no primary display on Wayland; the smallest output is then the
     // one the window must fit on wherever the compositor puts it.
-    let from_outputs = cx.primary_display().is_none();
+    // With several outputs the window's one is not known before it opens: no refit then.
+    let from_outputs = cx.primary_display().is_none() && cx.displays().len() == 1;
     let usable = cx
         .primary_display()
         .map(|display| display.visible_bounds().size)
         .or_else(|| cx.displays().iter().map(|display| display.visible_bounds().size).min_by(|a, b| a.height.cmp(&b.height)));
     let first_size = initial_window_size(usable);
+    log::info!("window: usable area {usable:?}, opening at {first_size:?}");
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(first_size, cx)),
         window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
@@ -894,17 +925,20 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     if let (true, Some(usable)) = (from_outputs, usable) {
         let _ = window.update(cx, |_, window, cx| {
             view.update(cx, |_, cx| {
-                let mut done = false;
+                let opened = Instant::now();
+                let mut armed = true;
                 cx.observe_window_bounds(window, move |_, window, _| {
-                    if done || window.scale_factor() == 1. {
+                    if !armed {
                         return;
                     }
-                    done = true;
-                    let now = window.viewport_size();
-                    let untouched =
-                        (now.width.as_f32() - first_size.width.as_f32()).abs() < 2. && (now.height.as_f32() - first_size.height.as_f32()).abs() < 2.;
-                    if let (true, Some(want)) = (untouched, rescaled_size(usable, window.scale_factor(), true)) {
-                        window.resize(want);
+                    match refit(opened.elapsed(), window.viewport_size(), first_size, window.scale_factor(), usable) {
+                        Refit::Wait => {}
+                        Refit::Disarm => armed = false,
+                        Refit::Resize(want) => {
+                            armed = false;
+                            log::info!("window: scale {} known, size {first_size:?} -> {want:?}", window.scale_factor());
+                            window.resize(want);
+                        }
                     }
                 })
                 .detach();
@@ -3183,6 +3217,20 @@ mod tests {
         // correcting again would make the window larger than the screen.
         assert_eq!(rescaled_size(size(px(1280.), px(720.)), 1.5, false), None);
         assert_eq!(rescaled_size(size(px(1536.), px(864.)), 1.25, false), None);
+    }
+
+    #[test]
+    fn the_refit_happens_once_and_only_at_start_up() {
+        let (usable, first) = (size(px(960.), px(540.)), initial_window_size(Some(size(px(960.), px(540.)))));
+        let soon = Duration::from_millis(200);
+        assert_eq!(refit(soon, first, first, 1., usable), Refit::Wait, "scale not known yet");
+        assert_eq!(refit(soon, first, first, 1.5, usable), Refit::Resize(size(px(860.), px(624.))));
+        // The user resized, or the compositor changed it: never override that.
+        assert_eq!(refit(soon, size(px(700.), px(500.)), first, 1.5, usable), Refit::Disarm);
+        // A scale change long after start is the user's (100% -> 125%, another monitor).
+        assert_eq!(refit(REFIT_WINDOW + soon, first, first, 1.25, usable), Refit::Disarm);
+        // An integer scale needs nothing.
+        assert_eq!(refit(soon, first, first, 2., usable), Refit::Disarm);
     }
 
     #[test]
