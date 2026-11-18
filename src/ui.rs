@@ -110,6 +110,9 @@ fn busy_refusal(running: Option<&'static str>, closing: bool) -> Option<String> 
     }
 }
 
+/// The prepared build and its busy guard, held by the build summary dialog.
+type SummarySlot = Rc<RefCell<Option<(Prepared, BusyGuard)>>>;
+
 /// How long closing waits for a cancelled download to stop and delete its
 /// `.part` file before deleting it itself and closing anyway.
 const DOWNLOAD_STOP_WAIT: Duration = Duration::from_secs(5);
@@ -1087,6 +1090,10 @@ pub struct MainView {
     download_bar: Option<DownloadBar>,
     build_fraction: Option<f64>,
 
+    /// The build summary dialog's pending build, while that dialog is open:
+    /// closing the window discards it (no worker runs then to see a cancel).
+    build_summary: Option<SummarySlot>,
+
     // Install tab
     installing: bool,
 
@@ -1154,6 +1161,7 @@ impl MainView {
             stage_text: None,
             download_bar: None,
             build_fraction: None,
+            build_summary: None,
             installing: false,
             log_lines: VecDeque::new(),
             log_dirty: false,
@@ -1304,7 +1312,15 @@ impl MainView {
         // Nothing new starts while the build stops and the window closes, as
         // for a download.
         self.state.borrow_mut().closing = true;
-        if !control.is_cancelled() {
+        // At the build summary nothing runs that would see the cancel: the
+        // dialog holds the configured tree and the busy guard. Discard them
+        // the way its Cancel does; the window closes once they are gone.
+        let at_summary = self.build_summary.take().and_then(|slot| slot.borrow_mut().take());
+        if let Some((prepared, busy)) = at_summary {
+            window.close_dialog(cx);
+            control.cancel();
+            self.discard_prepared(prepared, busy, window, cx);
+        } else if !control.is_cancelled() {
             control.cancel();
             toast(window, cx, "Stopping the build before closing…");
         }
@@ -2113,23 +2129,37 @@ impl MainView {
                     default: DefaultButton::Action,
                     destructive: false,
                 };
-                let slot = Rc::new(RefCell::new(Some((prepared, busy))));
+                let slot: SummarySlot = Rc::new(RefCell::new(Some((prepared, busy))));
+                this.build_summary = Some(slot.clone());
                 let cancel_slot = slot.clone();
                 let go = this.later(cx, move |this, window, cx| {
+                    this.build_summary = None;
                     let Some((prepared, busy)) = slot.borrow_mut().take() else { return };
+                    // A cancelled control would end the build at once.
+                    if control.is_cancelled() {
+                        this.discard_prepared(prepared, busy, window, cx);
+                        return;
+                    }
                     this.start_build(prepared, busy, control, tree_log, window, cx);
                 });
                 let cancel = this.later(cx, move |this, window, cx| {
+                    this.build_summary = None;
                     let Some((prepared, busy)) = cancel_slot.borrow_mut().take() else { return };
-                    this.log("Build not started; the configured tree is deleted.");
-                    // Busy until the tree is gone: a new build at once would extract into it.
-                    this.run(window, cx, async move { tokio::task::spawn_blocking(move || prepared.discard()).await }, move |this, _, window, cx| {
-                        this.finish_build(busy, "", window, cx)
-                    });
+                    this.discard_prepared(prepared, busy, window, cx);
                 });
                 show_question(question, go, Some(cancel), window, cx);
             },
         );
+    }
+
+    /// A build that will not start: delete its configured tree, then end the
+    /// busy state. Busy until the tree is gone: a new build at once would
+    /// extract into it.
+    fn discard_prepared(&mut self, prepared: Prepared, busy: BusyGuard, window: &mut Window, cx: &mut Context<Self>) {
+        self.log("Build not started; the configured tree is deleted.");
+        self.run(window, cx, async move { tokio::task::spawn_blocking(move || prepared.discard()).await }, move |this, _, window, cx| {
+            this.finish_build(busy, "", window, cx)
+        });
     }
 
     fn start_build(&mut self, prepared: Prepared, busy: BusyGuard, control: Arc<BuildControl>, tree_log: PathBuf, window: &mut Window, cx: &mut Context<Self>) {

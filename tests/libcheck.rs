@@ -443,17 +443,31 @@ fn a_dialog_that_could_not_open_the_display_passes_the_message_on() {
     let log = dir.join("calls");
     // zenity with no display ends with 1, as a closed dialog does, but says why on stderr; and it
     // leaves a process holding that stderr, which must not be waited for.
-    script_file(&dir.join("zenity"), &format!("#!/bin/bash\necho zenity >> '{}'\necho 'cannot open display: :9999' >&2\nsleep 5 &\nexit 1\n", log.display()));
+    // By its full path: PATH holds only the fakes. It records its PID, so the test knows it ran.
+    let sleep = ["/usr/bin/sleep", "/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).expect("sleep");
+    let sleeper = dir.join("sleeper");
+    script_file(
+        &dir.join("zenity"),
+        &format!(
+            "#!/bin/bash\necho zenity >> '{}'\necho 'cannot open display: :9999' >&2\n{sleep} 5 &\necho $! > '{}'\nexit 1\n",
+            log.display(),
+            sleeper.display()
+        ),
+    );
     script_file(&dir.join("kdialog"), &format!("#!/bin/bash\necho kdialog >> '{}'\necho 'Failed to open display' >&2\nexit 1\n", log.display()));
     script_file(&dir.join("notify-send"), &format!("#!/bin/bash\necho notify-send >> '{}'\nexit 0\n", log.display()));
     let started = std::time::Instant::now();
     let calls = show_in(&dir);
     assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
     assert_eq!(calls, ["zenity", "kdialog", "notify-send"]);
+    // The child holding zenity's stderr really ran, and still does: it was not waited for.
+    let pid = std::fs::read_to_string(&sleeper).expect("the background sleep did not start").trim().to_string();
+    assert!(Path::new(&format!("/proc/{pid}")).exists(), "the background sleep {pid} is not running");
+    let _ = Command::new("kill").arg(&pid).status();
     // The temporary files for their stderr (TMPDIR is this folder here) are gone.
     let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     left.sort();
-    assert_eq!(left, ["calls", "kdialog", "mktemp", "notify-send", "rm", "zenity"]);
+    assert_eq!(left, ["calls", "kdialog", "mktemp", "notify-send", "rm", "sleeper", "zenity"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

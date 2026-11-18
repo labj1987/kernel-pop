@@ -73,7 +73,8 @@ VFS-panics on boot. This app is built around not letting that happen:
   System tab, once signing is set up
 - With Secure Boot on, a kernel that could not boot is never installed:
   the install is refused until signing is set up, and a kernel whose
-  signing fails is removed again
+  signing fails is removed again, boot menu entry included (a rebuild of a
+  version already installed puts the one from before back instead)
 - Optional kernel signing: a one-time Set Up Signing step creates Kernel
   Pop's own signing key, signs the installed kernels, puts shim in front of
   systemd-boot where the firmware starts it directly, and queues the key
@@ -275,7 +276,9 @@ absent:
   put back by reinstalling the package that ships it
 - copies shim, MOK Manager and the fallback loader to the ESP, puts shim at
   the fallback path `EFI/BOOT/BOOTX64.EFI`, and writes the `BOOTX64.CSV`
-  that restores the entry after a firmware reset
+  that restores the entry after a firmware reset. On an ESP shared with
+  Windows or another distribution whose loader sits at that path, it is
+  left alone: the firmware entry below is what starts this system
 - adds a firmware entry named after the distribution that starts shim with
   systemd-boot as what it loads, then removes the "Linux Boot Manager"
   entries `bootctl` adds, which skip shim. Every copy to the ESP must
@@ -319,8 +322,11 @@ signed with a key that is enrolled or waiting for enrollment:
   before anything changes, and the app points you to Set Up Signing.
 - If signing the new kernel fails, or the copy on the ESP that systemd-boot
   or kernelstub starts does not carry the signature, its packages are
-  removed again, so no kernel that shim would refuse is left in the boot
-  menu.
+  removed again, with its systemd-boot entry, so no kernel that shim would
+  refuse is left in the boot menu. A rebuild of a version that was already
+  installed (the running kernel, say) is never removed: the kernel and
+  modules from before are put back with its initramfs. The same happens when
+  the install stops for any other reason before it has finished.
 - If the key is still waiting for enrollment, the kernel is installed and
   signed, and the install reminds you to confirm the enrollment at the MOK
   Manager screen on the next reboot; skip that and it will not boot.

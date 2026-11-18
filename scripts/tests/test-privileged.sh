@@ -48,6 +48,8 @@ export KERNEL_POP_APT_HOOK="$tmp/hooks/apt-hook" KERNEL_POP_KERNEL_HOOK="$tmp/ho
     KERNEL_POP_SDBOOT="$tmp/sdboot/systemd-bootx64.efi" KERNEL_POP_SDBOOT_STAMP="$tmp/sdboot/stamp" \
     KERNEL_POP_SHIM_LIB="$tmp/shim-lib" KERNEL_POP_OS_RELEASE="$tmp/os-release"
 printf 'ID=ubuntu\n' > "$tmp/os-release"
+# No XBOOTLDR partition unless a test sets one: bootctl is never asked.
+export KERNEL_POP_XBOOTLDR=""
 
 deb_allowed "$tmp/linux-image-7.2.12-kernelpop_7.2.12-1_amd64.deb"   || bad "deb_allowed image"
 deb_allowed "$tmp/linux-headers-7.2.12-kernelpop_7.2.12-1_amd64.deb" || bad "deb_allowed headers"
@@ -237,6 +239,24 @@ got="$(sdboot_entry_for_kver "$tmp/sd" 6.8.0-45-generic)"
 got="$(esp_image_for_kver systemd-boot "$tmp/sd" 7.1.3-070103-generic)"
 [[ "$got" == "$tmp/sd/mid/7.1.3-070103-generic/linux" ]] || bad "esp_image_for_kver systemd-boot got [$got]"
 [[ -z "$(esp_image_for_kver grub "$tmp/sd" 7.1.3-070103-generic)" ]] || bad "esp_image_for_kver grub should be empty"
+# An XBOOTLDR /boot: kernel-install writes the entry and the kernel there
+mkdir -p "$tmp/xbl/loader/entries" "$tmp/xbl/mid/7.4.1-kernelpop"
+printf 'title Ubuntu\nversion 7.4.1-kernelpop\nlinux /mid/7.4.1-kernelpop/linux\ninitrd /mid/7.4.1-kernelpop/initrd.img-7.4.1-kernelpop\n' > "$tmp/xbl/loader/entries/mid-7.4.1-kernelpop.conf"
+touch "$tmp/xbl/mid/7.4.1-kernelpop/linux" "$tmp/xbl/mid/7.4.1-kernelpop/initrd"
+[[ -z "$(sdboot_entry_for_kver "$tmp/sd" 7.4.1-kernelpop)" ]] || bad "an XBOOTLDR entry was found without XBOOTLDR"
+got="$(KERNEL_POP_XBOOTLDR="$tmp/xbl" sdboot_entry_for_kver "$tmp/sd" 7.4.1-kernelpop)"
+[[ "$got" == "$tmp/xbl/loader/entries/mid-7.4.1-kernelpop.conf" ]] || bad "sdboot_entry_for_kver on XBOOTLDR got [$got]"
+got="$(KERNEL_POP_XBOOTLDR="$tmp/xbl" esp_image_for_kver systemd-boot "$tmp/sd" 7.4.1-kernelpop)"
+[[ "$got" == "$tmp/xbl/mid/7.4.1-kernelpop/linux" ]] || bad "esp_image_for_kver on XBOOTLDR got [$got]"
+got="$(KERNEL_POP_XBOOTLDR="$tmp/xbl" sdboot_entry_for_kver "$tmp/sd" 7.1.3-070103-generic)"
+[[ "$got" == "$tmp/sd/loader/entries/mid-7.1.3-070103-generic.conf" ]] || bad "the ESP's entries come first, got [$got]"
+got="$(sdboot_entry_files_present "$tmp/xbl/loader/entries/mid-7.4.1-kernelpop.conf")" && bad "a missing initrd was not noticed"
+[[ "$got" == "$tmp/xbl/mid/7.4.1-kernelpop/initrd.img-7.4.1-kernelpop" ]] || bad "sdboot_entry_files_present listed [$got]"
+touch "$tmp/xbl/mid/7.4.1-kernelpop/initrd.img-7.4.1-kernelpop"
+sdboot_entry_files_present "$tmp/xbl/loader/entries/mid-7.4.1-kernelpop.conf" >/dev/null || bad "an entry with all its files was refused"
+KERNEL_POP_XBOOTLDR="$tmp/xbl" prune_esp_initrds "$tmp/sd" 7.4.1-kernelpop >/dev/null
+[[ -e "$tmp/xbl/mid/7.4.1-kernelpop/initrd" ]] && bad "prune did not work on the XBOOTLDR partition"
+[[ -f "$tmp/xbl/mid/7.4.1-kernelpop/initrd.img-7.4.1-kernelpop" ]] || bad "prune removed the used initrd on XBOOTLDR"
 
 mkdir -p "$tmp/ksboot" "$tmp/ksroot" "$tmp/ksesp/EFI/Pop_OS-abcd"
 touch "$tmp/ksesp/EFI/Pop_OS-abcd/vmlinuz.efi" "$tmp/ksesp/EFI/Pop_OS-abcd/vmlinuz-previous.efi"
@@ -732,6 +752,11 @@ else
                 cmp -s "$KERNEL_POP_MOK_PENDING" "$tmp/list-before" || fail "the shared list changed for a malformed request"
             done
 
+            # Shorter than its attribute bytes: damaged, not empty.
+            printf 'ab' > "$moknew"
+            rc=0; pending_mok_certs "$tmp/malformed-out" 2>/dev/null || rc=$?
+            [[ $rc == 2 ]] || fail "a MokNew shorter than 4 bytes should read as damaged, got $rc"
+
             # A waiting certificate openssl can't read: nothing is revoked, the request stays.
             printf 'not a certificate' > "$tmp/junk.der"
             : > "$calls"; write_moknew x509 "$tmp/other/c.der" "$tmp/junk.der"
@@ -855,12 +880,46 @@ EOF2
                    KERNEL_POP_SIGNED_DIR="$root/signed" KERNEL_POP_GRUB_CFG="$root/grub.cfg" \
                    KERNEL_POP_GRUB_DEFAULTS="$root/default-grub" KERNEL_POP_DKMS_TREE="$root/dkms"
             if [[ -n "${WITH_KEY:-}" ]]; then touch "$root/mok/signing.key" "$root/mok/signing.pem" "$root/mok/signing.der"; fi
+            # A version installed before: its files, as dpkg will replace them
+            if [[ -n "${PREEXIST:-}" ]]; then
+                echo old-image > "$KERNEL_POP_BOOT/vmlinuz-$kv"; echo old-initrd > "$KERNEL_POP_BOOT/initrd.img-$kv"
+                mkdir -p "$KERNEL_POP_MODULES/$kv/kernel"; echo old > "$KERNEL_POP_MODULES/$kv/kernel/old.ko"
+            fi
+            # Only a modules directory left from an earlier kernel of that version
+            if [[ -n "${LONE_MODS:-}" ]]; then mkdir -p "$KERNEL_POP_MODULES/$kv"; echo stale > "$KERNEL_POP_MODULES/$kv/stale.ko"; fi
+            [[ -n "${NO_ROOM:-}" ]] && boot_free_bytes() { echo 0; }
+            [[ -n "${NO_KEEP:-}" ]] && keep_installed_kernel() { :; }
+            # shellcheck disable=SC2034  # read by wait_for_package_lock
+            [[ -n "${LOCK_HELD:-}" ]] && { package_lock_holder() { echo "4883 packagekitd"; }; LOCK_WAIT=0; }
+            [[ -n "${RESTORE_MV_FAIL:-}" ]] && mv() { [[ "$1" == -T ]] && return 1; command mv "$@"; }
+            # Like dpkg: new files are written aside and renamed over the old
+            # names; the systemd-boot hook writes an entry and copies the kernel.
             dpkg() {
+                [[ "$1" == --audit && -n "${INTERRUPTED:-}" ]] && echo "half-configured: nvidia-dkms-615"
+                [[ "$1" == -i ]] || return 0
                 shift; printf '%s\n' "$@" > "$root/dpkg-args"
-                touch "$KERNEL_POP_BOOT/vmlinuz-$kv"; mkdir -p "$KERNEL_POP_MODULES/$kv/build"
+                [[ -n "${SIG_DURING:-}" ]] && kill -TERM "$(cat "$root/pid")"
+                [[ -n "${DPKG_FAIL:-}" ]] && return 1
+                echo new-image > "$KERNEL_POP_BOOT/.new" && mv -f "$KERNEL_POP_BOOT/.new" "$KERNEL_POP_BOOT/vmlinuz-$kv"
+                if [[ -z "${NO_MODULES:-}" ]]; then
+                    rm -rf "${KERNEL_POP_MODULES:?}/$kv"; mkdir -p "$KERNEL_POP_MODULES/$kv/build"; echo new > "$KERNEL_POP_MODULES/$kv/new.ko"
+                fi
+                if [[ -n "${SDBOOT:-}" ]]; then
+                    mkdir -p "$root/esp/loader/entries" "$root/esp/mid/$kv"
+                    printf 'title t\nversion %s\nlinux /mid/%s/linux\ninitrd /mid/%s/initrd.img-%s\n' "$kv" "$kv" "$kv" "$kv" > "$root/esp/loader/entries/mid-$kv.conf"
+                    touch "$root/esp/mid/$kv/linux" "$root/esp/mid/$kv/initrd.img-$kv"
+                fi
+                return 0
             }
-            apt-get() { echo "$*" >> "$root/apt-args"; [[ "$3" == "purge" ]]; }
-            update-initramfs() { touch "$KERNEL_POP_BOOT/initrd.img-$3"; }   # -c|-u -k <kver>
+            # Simulations (-s) print $APT_SIM and are logged apart
+            apt-get() {
+                if [[ "$1" == -s ]]; then echo "$*" >> "$root/apt-sim"; [[ -n "${APT_SIM:-}" ]] && echo "$APT_SIM"; return 0; fi
+                echo "$*" >> "$root/apt-args"; [[ "$3" == "purge" ]]
+            }
+            kernel-install() { echo "$*" >> "$root/ki-args"; [[ "$1" == add && -n "${KI_FAIL:-}" ]] && return 1; [[ "$1" == remove ]] && rm -f "$root/esp/loader/entries/mid-$2.conf"; return 0; }
+            # -c|-u -k <kver>; written in place, as dracut does; names the modules it saw
+            update-initramfs() { echo "initrd from $(ls "$KERNEL_POP_MODULES/$3" | tr '\n' ' ')" > "$KERNEL_POP_BOOT/initrd.img-$3"; }
+            [[ -n "${NO_IRTOOL:-}" ]] && initramfs_tool() { echo none; }
             if [[ -n "${DKMS_BROKEN:-}" ]]; then
                 dkms() { [[ "$1" == "status" ]] && echo "nvidia/615.78.08, $kv, x86_64: built"; [[ "$1" == "status" ]]; }
             else
@@ -868,12 +927,11 @@ EOF2
             fi
             if [[ -n "${SDBOOT:-}" ]]; then
                 detect_bootloader() { echo "systemd-boot $root/esp"; }
-                sdboot_entry_for_kver() { echo "$root/esp/loader/entries/$2.conf"; }
                 sync_signed_to_esp() { [[ -z "${ESP_UNSIGNED:-}" ]] || { log "SIGN WARNING: the ESP copy of $1 does not carry the Kernel Pop signature"; return 1; }; }
             else
                 detect_bootloader() { echo "grub"; }
             fi
-            update-grub() { :; }
+            update-grub() { [[ -z "${GRUB_FAIL:-}" ]]; }
             grub-editenv() { echo "saved_entry=$(cat "$root/saved")"; }
             grub-set-default() { echo "$1" > "$root/saved"; }
             grub-reboot() { echo "$1" > "$root/next"; }
@@ -883,7 +941,8 @@ EOF2
             # The fake packages hold no image: the trial signing is stubbed (tested on a real package below)
             trial_sign_image() { [[ -z "${TRIAL_FAIL:-}" ]] || { log "SIGN WARNING: stub trial signing failed"; return 1; }; }
             dpkg-query() { [[ -n "${PREEXIST:-}" && "$*" == *"linux-image-$kv"* ]] && echo "install ok installed"; }
-            do_install "$root/dl"
+            echo "$BASHPID" > "$root/pid"
+            do_install "$root/dl" 3>&1
         ) 2>&1
     }
     count() { grep -c "^\[kernel-pop\] $1" <<< "$2"; }
@@ -940,8 +999,74 @@ EOF2
     grep -q "removed again. Nothing is left installed" <<< "$out" || bad "the rollback should be reported: $out"
     [[ "$(cat "$root/saved")" == "gnulinux-advanced-x>gnulinux-$running-advanced-x" ]] || bad "a rolled-back install changed the default"
     # The same over an installed kernel of that version: the message says that one is gone too
+    # The same over an installed kernel of that version (maybe the running
+    # one): never purged; the kernel, initramfs and modules from before are
+    # put back.
     out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 run_install signfail-over)" && bad "do_install should fail when signing fails under Secure Boot"
-    grep -q "It had replaced the $kv installed before, which is gone with it" <<< "$out" || bad "the rollback over an installed $kv should say it is gone: $out"
+    root="$tmp/inst-signfail-over"
+    grep -q "the $kv installed before was put back as it was" <<< "$out" || bad "the rollback over an installed $kv should put it back: $out"
+    [[ -e "$root/apt-args" ]] && bad "a version installed before was purged: $(cat "$root/apt-args")"
+    [[ "$(cat "$root/boot/vmlinuz-$kv")" == old-image ]] || bad "the kernel from before was not put back"
+    [[ -f "$root/modules/$kv/kernel/old.ko" && ! -e "$root/modules/$kv/new.ko" ]] || bad "the modules from before were not put back"
+    [[ "$(cat "$root/boot/initrd.img-$kv")" == old-initrd ]] || bad "the kept initramfs was not put back: $(cat "$root/boot/initrd.img-$kv")"
+    [[ -z "$(compgen -G "$root/boot/.kernel-pop-keep-*")$(compgen -G "$root/modules/.kernel-pop-keep-*")" ]] || bad "the kept copies were left behind"
+    # No room in /boot for a copy of the initramfs: made again from the old modules
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 NO_ROOM=1 run_install signfail-noroom)" && bad "do_install should fail when signing fails under Secure Boot"
+    [[ "$(cat "$tmp/inst-signfail-noroom/boot/initrd.img-$kv")" == "initrd from kernel " ]] || bad "the initramfs was not made again from the old modules: $(cat "$tmp/inst-signfail-noroom/boot/initrd.img-$kv")"
+    # Only a leftover modules directory: nothing was installed before, so the
+    # new packages are purged and the leftover goes too
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled LONE_MODS=1 run_install lonemods)" && bad "do_install should fail when signing fails under Secure Boot"
+    root="$tmp/inst-lonemods"
+    grep -q "Nothing is left installed" <<< "$out" || bad "a leftover modules directory was taken for an installed kernel: $out"
+    [[ "$(cat "$root/apt-args" 2>/dev/null)" == "$APT_OPTS purge -y linux-headers-$kv linux-image-$kv" ]] || bad "the new packages were not purged: [$(cat "$root/apt-args" 2>/dev/null)]"
+    [[ -e "$root/modules/$kv" ]] && bad "the leftover modules directory stayed"
+    # A stop after dpkg that is not a rollback (update-grub fails): the
+    # version from before is put back all the same
+    out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled PREEXIST=1 GRUB_FAIL=1 run_install grubfail)" && bad "do_install should fail when update-grub fails"
+    root="$tmp/inst-grubfail"
+    grep -q "putting back the $kv installed before" <<< "$out" || bad "a stop after dpkg did not put the old version back: $out"
+    [[ "$(cat "$root/boot/vmlinuz-$kv")" == old-image && -f "$root/modules/$kv/kernel/old.ko" ]] || bad "a stop after dpkg left the new build in place"
+    # Putting back fails part way: what is left stays kept, and is named
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 RESTORE_MV_FAIL=1 run_install restorefail)" && bad "do_install should fail when signing fails under Secure Boot"
+    root="$tmp/inst-restorefail"
+    grep -q "what was kept of it is in .*\.kernel-pop-keep-$kv" <<< "$out" || bad "the kept files should be named: $out"
+    [[ -f "$root/modules/.kernel-pop-keep-$kv/kernel/old.ko" ]] || bad "the kept modules were deleted after a failed restore"
+    # Stops before dpkg ran (the package lock stays taken, a repair that would
+    # remove packages): /boot, the modules and the ESP are left as they are
+    for case in LOCK_HELD INTERRUPTED; do
+        out="$(export "$case=1"; SDBOOT=1 SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 APT_SIM="Remv nvidia-dkms-615 [1]" run_install "early-$case")" \
+            && bad "$case: do_install should stop before dpkg"
+        root="$tmp/inst-early-$case"
+        case "$case" in
+            LOCK_HELD) grep -q "still in use by packagekitd" <<< "$out" || bad "$case: the lock timeout was not reported: $out" ;;
+            INTERRUPTED) grep -q "would remove: nvidia-dkms-615" <<< "$out" || bad "$case: the refused repair was not reported: $out" ;;
+        esac
+        [[ -e "$root/dpkg-args" ]] && bad "$case: dpkg ran"
+        [[ -e "$root/ki-args" ]] && bad "$case: the ESP was rewritten: $(cat "$root/ki-args")"
+        grep -q "putting back" <<< "$out" && bad "$case: a stop before dpkg put files back: $out"
+        [[ "$(cat "$root/boot/vmlinuz-$kv")" == old-image && "$(cat "$root/boot/initrd.img-$kv")" == old-initrd && -f "$root/modules/$kv/kernel/old.ko" ]] \
+            || bad "$case: /boot or the modules changed"
+        [[ -z "$(compgen -G "$root/boot/.kernel-pop-keep-*")$(compgen -G "$root/modules/.kernel-pop-keep-*")" ]] || bad "$case: kept copies were left behind"
+    done
+    # The files are back but the ESP copy cannot follow: said so, no kept paths
+    out="$(SDBOOT=1 KI_FAIL=1 SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 run_install restore-esp)" && bad "do_install should fail when signing fails under Secure Boot"
+    grep -q "were put back, but its initramfs or its copy on the ESP could not follow" <<< "$out" || bad "a restore whose ESP copy failed: $out"
+    grep -q "what was kept of it is in" <<< "$out" && bad "kept paths named although every file was moved back: $out"
+    # Installed before but nothing kept: never purged, said so
+    out="$(NO_KEEP=1 SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 run_install nokeep)" && bad "do_install should fail when signing fails under Secure Boot"
+    grep -q "no copy of it was kept, so it was not removed" <<< "$out" || bad "existed without a kept copy: $out"
+    [[ -e "$tmp/inst-nokeep/apt-args" ]] && bad "a version installed before was purged without a kept copy"
+    # Stopped by a signal while dpkg runs: nothing is put back, the kept
+    # files stay and are named
+    out="$(SIG_DURING=1 SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled PREEXIST=1 run_install sigterm)" && bad "a stopped install should fail"
+    root="$tmp/inst-sigterm"
+    grep -q "was stopped (SIGTERM).*kept in .*\.kernel-pop-keep-$kv" <<< "$out" || bad "a signal should leave the kept files named: $out"
+    grep -q "putting back" <<< "$out" && bad "a signal must not put files back: $out"
+    [[ -f "$root/boot/.kernel-pop-keep-$kv/vmlinuz-$kv" && -f "$root/modules/.kernel-pop-keep-$kv/kernel/old.ko" ]] || bad "a signal deleted the kept files"
+    # Installed over an installed version, all well: the kept copies go
+    out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled PREEXIST=1 run_install over-ok)" || bad "a reinstall under Secure Boot failed: $out"
+    [[ "$(cat "$tmp/inst-over-ok/boot/vmlinuz-$kv")" == new-image ]] || bad "a good reinstall did not install the new kernel"
+    [[ -z "$(compgen -G "$tmp/inst-over-ok/boot/.kernel-pop-keep-*")$(compgen -G "$tmp/inst-over-ok/modules/.kernel-pop-keep-*")" ]] || bad "a good reinstall left the kept copies behind"
     # The image cannot be signed at all: refused before dpkg, an installed kernel untouched
     out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 TRIAL_FAIL=1 run_install trialfail)" && bad "do_install should refuse an image that cannot be signed"
     [[ -e "$tmp/inst-trialfail/dpkg-args" ]] && bad "dpkg ran although the image could not be signed"
@@ -957,12 +1082,42 @@ EOF2
     [[ "$(cat "$tmp/inst-espunsigned/apt-args" 2>/dev/null)" == "$APT_OPTS purge -y linux-headers-$kv linux-image-$kv" ]] \
         || bad "an unsigned ESP copy under Secure Boot should be rolled back, got [$(cat "$tmp/inst-espunsigned/apt-args" 2>/dev/null)]"
     grep -q "copy on the ESP the boot loader starts is not" <<< "$out" || bad "the rollback should say the ESP copy is unsigned: $out"
+    # No postrm hook removes a systemd-boot entry: the rollback does, or the
+    # unbootable kernel would stay the newest, default entry
+    grep -qx "remove $kv" "$tmp/inst-espunsigned/ki-args" || bad "the rollback did not remove the boot entry: $(cat "$tmp/inst-espunsigned/ki-args")"
+    [[ -e "$tmp/inst-espunsigned/esp/loader/entries/mid-$kv.conf" ]] && bad "the rolled-back kernel's boot entry is still there"
+    grep -q "Nothing is left installed" <<< "$out" || bad "the rollback should say nothing is left: $out"
     # The same with Secure Boot off: installed, one SIGN WARNING
     out="$(SDBOOT=1 ESP_UNSIGNED=1 WITH_KEY=1 SIGN_OK=1 run_install espunsigned-off)" || bad "Secure Boot off: an unsigned ESP copy must not fail the install: $out"
     [[ -e "$tmp/inst-espunsigned-off/apt-args" ]] && bad "Secure Boot off: an unsigned ESP copy must not be rolled back"
     [[ "$(count 'SIGN WARNING:' "$out")" == 1 ]] || bad "Secure Boot off: one SIGN WARNING for the ESP copy"
     # Signed in /boot and on the ESP: installed
     out="$(SDBOOT=1 SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled run_install espsigned)" || bad "a signed ESP copy should install: $out"
+
+    # systemd-boot without signing: the ESP still gets the final initramfs
+    # (the package hook copied the one from before DKMS), and the entry's
+    # files are checked
+    out="$(SDBOOT=1 run_install sd-unsigned)" || bad "systemd-boot install without signing failed: $out"
+    grep -qx "add $kv $tmp/inst-sd-unsigned/boot/vmlinuz-$kv $tmp/inst-sd-unsigned/boot/initrd.img-$kv" "$tmp/inst-sd-unsigned/ki-args" \
+        || bad "the ESP copy was not refreshed without signing: [$(cat "$tmp/inst-sd-unsigned/ki-args" 2>/dev/null)]"
+    grep -q "Verified: the kernel and initramfs" <<< "$out" || bad "the entry's files were not checked: $out"
+    # That copy fails (a full ESP): installed, with one DKMS WARNING
+    out="$(SDBOOT=1 KI_FAIL=1 run_install sd-kifail)" || bad "a failed ESP refresh should not fail the install: $out"
+    [[ "$(count 'DKMS WARNING:' "$out")" == 1 ]] || bad "a failed ESP refresh should give one DKMS WARNING: $out"
+    # No initramfs tool: refused before dpkg
+    out="$(NO_IRTOOL=1 run_install noir)" && bad "do_install should refuse without an initramfs tool"
+    [[ -e "$tmp/inst-noir/dpkg-args" ]] && bad "dpkg ran without an initramfs tool"
+    grep -q "No initramfs tool is installed.*Nothing was installed" <<< "$out" || bad "the refusal should name the missing tool: $out"
+    # dpkg fails and apt -f would remove another package: not run
+    out="$(DPKG_FAIL=1 APT_SIM="Remv nvidia-dkms-615 [615.78-1]" run_install aptf)" && bad "do_install should stop when apt -f would remove packages"
+    grep -q "would remove: nvidia-dkms-615" <<< "$out" || bad "the refusal should name the package: $out"
+    grep -q "install -f -y" "$tmp/inst-aptf/apt-args" 2>/dev/null && bad "apt-get -f ran although it would remove a package"
+    # ... or only the new packages themselves (nothing was replaced): allowed
+    out="$(DPKG_FAIL=1 APT_SIM="Remv linux-image-$kv [7.7.7-1]" run_install aptf-own)"
+    grep -q "install -f -y" "$tmp/inst-aptf-own/apt-args" 2>/dev/null || bad "apt-get -f should run when it only takes back the new packages: $out"
+    # The modules directory never appears: stop, never use another one
+    out="$(NO_MODULES=1 run_install nomods)" && bad "do_install should fail without the modules directory"
+    grep -q "did NOT appear after install" <<< "$out" || bad "a missing modules directory should be reported: $out"
 
     # Signing fails with Secure Boot off: kept, one SIGN WARNING, summary not counted
     out="$(WITH_KEY=1 run_install signfail-off)" || bad "do_install (sign fails, Secure Boot off) failed: $out"
@@ -1120,7 +1275,7 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     }
     rm -f "$tmp/int-calls"
     out="$(do_install_build_deps pahole 2>&1 3>&1)" || bad "the install should go on after finishing the interrupted run: $out"
-    [[ "$(cat "$tmp/int-calls")" == "dpkg --configure -a"$'\n'"apt-get $APT_OPTS install -f -y"$'\n'"apt-get $APT_OPTS install --reinstall -y tailscale"$'\n'"apt-get $APT_OPTS install -y pahole" ]] \
+    [[ "$(cat "$tmp/int-calls")" == "dpkg --configure -a"$'\n'"apt-get -s install -f"$'\n'"apt-get $APT_OPTS install -f -y"$'\n'"apt-get -s install --reinstall tailscale"$'\n'"apt-get $APT_OPTS install --reinstall -y tailscale"$'\n'"apt-get $APT_OPTS install -y pahole" ]] \
         || bad "interrupted-run repair got [$(cat "$tmp/int-calls")]"
     grep -q "interrupted earlier" <<<"$out" || bad "the repair should be shown: $out"
     grep -q "is finished — continuing" <<<"$out" || bad "the repair's end should be shown: $out"
@@ -1128,8 +1283,61 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     rm -f "$tmp/int-calls"
     do_install_build_deps pahole >/dev/null 2>&1
     [[ "$(cat "$tmp/int-calls")" == "apt-get $APT_OPTS install -y pahole" ]] || bad "a clean dpkg state still ran a repair: [$(cat "$tmp/int-calls")]"
+    # A repair that would remove packages is not run
+    : > "$tmp/dpkg/updates/0004"; echo broken > "$state"; rm -f "$tmp/int-calls"
+    apt-get() {
+        echo "apt-get $*" >> "$tmp/int-calls"
+        [[ "$1" == -s ]] && printf 'Remv nvidia-driver-615 [615.78-1]\nPurg libnvidia-gl-615 [615.78-1]\n'
+        return 0
+    }
+    out="$( (do_install_build_deps pahole) 2>&1 3>&1)" && bad "a repair that removes packages must stop the run"
+    grep -q "would remove: nvidia-driver-615 libnvidia-gl-615" <<<"$out" || bad "the refusal should name what would go: $out"
+    grep -q -- "install -f -y\|install -y pahole" "$tmp/int-calls" && bad "apt-get ran for real: [$(cat "$tmp/int-calls")]"
+    rm -f "$tmp/dpkg/updates/"*
     exit "$fails"
 ) || { echo "FAIL: interrupted dpkg group"; fails=$((fails + 1)); }
+
+# ── Removal: metapackages, boot entries ───────────────────────────────────
+(
+    fails=0
+    export KERNEL_POP_BOOT="$tmp/rm-boot" KERNEL_POP_MODULES="$tmp/rm-mods"
+    mkdir -p "$KERNEL_POP_BOOT" "$KERNEL_POP_MODULES"
+    rk=6.8.0-40-generic
+    touch "$KERNEL_POP_BOOT/vmlinuz-$rk"
+    dpkg-query() { printf 'ii  linux-image-%s\n' "$rk"; }
+    # apt simulates a purge with "Purg" lines
+    APT_SIM="Purg linux-image-$rk [6.8.0-40.40]"$'\n'"Purg linux-image-generic [6.8.0.40.40]"
+    apt-get() { if [[ "$1" == -s ]]; then echo "$APT_SIM"; return 0; fi; echo "$*" >> "$tmp/rm-apt"; }
+    detect_bootloader() { echo grub; }
+    update-grub() { :; }
+    rm -f "$tmp/rm-apt"
+    out="$( (do_remove "$rk") 2>&1)" && bad "removing a kernel the metapackage needs should be refused"
+    grep -q "kernel metapackage(s): linux-image-generic" <<<"$out" || bad "the metapackage (Purg) was not named: $out"
+    [[ -e "$tmp/rm-apt" ]] && bad "apt-get purged although a metapackage would go"
+    APT_SIM="Remv linux-generic [6.8.0.40.40]"
+    out="$( (do_remove "$rk") 2>&1)" && bad "a Remv of a metapackage should be refused too"
+    APT_SIM="Purg linux-image-$rk [6.8.0-40.40]"
+    # copies kept by an install stopped by a signal go with the version
+    mkdir -p "$KERNEL_POP_BOOT/.kernel-pop-keep-$rk" "$KERNEL_POP_MODULES/.kernel-pop-keep-$rk/kernel"
+    touch "$KERNEL_POP_BOOT/initrd.img-$rk.kept" "$KERNEL_POP_BOOT/.kernel-pop-keep-6.8.0-41-generic"
+    out="$( (do_remove "$rk") 2>&1)" || bad "a removal without metapackages failed: $out"
+    [[ -e "$KERNEL_POP_BOOT/.kernel-pop-keep-$rk" || -e "$KERNEL_POP_MODULES/.kernel-pop-keep-$rk" || -e "$KERNEL_POP_BOOT/initrd.img-$rk.kept" ]] \
+        && bad "the removed version's kept copies were left behind"
+    [[ -e "$KERNEL_POP_BOOT/.kernel-pop-keep-6.8.0-41-generic" ]] || bad "another version's kept copy was removed"
+    grep -q "purge -y linux-image-$rk" "$tmp/rm-apt" || bad "the kernel was not purged: [$(cat "$tmp/rm-apt" 2>/dev/null)]"
+    # systemd-boot without kernel-install: the entry goes on the ESP and on XBOOTLDR
+    (
+        resp="$tmp/rm-esp"; rxbl="$tmp/rm-xbl"
+        mkdir -p "$resp/loader/entries" "$rxbl/loader/entries"
+        printf 'version %s\n' "$rk" > "$rxbl/loader/entries/mid-$rk.conf"
+        detect_bootloader() { echo "systemd-boot $resp"; }
+        command() { [[ "$2" == kernel-install ]] && return 1; builtin command "$@"; }
+        KERNEL_POP_XBOOTLDR="$rxbl" remove_boot_entry "$rk" >/dev/null || exit 1
+        [[ -e "$rxbl/loader/entries/mid-$rk.conf" ]] && exit 2
+        exit 0
+    ) || bad "remove_boot_entry on XBOOTLDR case $?"
+    exit "$fails"
+) || { echo "FAIL: removal group"; fails=$((fails + 1)); }
 
 # ── shim in front of systemd-boot ────────────────────────────────────────
 (
@@ -1210,6 +1418,9 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     out="$(sign_boot_loader 2>&1)"
     grep -q "Signed systemd-boot" <<<"$out" || bad "a new systemd-boot was not signed: $out"
     [[ "$(head -1 "$KERNEL_POP_SDBOOT.signed")" == sdboot-new ]] || bad "the .signed copy is the old binary"
+    # bootctl skipped the copy: the older ESP copy, signed with the same key,
+    # is replaced all the same
+    cmp -s "$KERNEL_POP_SDBOOT.signed" "$cesp/EFI/systemd/systemd-bootx64.efi" || bad "the ESP kept the older signed systemd-boot"
 
     # A full ESP: a copy fails part way. No firmware entry may then point at
     # shim, the direct systemd-boot entry stays, and the loader already on
@@ -1217,7 +1428,7 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     fesp="$tmp/full-esp"
     mkdir -p "$fesp/EFI/systemd" "$fesp/EFI/BOOT"
     cp "$KERNEL_POP_SDBOOT" "$fesp/EFI/systemd/systemd-bootx64.efi"
-    echo old-loader > "$fesp/EFI/BOOT/BOOTX64.EFI"
+    cp "$KERNEL_POP_SDBOOT" "$fesp/EFI/BOOT/BOOTX64.EFI"     # bootctl's fallback copy: ours to replace
     printf 'Boot0001* Linux Boot Manager\tHD(1,GPT,x,0x800,0x219800)/\\EFI\\systemd\\systemd-bootx64.efi\n' > "$st"
     : > "$tmp/fw-calls"
     bootctl() { [[ "$1" == --print-esp-path ]] && echo "$fesp"; return 0; }
@@ -1229,8 +1440,34 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     out="$(setup_shim_chain "$fesp" 2>&1)" && bad "setup_shim_chain succeeded although a copy to the ESP failed"
     grep -q "SIGN WARNING: could not copy" <<<"$out" || bad "a failed ESP copy was not reported: $out"
     [[ ! -s "$tmp/fw-calls" ]] || bad "firmware entries changed although a copy to the ESP failed: $(cat "$tmp/fw-calls")"
-    [[ "$(cat "$fesp/EFI/BOOT/BOOTX64.EFI")" == old-loader ]] || bad "a failed copy damaged the loader on the ESP"
+    cmp -s "$fesp/EFI/BOOT/BOOTX64.EFI" "$KERNEL_POP_SDBOOT" || bad "a failed copy damaged the loader on the ESP"
+    # The fallback copy goes first: shim in EFI/ubuntu is not updated before
+    # it, so the next run still knows the fallback loader as ours
+    [[ -e "$fesp/EFI/ubuntu/shimx64.efi" ]] && bad "EFI/ubuntu was updated before the fallback copy"
     unset -f install
+
+    # An ESP shared with Windows: its fallback loader is left alone (and no
+    # fbx64 next to it), this system starts from its own firmware entry.
+    wesp="$tmp/win-esp"
+    mkdir -p "$wesp/EFI/systemd" "$wesp/EFI/BOOT"
+    cp "$KERNEL_POP_SDBOOT" "$wesp/EFI/systemd/systemd-bootx64.efi"
+    echo "Windows Boot Manager bootmgfw" > "$wesp/EFI/BOOT/BOOTX64.EFI"
+    printf 'Boot0001* Linux Boot Manager\tHD(1,GPT,x,0x800,0x219800)/\\EFI\\systemd\\systemd-bootx64.efi\n' > "$st"
+    bootctl() { [[ "$1" == --print-esp-path ]] && echo "$wesp"; return 0; }
+    out="$(setup_shim_chain "$wesp" 2>&1)" || bad "setup_shim_chain failed on a shared ESP: $out"
+    [[ "$(cat "$wesp/EFI/BOOT/BOOTX64.EFI")" == "Windows Boot Manager bootmgfw" ]] || bad "another system's fallback loader was replaced"
+    [[ -e "$wesp/EFI/BOOT/fbx64.efi" ]] && bad "fbx64 was put next to another system's fallback loader"
+    grep -q "Left .*BOOTX64.EFI alone" <<<"$out" || bad "leaving the fallback loader alone was not explained: $out"
+    [[ -n "$(shim_sdboot_entries)" ]] || bad "no shim firmware entry on a shared ESP"
+    # Writing the CSV fails part way (full ESP): the old one stays whole
+    printf 'shimx64.efi,Ubuntu,,This is the boot entry for Ubuntu\n' | iconv -t UCS-2LE > "$wesp/EFI/ubuntu/BOOTX64.CSV"
+    cp "$wesp/EFI/ubuntu/BOOTX64.CSV" "$tmp/csv-before"
+    (
+        iconv() { if [[ "$*" == "-t UCS-2LE" ]]; then printf 'sh'; return 1; fi; command iconv "$@"; }
+        setup_shim_chain "$wesp" >/dev/null 2>&1
+    ) && bad "setup_shim_chain succeeded although the CSV could not be written"
+    cmp -s "$wesp/EFI/ubuntu/BOOTX64.CSV" "$tmp/csv-before" || bad "a failed CSV write damaged the CSV"
+    [[ -e "$wesp/EFI/ubuntu/BOOTX64.CSV.kernel-pop-new" ]] && bad "a failed CSV write left its temp file"
     bootctl() { [[ "$1" == --print-esp-path ]] && echo "$cesp"; return 0; }
 
     # The kernel hook signs only a kernel without any signature
@@ -1297,6 +1534,18 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     dkms() { [[ "$1" == status ]] && echo "gpu-unlock/1.0.0, 7.2.6-070206-generic, x86_64: installed"; return 0; }
     out="$(setup_dkms_key 2>&1)"
     grep -q "SIGN WARNING: gpu-unlock 1.0.0 for 7.2.6-070206-generic was rebuilt but is still not signed" <<<"$out" || bad "an unsigned rebuild was not reported: $out"
+    # DKMS 2 prints "name, version, kernel, arch: state": read the same way
+    : > "$tmp/dkms-calls"
+    dkms() {
+        case "$1" in
+            status) echo "gpu-unlock, 1.0.0, 7.2.6-070206-generic, x86_64: installed"; echo "old, 1, 6.1.0-1-generic, x86_64: built" ;;
+            *) echo "dkms $*" >> "$tmp/dkms-calls" ;;
+        esac
+        return 0
+    }
+    setup_dkms_key >/dev/null 2>&1
+    [[ "$(cat "$tmp/dkms-calls")" == $'dkms build --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic\ndkms install --force -m gpu-unlock -v 1.0.0 -k 7.2.6-070206-generic' ]] \
+        || bad "DKMS 2 status lines: [$(cat "$tmp/dkms-calls")]"
     # A module named after its package ("$PACKAGE_NAME", as many dkms.conf
     # files write it) is found, and judged by its signature
     mkdir -p "$KERNEL_POP_DKMS_TREE/v4l2loopback/0.13.2/source"
@@ -1307,6 +1556,14 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" || bad "a \${PACKAGE_NAME} module signed with the key counted as unsigned"
     echo "11:22:33:44" > "$kd/v4l2loopback.ko.zst"
     dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" && bad "a \${PACKAGE_NAME} module signed with another key counted as signed"
+    # Single quotes, and no BUILT_MODULE_NAME at all (the package's name then)
+    echo "9B:1B:75:AD" > "$kd/v4l2loopback.ko.zst"
+    printf "PACKAGE_NAME='v4l2loopback'\nBUILT_MODULE_NAME[0]='v4l2loopback'\n" > "$KERNEL_POP_DKMS_TREE/v4l2loopback/0.13.2/source/dkms.conf"
+    dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" || bad "a single-quoted module name was not found"
+    printf 'PACKAGE_NAME="v4l2loopback"\nMAKE[0]="make"\n' > "$KERNEL_POP_DKMS_TREE/v4l2loopback/0.13.2/source/dkms.conf"
+    dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" || bad "without BUILT_MODULE_NAME the package's module was not found"
+    echo "11:22:33:44" > "$kd/v4l2loopback.ko.zst"
+    dkms_package_signed v4l2loopback 0.13.2 7.2.6-070206-generic "$(cert_key_ids)" && bad "without BUILT_MODULE_NAME a module signed with another key counted as signed"
     export KERNEL_POP_MODULES="$saved_modules" KERNEL_POP_BOOT="$saved_boot"
     unset -f modinfo cert_key_ids generate_initramfs refresh_esp_copy
 
@@ -1400,6 +1657,18 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     queue_key_enrollment() { echo queue >> "$order"; die "import failed"; }
     (printf 'Secret-pw1\n' | do_setup_signing >/dev/null 2>&1) && bad "setup should fail when the enrollment fails"
     grep -q chain "$order" && bad "the shim chain was set up although the enrollment failed"
+    # An already-signed kernel whose ESP copy is not signed (an earlier copy
+    # failed): copied again
+    : > "$order"
+    queue_key_enrollment() { :; }
+    installed_kvers() { printf '9.9.1-old\n9.9.2-ok\n'; }
+    kernel_signed() { return 0; }
+    write_signed_marker() { :; }
+    esp_copy_signed() { [[ "$1" == 9.9.2-ok ]]; }
+    sync_signed_to_esp() { echo "sync $1" >> "$order"; }
+    printf 'Secret-pw1\n' | do_setup_signing >/dev/null 2>&1 || bad "do_setup_signing failed with signed kernels"
+    grep -qx "sync 9.9.1-old" "$order" || bad "an unsigned ESP copy of a signed kernel was not copied again: [$(cat "$order")]"
+    grep -q "sync 9.9.2-ok" "$order" && bad "a signed ESP copy was copied again"
     exit "$fails"
 ) || { echo "FAIL: setup order group"; fails=$((fails + 1)); }
 

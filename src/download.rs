@@ -151,13 +151,29 @@ where
             }
         }
         if !failed {
-            file.flush().await?;
-            return Ok(());
+            // The last buffered write can fail here (a full disk): retried
+            // like a failed write, its .part file gone.
+            match flush_part(file, dest).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = e,
+            }
+            continue;
         }
         let _ = tokio::fs::remove_file(dest).await;
     }
 
     Err(last_err).context(format!("Download failed after {} attempts", MAX_RETRIES))
+}
+
+/// Flushes a finished `.part` file. On failure the file is deleted and the
+/// error returned.
+async fn flush_part<W: tokio::io::AsyncWrite + Unpin>(mut file: W, dest: &Path) -> Result<()> {
+    if let Err(e) = file.flush().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// One file to download: where from, and its name in the target directory.
@@ -349,6 +365,33 @@ mod tests {
         assert!(is_cancelled(&result.unwrap_err()));
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(or_cancel(&AtomicBool::new(false), async { 7 }).await.unwrap(), 7);
+    }
+
+    /// A writer whose last flush fails, as a full disk makes it.
+    struct FullDisk;
+    impl tokio::io::AsyncWrite for FullDisk {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(28)))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_deletes_the_part_file() {
+        let part = std::env::temp_dir().join(format!("kernel-pop-test-flush-{}.part", std::process::id()));
+        std::fs::write(&part, b"partial").unwrap();
+        let err = flush_part(FullDisk, &part).await.unwrap_err();
+        assert!(err.to_string().contains("No space left"), "{err}");
+        assert!(!part.exists());
+        std::fs::write(&part, b"whole").unwrap();
+        flush_part(tokio::fs::File::create(&part).await.unwrap(), &part).await.unwrap();
+        assert!(part.exists());
+        std::fs::remove_file(&part).unwrap();
     }
 
     #[test]
