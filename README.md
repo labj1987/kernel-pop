@@ -325,7 +325,8 @@ signed with a key that is enrolled or waiting for enrollment:
   removed again, with its systemd-boot entry, so no kernel that shim would
   refuse is left in the boot menu. A rebuild of a version that was already
   installed (the running kernel, say) is never removed: the kernel and
-  modules from before are put back and its initramfs made again.
+  modules from before are put back with its initramfs. The same happens when
+  the install stops for any other reason before it has finished.
 - If the key is still waiting for enrollment, the kernel is installed and
   signed, and the install reminds you to confirm the enrollment at the MOK
   Manager screen on the next reboot; skip that and it will not boot.

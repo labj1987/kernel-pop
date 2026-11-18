@@ -885,6 +885,10 @@ EOF2
                 echo old-image > "$KERNEL_POP_BOOT/vmlinuz-$kv"; echo old-initrd > "$KERNEL_POP_BOOT/initrd.img-$kv"
                 mkdir -p "$KERNEL_POP_MODULES/$kv/kernel"; echo old > "$KERNEL_POP_MODULES/$kv/kernel/old.ko"
             fi
+            # Only a modules directory left from an earlier kernel of that version
+            if [[ -n "${LONE_MODS:-}" ]]; then mkdir -p "$KERNEL_POP_MODULES/$kv"; echo stale > "$KERNEL_POP_MODULES/$kv/stale.ko"; fi
+            [[ -n "${NO_ROOM:-}" ]] && boot_free_bytes() { echo 0; }
+            [[ -n "${RESTORE_MV_FAIL:-}" ]] && mv() { [[ "$1" == -T ]] && return 1; command mv "$@"; }
             # Like dpkg: new files are written aside and renamed over the old
             # names; the systemd-boot hook writes an entry and copies the kernel.
             dpkg() {
@@ -922,7 +926,7 @@ EOF2
             else
                 detect_bootloader() { echo "grub"; }
             fi
-            update-grub() { :; }
+            update-grub() { [[ -z "${GRUB_FAIL:-}" ]]; }
             grub-editenv() { echo "saved_entry=$(cat "$root/saved")"; }
             grub-set-default() { echo "$1" > "$root/saved"; }
             grub-reboot() { echo "$1" > "$root/next"; }
@@ -998,8 +1002,29 @@ EOF2
     [[ -e "$root/apt-args" ]] && bad "a version installed before was purged: $(cat "$root/apt-args")"
     [[ "$(cat "$root/boot/vmlinuz-$kv")" == old-image ]] || bad "the kernel from before was not put back"
     [[ -f "$root/modules/$kv/kernel/old.ko" && ! -e "$root/modules/$kv/new.ko" ]] || bad "the modules from before were not put back"
-    [[ "$(cat "$root/boot/initrd.img-$kv")" == "initrd from kernel " ]] || bad "the initramfs was not made again from the old modules: $(cat "$root/boot/initrd.img-$kv")"
+    [[ "$(cat "$root/boot/initrd.img-$kv")" == old-initrd ]] || bad "the kept initramfs was not put back: $(cat "$root/boot/initrd.img-$kv")"
     [[ -z "$(compgen -G "$root/boot/.kernel-pop-keep-*")$(compgen -G "$root/modules/.kernel-pop-keep-*")" ]] || bad "the kept copies were left behind"
+    # No room in /boot for a copy of the initramfs: made again from the old modules
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 NO_ROOM=1 run_install signfail-noroom)" && bad "do_install should fail when signing fails under Secure Boot"
+    [[ "$(cat "$tmp/inst-signfail-noroom/boot/initrd.img-$kv")" == "initrd from kernel " ]] || bad "the initramfs was not made again from the old modules: $(cat "$tmp/inst-signfail-noroom/boot/initrd.img-$kv")"
+    # Only a leftover modules directory: nothing was installed before, so the
+    # new packages are purged and the leftover goes too
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled LONE_MODS=1 run_install lonemods)" && bad "do_install should fail when signing fails under Secure Boot"
+    root="$tmp/inst-lonemods"
+    grep -q "Nothing is left installed" <<< "$out" || bad "a leftover modules directory was taken for an installed kernel: $out"
+    [[ "$(cat "$root/apt-args" 2>/dev/null)" == "$APT_OPTS purge -y linux-headers-$kv linux-image-$kv" ]] || bad "the new packages were not purged: [$(cat "$root/apt-args" 2>/dev/null)]"
+    [[ -e "$root/modules/$kv" ]] && bad "the leftover modules directory stayed"
+    # A stop after dpkg that is not a rollback (update-grub fails): the
+    # version from before is put back all the same
+    out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled PREEXIST=1 GRUB_FAIL=1 run_install grubfail)" && bad "do_install should fail when update-grub fails"
+    root="$tmp/inst-grubfail"
+    grep -q "putting back the $kv installed before" <<< "$out" || bad "a stop after dpkg did not put the old version back: $out"
+    [[ "$(cat "$root/boot/vmlinuz-$kv")" == old-image && -f "$root/modules/$kv/kernel/old.ko" ]] || bad "a stop after dpkg left the new build in place"
+    # Putting back fails part way: what is left stays kept, and is named
+    out="$(SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 RESTORE_MV_FAIL=1 run_install restorefail)" && bad "do_install should fail when signing fails under Secure Boot"
+    root="$tmp/inst-restorefail"
+    grep -q "what was kept of it is in .*\.kernel-pop-keep-$kv" <<< "$out" || bad "the kept files should be named: $out"
+    [[ -f "$root/modules/.kernel-pop-keep-$kv/kernel/old.ko" ]] || bad "the kept modules were deleted after a failed restore"
     # Installed over an installed version, all well: the kept copies go
     out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled PREEXIST=1 run_install over-ok)" || bad "a reinstall under Secure Boot failed: $out"
     [[ "$(cat "$tmp/inst-over-ok/boot/vmlinuz-$kv")" == new-image ]] || bad "a good reinstall did not install the new kernel"
@@ -1372,6 +1397,9 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     grep -q "SIGN WARNING: could not copy" <<<"$out" || bad "a failed ESP copy was not reported: $out"
     [[ ! -s "$tmp/fw-calls" ]] || bad "firmware entries changed although a copy to the ESP failed: $(cat "$tmp/fw-calls")"
     cmp -s "$fesp/EFI/BOOT/BOOTX64.EFI" "$KERNEL_POP_SDBOOT" || bad "a failed copy damaged the loader on the ESP"
+    # The fallback copy goes first: shim in EFI/ubuntu is not updated before
+    # it, so the next run still knows the fallback loader as ours
+    [[ -e "$fesp/EFI/ubuntu/shimx64.efi" ]] && bad "EFI/ubuntu was updated before the fallback copy"
     unset -f install
 
     # An ESP shared with Windows: its fallback loader is left alone (and no

@@ -232,12 +232,16 @@ enforcing, `--install` requires the key set, the sbsign tools and a key
 that is enrolled or queued (`secure_boot_preflight`, before dpkg; the app
 checks the same in `install_blocker` and refuses up front). If signing
 then fails, `rollback_and_die` undoes the install and the run fails: new
-packages are purged and their boot entry removed (`remove_boot_entry`: no
-postrm hook removes a systemd-boot entry); a version that was installed
-before (a rebuild, maybe of the running kernel) is never purged, its
-kernel, System.map, config and modules are kept before dpkg
-(`keep_installed_kernel`, hard links) and moved back, and its initramfs is
-generated again. Everything the steps after dpkg need (an initramfs tool,
+packages are purged, a leftover `/lib/modules/<kver>` removed and their
+boot entry removed (`remove_boot_entry`: no postrm hook removes a
+systemd-boot entry); a version that was installed before (its
+`/boot/vmlinuz-<kver>` is there; a rebuild, maybe of the running kernel) is
+never purged: its kernel, System.map, config and modules are kept before
+dpkg (`keep_installed_kernel`, hard links), its initramfs copied when
+`/boot` has room (else generated again on restore), and moved back. Any
+other stop after the copy and before the install finished puts it back too
+(`kept_kernel_on_exit`, the EXIT trap); a restore that fails part way leaves
+the rest where it was kept and names the paths. Everything the steps after dpkg need (an initramfs tool,
 kernel-install or kernelstub) is checked before dpkg. A queued key is fine: the kernel
 boots once MOK Manager enrolls it.
 
@@ -325,7 +329,8 @@ boots once MOK Manager enrolls it.
   `EFI/<os-release ID>/`, shim at `EFI/BOOT/BOOTX64.EFI` only over a
   fallback loader that is ours (`fallback_is_ours`: none, shim, or
   systemd-boot; never Windows' or another distribution's, and then no
-  fbx64 either), UCS-2LE `BOOTX64.CSV` (written tmp + mv)
+  fbx64 either; copied before `EFI/<vendor>`, so a run that fails part way
+  still sees it as ours next time), UCS-2LE `BOOTX64.CSV` (written tmp + mv)
   byte-identical to install_shim's, firmware entry
   `<Vendor>` = `EFI/<vendor>/shimx64.efi` with load option
   `\EFI\systemd\systemd-bootx64.efi \0`), done by the script itself so it

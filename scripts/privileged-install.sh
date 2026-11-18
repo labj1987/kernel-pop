@@ -917,17 +917,18 @@ trial_sign_image() {
     log "Checked: the kernel image of $kver can be signed"
 }
 
-# A kernel version that is installed already (a rebuild, maybe of the
-# running kernel) is never purged by a rollback: that would take the working
-# kernel with it. Before dpkg replaces it, its kernel, System.map, config and
-# modules are kept: hard links (dpkg writes new files and renames them over
-# the old names, so the links keep the old contents), copies where /boot
-# cannot hold links. A rollback moves them back and generates the initramfs
-# again from the old modules (dracut rewrites an initramfs in place, so a
-# link would not keep it).
-KEEP_BOOT="" KEEP_MODS=""
+# A kernel version that is installed already (its /boot/vmlinuz is there: a
+# rebuild, maybe of the running kernel) is never purged by a rollback: that
+# would take the working kernel with it. Before dpkg replaces it, its kernel,
+# System.map, config and modules are kept: hard links (dpkg writes new files
+# and renames them over the old names, so the links keep the old contents),
+# copies where /boot cannot hold links. Its initramfs is copied when /boot
+# has room (dracut rewrites an initramfs in place, so a link would not keep
+# it); otherwise it is generated again from the old modules. Any stop after
+# that, before the install has finished, puts them back (kept_kernel_on_exit).
+KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
 keep_installed_kernel() {
-    local kver="$1" boot mods f
+    local kver="$1" boot mods f size avail
     boot="$(boot_dir)"
     mods="$(modules_dir)"
     KEEP_BOOT="$boot/.kernel-pop-keep-$kver"
@@ -938,36 +939,52 @@ keep_installed_kernel() {
         [[ -e "$boot/$f-$kver" ]] || continue
         ln "$boot/$f-$kver" "$KEEP_BOOT/" 2>/dev/null || cp -p "$boot/$f-$kver" "$KEEP_BOOT/" || return 1
     done
+    [[ -f "$KEEP_BOOT/vmlinuz-$kver" ]] || return 1
+    if [[ -f "$boot/initrd.img-$kver" ]]; then
+        # Room for the copy and for the new build's initramfs next to it.
+        size="$(stat -c %s "$boot/initrd.img-$kver")"
+        avail="$(boot_free_bytes "$boot")"
+        if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail > 3 * size )); then
+            cp -p "$boot/initrd.img-$kver" "$KEEP_BOOT/" || rm -f "$KEEP_BOOT/initrd.img-$kver"
+        fi
+    fi
     if [[ -d "$mods/$kver" ]]; then
         cp -al "$mods/$kver" "$KEEP_MODS" 2>/dev/null || { rm -rf "$KEEP_MODS"; cp -a "$mods/$kver" "$KEEP_MODS"; } || return 1
     fi
+    KEEP_KVER="$kver"
 }
+
+# Free bytes on the filesystem holding <dir>.
+boot_free_bytes() { df -PB1 "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
 
 drop_kept_kernel() {
     [[ -n "$KEEP_BOOT" ]] && rm -rf "$KEEP_BOOT"
     [[ -n "$KEEP_MODS" ]] && rm -rf "$KEEP_MODS"
+    KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
     return 0
 }
 
+# Where the kept files are, for a message.
+kept_paths() { echo "$KEEP_BOOT${KEEP_MODS:+ and $KEEP_MODS}"; }
+
 # Put the kept files of <kver> back and bring the boot loader's copy in line
-# with them. Non-zero when something could not be put back.
+# with them. Non-zero when something could not be put back; whatever was not
+# moved back stays where it was kept (named in the log), never deleted.
 restore_kept_kernel() {
     local kver="$1" boot mods f
     boot="$(boot_dir)"
     mods="$(modules_dir)"
-    [[ -d "$KEEP_BOOT" ]] || return 1
-    for f in "$KEEP_BOOT"/*; do
-        [[ -e "$f" ]] || continue
-        # Still the same file: nothing replaced it.
-        if [[ "$f" -ef "$boot/${f##*/}" ]]; then rm -f "$f"; continue; fi
-        mv -f "$f" "$boot/" || return 1
-    done
-    if [[ -d "$KEEP_MODS" ]]; then
-        rm -rf "${mods:?}/${kver:?}" && mv -T "$KEEP_MODS" "$mods/$kver" || return 1
+    if ! restore_kept_files "$kver"; then
+        log "Could not put back every kept file of $kver; what is left is in $(kept_paths)"
+        KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
+        return 1
     fi
-    rmdir "$KEEP_BOOT" 2>/dev/null || true
-    KEEP_BOOT="" KEEP_MODS=""
-    generate_initramfs "$kver" && [[ -f "$boot/initrd.img-$kver" ]] || return 1
+    KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
+    if [[ -f "$boot/initrd.img-$kver.kept" ]]; then
+        mv -f "$boot/initrd.img-$kver.kept" "$boot/initrd.img-$kver" || return 1
+    else
+        generate_initramfs "$kver" && [[ -f "$boot/initrd.img-$kver" ]] || return 1
+    fi
     if signing_key_present && kernel_signed "$kver"; then
         write_signed_marker "$kver" || true
         sync_signed_to_esp "$kver" || return 1
@@ -978,18 +995,54 @@ restore_kept_kernel() {
     log "Put back the $kver installed before: its kernel, initramfs and modules"
 }
 
+# The file moves of restore_kept_kernel. The kept initramfs goes back under
+# a temporary name (initrd.img-<kver>.kept), renamed over the new one last.
+restore_kept_files() {
+    local kver="$1" boot mods f name
+    boot="$(boot_dir)"
+    mods="$(modules_dir)"
+    [[ -d "$KEEP_BOOT" ]] || return 1
+    for f in "$KEEP_BOOT"/*; do
+        [[ -e "$f" ]] || continue
+        name="${f##*/}"
+        [[ "$name" == "initrd.img-$kver" ]] && name="$name.kept"
+        # Still the same file: nothing replaced it.
+        if [[ "$f" -ef "$boot/$name" ]]; then rm -f "$f"; continue; fi
+        mv -f "$f" "$boot/$name" || return 1
+    done
+    if [[ -d "$KEEP_MODS" ]]; then
+        rm -rf "${mods:?}/${kver:?}" && mv -T "$KEEP_MODS" "$mods/$kver" || return 1
+    fi
+    rmdir "$KEEP_BOOT" 2>/dev/null || true
+}
+
+# The EXIT trap of an install: a run that stopped after the kept copy was
+# made and before the install finished puts the version from before back,
+# since what dpkg left may be unsigned or half installed. Chosen over only
+# naming the kept files: with Secure Boot enforcing, that version may be the
+# running kernel, and an unsigned one in its place would not boot again.
+kept_kernel_on_exit() {
+    [[ -n "$KEEP_KVER" ]] || return 0
+    log "The install stopped before $KEEP_KVER was ready: putting back the $KEEP_KVER installed before…"
+    restore_kept_kernel "$KEEP_KVER" \
+        || log "WARNING: the $KEEP_KVER installed before could not be put back completely — it may NOT boot while Secure Boot is enforcing (see above)"
+    return 0
+}
+
 # Undo a just-finished dpkg install with Secure Boot enforcing, where the new
 # kernel could not boot (signing failed, or its ESP copy is unsigned), then
-# stop with <why>. A version installed before is put back from the kept
-# files; a new one is purged and its boot menu entry removed (no postrm hook
-# removes a systemd-boot entry).
+# stop with <why>. A version installed before (<existed> 1) is never purged:
+# it is put back from the kept files. A new one is purged, its leftover
+# modules directory and its boot menu entry removed (no postrm hook removes
+# a systemd-boot entry).
 rollback_and_die() {
-    local dir="$1" kver="$2" why="$3" d pkgs=()
-    if [[ -n "$KEEP_BOOT" ]]; then
-        if restore_kept_kernel "$kver"; then
+    local dir="$1" kver="$2" existed="$3" why="$4" d pkgs=() kept
+    if (( existed )); then
+        kept="$(kept_paths)"
+        if [[ -n "$KEEP_KVER" ]] && restore_kept_kernel "$kver"; then
             die "$why With Secure Boot enforcing the new build could not boot, so the $kver installed before was put back as it was (kernel, initramfs and modules; the headers are the new build's). Try again, or check the signing setup on the System tab."
         fi
-        die "$why The $kver installed before could not be put back completely, so it may NOT boot while Secure Boot is enforcing. Boot another kernel and install $kver again."
+        die "$why The $kver installed before could not be put back completely, so it may NOT boot while Secure Boot is enforcing; what was kept of it is in $kept. Boot another kernel and install $kver again."
     fi
     if [[ "$kver" == "$(uname -r)" ]]; then
         die "$why $kver is the running kernel, so it was not removed — it will NOT boot again while Secure Boot is enforcing. Install a kernel that boots before rebooting."
@@ -1001,6 +1054,9 @@ rollback_and_die() {
     if ! apt_get purge -y "${pkgs[@]}" >>"$LOGFILE" 2>&1; then
         die "$why $kver could not be removed again — it will NOT boot while Secure Boot is enforcing. Remove it on the System tab before rebooting."
     fi
+    # Files dpkg did not own (a modules directory left from an earlier
+    # kernel of that version) go too: nothing of $kver was installed before.
+    rm -rf "$(modules_dir)/${kver:?}"
     remove_signed_marker "$kver"
     if ! remove_boot_entry "$kver"; then
         die "$why With Secure Boot enforcing it could not boot, so it was removed again, but its boot menu entry may still be there: choose another kernel in the boot menu."
@@ -1012,9 +1068,9 @@ rollback_and_die() {
 # ESP is not known to be. With Secure Boot enforcing it could not boot, so the
 # install is undone like a failed signing; with it off it is a warning.
 esp_copy_unsigned() {
-    local dir="$1" kver="$2"
+    local dir="$1" kver="$2" existed="$3"
     if secure_boot_enforcing; then
-        rollback_and_die "$dir" "$kver" "$kver was signed, but the copy on the ESP the boot loader starts is not (see the SIGN WARNING above)."
+        rollback_and_die "$dir" "$kver" "$existed" "$kver was signed, but the copy on the ESP the boot loader starts is not (see the SIGN WARNING above)."
     fi
     SIGN_FAILED=$((SIGN_FAILED + 1))
     log "$kver is installed, but its ESP copy is not signed: it boots only while Secure Boot is off"
@@ -1197,7 +1253,7 @@ do_install() {
     # Everything below works on the private, verified copy only.
     STAGE_DIR="$(umask 077 && mktemp -d "${KERNEL_POP_STAGING:-/var/tmp}/kernel-pop-install.XXXXXX")" \
         || die "Could not create a private staging directory"
-    trap 'rm -rf "$STAGE_DIR"; drop_kept_kernel' EXIT
+    trap 'rm -rf "$STAGE_DIR"; kept_kernel_on_exit' EXIT
     stage_verified_debs "$src" "$STAGE_DIR"
     local dir="$STAGE_DIR"
 
@@ -1228,8 +1284,10 @@ do_install() {
     # is signed once here first, on a copy in the private staging dir: a
     # failure stops before anything is installed.
     local existed=0 image_deb="" own_pkgs=()
-    dpkg-query -W -f '${Status}' "linux-image-$kver" 2>/dev/null | grep -q 'install ok installed' && existed=1
-    [[ -e "$boot/vmlinuz-$kver" || -d "$mods/$kver" ]] && existed=1
+    # Installed before: its kernel image is there (a modules directory alone
+    # is a leftover, and a package without its image is broken: neither is
+    # worth keeping).
+    [[ -f "$boot/vmlinuz-$kver" ]] && existed=1
     for d in "${debs[@]}"; do
         own_pkgs+=("$(dpkg-deb -f "$d" Package)")
         [[ "$(dpkg-deb -f "$d" Package)" == "linux-image-$kver" ]] && image_deb="$d"
@@ -1252,14 +1310,14 @@ do_install() {
                 || die "systemd-boot is the boot loader, but kernel-install (systemd) is missing, so $kver would get no boot menu entry. Nothing was installed." ;;
         kernelstub)
             command -v kernelstub >/dev/null 2>&1 \
-                || die "kernelstub is configured, but the kernelstub command is missing, so $kver would not be copied to the ESP. Nothing was installed." ;;
+                || die "kernelstub is configured (/etc/kernelstub/configuration is there), but the kernelstub command is missing, so $kver would not be copied to the ESP. Nothing was installed. If kernelstub is no longer used, that file is a leftover: remove it, then try again." ;;
     esac
 
     # A rollback (Secure Boot enforcing, the new build cannot boot) puts an
     # installed version back instead of purging it.
     if (( existed )) && secure_boot_enforcing; then
         keep_installed_kernel "$kver" \
-            || die "Could not keep a copy of the $kver installed now (is /boot full?), which a failed signing would need to put it back. Nothing was installed."
+            || { drop_kept_kernel; die "Could not keep a copy of the $kver installed now (is /boot full?), which a failed signing would need to put it back. Nothing was installed."; }
     fi
 
     log "Installing ${#debs[@]} packages…"
@@ -1297,7 +1355,7 @@ do_install() {
         if sign_kernel "$kver"; then
             signed_now=1
         elif secure_boot_enforcing; then
-            rollback_and_die "$dir" "$kver" "$kver could not be signed (see the SIGN WARNING above)."
+            rollback_and_die "$dir" "$kver" "$existed" "$kver could not be signed (see the SIGN WARNING above)."
         else
             SIGN_FAILED=$((SIGN_FAILED + 1))
             log "$kver was installed but could not be signed (see the SIGN WARNING above)"
@@ -1343,7 +1401,7 @@ do_install() {
                 [[ -n "$efi_img" ]] || die "No EFI/Pop_OS-*/$slot under $esp after install — kernelstub did not sync. Try 'kernelstub -p' — DO NOT reboot expecting the new kernel"
                 log "Verified: kernelstub image $efi_img exists"
                 if (( signed_now )); then
-                    sync_signed_to_esp "$kver" || esp_copy_unsigned "$dir" "$kver"
+                    sync_signed_to_esp "$kver" || esp_copy_unsigned "$dir" "$kver" "$existed"
                 else
                     refresh_esp_copy "$kver" || esp_initrd_stale "$kver"
                 fi
@@ -1360,7 +1418,7 @@ do_install() {
             [[ -n "$entry" ]] || die "No systemd-boot entry appeared for $kver in $esp/loader/entries (or on the XBOOTLDR partition) — DO NOT reboot expecting it in the menu"
             log "Verified: boot menu entry $entry exists"
             if (( signed_now )); then
-                sync_signed_to_esp "$kver" || esp_copy_unsigned "$dir" "$kver"
+                sync_signed_to_esp "$kver" || esp_copy_unsigned "$dir" "$kver" "$existed"
             else
                 refresh_esp_copy "$kver" || esp_initrd_stale "$kver"
             fi
@@ -1813,7 +1871,7 @@ fallback_is_ours() {
         [[ -s "$f" ]] && cmp -s "$f" "$cur" && return 0
     done
     # A systemd-boot of another version names itself in its binary.
-    grep -aq 'systemd-boot' "$cur" 2>/dev/null && ! grep -aq 'Windows Boot Manager' "$cur" 2>/dev/null
+    grep -aq 'systemd-boot' "$cur" 2>/dev/null
 }
 
 # The ESP and firmware side, after install_shim_packages and after the key
@@ -1832,11 +1890,9 @@ setup_shim_chain() {
     sign_boot_loader || return 1
     # Every copy must be in place before a firmware entry points at it or the
     # direct systemd-boot entries go.
-    for f in shim fb mm; do
-        [[ -f "$lib/${f}x64.efi.signed" ]] || continue
-        esp_install "$lib/${f}x64.efi.signed" "$esp/EFI/$vendor/${f}x64.efi" || return 1
-    done
-    # The fallback path: shim there, and fbx64 recreates the firmware entry
+    # The fallback path first: it counts as ours by comparing it with the
+    # shim in EFI/<vendor>, so if a copy fails part way the next run still
+    # sees it as ours. Shim there, and fbx64 recreates the firmware entry
     # from the CSV after a firmware reset. GRUB's CSV passes nothing, which
     # would point shim at GRUB. Only over a fallback loader that is this
     # system's (shim, or systemd-boot as bootctl puts it there) or none: on
@@ -1850,6 +1906,10 @@ setup_shim_chain() {
     else
         log "Left $esp/EFI/BOOT/BOOTX64.EFI alone: it is another system's boot loader (Windows or another distribution), not shim or systemd-boot. This system starts from its own firmware entry."
     fi
+    for f in shim fb mm; do
+        [[ -f "$lib/${f}x64.efi.signed" ]] || continue
+        esp_install "$lib/${f}x64.efi.signed" "$esp/EFI/$vendor/${f}x64.efi" || return 1
+    done
     csv="$esp/EFI/$vendor/BOOTX64.CSV"
     if ! iconv -f UCS-2LE -t UTF-8 "$csv" 2>/dev/null | grep -q 'systemd-bootx64\.efi'; then
         # Written next to it and renamed over it: a full ESP never leaves a
