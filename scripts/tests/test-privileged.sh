@@ -888,12 +888,17 @@ EOF2
             # Only a modules directory left from an earlier kernel of that version
             if [[ -n "${LONE_MODS:-}" ]]; then mkdir -p "$KERNEL_POP_MODULES/$kv"; echo stale > "$KERNEL_POP_MODULES/$kv/stale.ko"; fi
             [[ -n "${NO_ROOM:-}" ]] && boot_free_bytes() { echo 0; }
+            [[ -n "${NO_KEEP:-}" ]] && keep_installed_kernel() { :; }
+            # shellcheck disable=SC2034  # read by wait_for_package_lock
+            [[ -n "${LOCK_HELD:-}" ]] && { package_lock_holder() { echo "4883 packagekitd"; }; LOCK_WAIT=0; }
             [[ -n "${RESTORE_MV_FAIL:-}" ]] && mv() { [[ "$1" == -T ]] && return 1; command mv "$@"; }
             # Like dpkg: new files are written aside and renamed over the old
             # names; the systemd-boot hook writes an entry and copies the kernel.
             dpkg() {
+                [[ "$1" == --audit && -n "${INTERRUPTED:-}" ]] && echo "half-configured: nvidia-dkms-615"
                 [[ "$1" == -i ]] || return 0
                 shift; printf '%s\n' "$@" > "$root/dpkg-args"
+                [[ -n "${SIG_DURING:-}" ]] && kill -TERM "$(cat "$root/pid")"
                 [[ -n "${DPKG_FAIL:-}" ]] && return 1
                 echo new-image > "$KERNEL_POP_BOOT/.new" && mv -f "$KERNEL_POP_BOOT/.new" "$KERNEL_POP_BOOT/vmlinuz-$kv"
                 if [[ -z "${NO_MODULES:-}" ]]; then
@@ -936,7 +941,8 @@ EOF2
             # The fake packages hold no image: the trial signing is stubbed (tested on a real package below)
             trial_sign_image() { [[ -z "${TRIAL_FAIL:-}" ]] || { log "SIGN WARNING: stub trial signing failed"; return 1; }; }
             dpkg-query() { [[ -n "${PREEXIST:-}" && "$*" == *"linux-image-$kv"* ]] && echo "install ok installed"; }
-            do_install "$root/dl"
+            echo "$BASHPID" > "$root/pid"
+            do_install "$root/dl" 3>&1
         ) 2>&1
     }
     count() { grep -c "^\[kernel-pop\] $1" <<< "$2"; }
@@ -1025,6 +1031,38 @@ EOF2
     root="$tmp/inst-restorefail"
     grep -q "what was kept of it is in .*\.kernel-pop-keep-$kv" <<< "$out" || bad "the kept files should be named: $out"
     [[ -f "$root/modules/.kernel-pop-keep-$kv/kernel/old.ko" ]] || bad "the kept modules were deleted after a failed restore"
+    # Stops before dpkg ran (the package lock stays taken, a repair that would
+    # remove packages): /boot, the modules and the ESP are left as they are
+    for case in LOCK_HELD INTERRUPTED; do
+        out="$(export "$case=1"; SDBOOT=1 SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 APT_SIM="Remv nvidia-dkms-615 [1]" run_install "early-$case")" \
+            && bad "$case: do_install should stop before dpkg"
+        root="$tmp/inst-early-$case"
+        case "$case" in
+            LOCK_HELD) grep -q "still in use by packagekitd" <<< "$out" || bad "$case: the lock timeout was not reported: $out" ;;
+            INTERRUPTED) grep -q "would remove: nvidia-dkms-615" <<< "$out" || bad "$case: the refused repair was not reported: $out" ;;
+        esac
+        [[ -e "$root/dpkg-args" ]] && bad "$case: dpkg ran"
+        [[ -e "$root/ki-args" ]] && bad "$case: the ESP was rewritten: $(cat "$root/ki-args")"
+        grep -q "putting back" <<< "$out" && bad "$case: a stop before dpkg put files back: $out"
+        [[ "$(cat "$root/boot/vmlinuz-$kv")" == old-image && "$(cat "$root/boot/initrd.img-$kv")" == old-initrd && -f "$root/modules/$kv/kernel/old.ko" ]] \
+            || bad "$case: /boot or the modules changed"
+        [[ -z "$(compgen -G "$root/boot/.kernel-pop-keep-*")$(compgen -G "$root/modules/.kernel-pop-keep-*")" ]] || bad "$case: kept copies were left behind"
+    done
+    # The files are back but the ESP copy cannot follow: said so, no kept paths
+    out="$(SDBOOT=1 KI_FAIL=1 SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 run_install restore-esp)" && bad "do_install should fail when signing fails under Secure Boot"
+    grep -q "were put back, but its initramfs or its copy on the ESP could not follow" <<< "$out" || bad "a restore whose ESP copy failed: $out"
+    grep -q "what was kept of it is in" <<< "$out" && bad "kept paths named although every file was moved back: $out"
+    # Installed before but nothing kept: never purged, said so
+    out="$(NO_KEEP=1 SB_ON=1 WITH_KEY=1 KEY_STATE=enrolled PREEXIST=1 run_install nokeep)" && bad "do_install should fail when signing fails under Secure Boot"
+    grep -q "no copy of it was kept, so it was not removed" <<< "$out" || bad "existed without a kept copy: $out"
+    [[ -e "$tmp/inst-nokeep/apt-args" ]] && bad "a version installed before was purged without a kept copy"
+    # Stopped by a signal while dpkg runs: nothing is put back, the kept
+    # files stay and are named
+    out="$(SIG_DURING=1 SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled PREEXIST=1 run_install sigterm)" && bad "a stopped install should fail"
+    root="$tmp/inst-sigterm"
+    grep -q "was stopped (SIGTERM).*kept in .*\.kernel-pop-keep-$kv" <<< "$out" || bad "a signal should leave the kept files named: $out"
+    grep -q "putting back" <<< "$out" && bad "a signal must not put files back: $out"
+    [[ -f "$root/boot/.kernel-pop-keep-$kv/vmlinuz-$kv" && -f "$root/modules/.kernel-pop-keep-$kv/kernel/old.ko" ]] || bad "a signal deleted the kept files"
     # Installed over an installed version, all well: the kept copies go
     out="$(SB_ON=1 WITH_KEY=1 SIGN_OK=1 KEY_STATE=enrolled PREEXIST=1 run_install over-ok)" || bad "a reinstall under Secure Boot failed: $out"
     [[ "$(cat "$tmp/inst-over-ok/boot/vmlinuz-$kv")" == new-image ]] || bad "a good reinstall did not install the new kernel"

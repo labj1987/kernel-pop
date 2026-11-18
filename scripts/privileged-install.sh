@@ -178,10 +178,14 @@ dpkg_install() {
         wait_for_package_lock
         finish_interrupted_dpkg
         rc=0
+        # From here on, a stop puts a kept kernel back (kept_kernel_on_exit).
+        [[ -n "$KEEP_KVER" ]] && KEEP_ARMED=1
         out="$(dpkg -i "$@" 2>&1)" || rc=$?
         printf '%s\n' "$out"
         if (( rc != 0 && tries < 60 )) \
             && grep -qE 'dpkg: error: dpkg (frontend lock|status database|lock) (is|was) locked' <<<"$out"; then
+            # dpkg could not take its lock: it changed nothing.
+            KEEP_ARMED=0
             tries=$(( tries + 1 ))
             sleep "$LOCK_POLL"
             continue
@@ -926,7 +930,7 @@ trial_sign_image() {
 # has room (dracut rewrites an initramfs in place, so a link would not keep
 # it); otherwise it is generated again from the old modules. Any stop after
 # that, before the install has finished, puts them back (kept_kernel_on_exit).
-KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
+KEEP_BOOT="" KEEP_MODS="" KEEP_KVER="" KEEP_ARMED=0 KEEP_SIGNAL=""
 keep_installed_kernel() {
     local kver="$1" boot mods f size avail
     boot="$(boot_dir)"
@@ -934,6 +938,7 @@ keep_installed_kernel() {
     KEEP_BOOT="$boot/.kernel-pop-keep-$kver"
     KEEP_MODS="$mods/.kernel-pop-keep-$kver"
     rm -rf "$KEEP_BOOT" "$KEEP_MODS"
+    rm -f "$boot/initrd.img-$kver.kept"
     mkdir -m 0700 "$KEEP_BOOT" || return 1
     for f in vmlinuz System.map config; do
         [[ -e "$boot/$f-$kver" ]] || continue
@@ -960,7 +965,7 @@ boot_free_bytes() { df -PB1 "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
 drop_kept_kernel() {
     [[ -n "$KEEP_BOOT" ]] && rm -rf "$KEEP_BOOT"
     [[ -n "$KEEP_MODS" ]] && rm -rf "$KEEP_MODS"
-    KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
+    KEEP_BOOT="" KEEP_MODS="" KEEP_KVER="" KEEP_ARMED=0
     return 0
 }
 
@@ -968,18 +973,19 @@ drop_kept_kernel() {
 kept_paths() { echo "$KEEP_BOOT${KEEP_MODS:+ and $KEEP_MODS}"; }
 
 # Put the kept files of <kver> back and bring the boot loader's copy in line
-# with them. Non-zero when something could not be put back; whatever was not
-# moved back stays where it was kept (named in the log), never deleted.
+# with them. Returns 2 when kept files could not be moved back (what is left
+# stays where it was kept, named in the log, never deleted), 1 when they are
+# back but the initramfs or the boot loader's copy could not follow.
 restore_kept_kernel() {
     local kver="$1" boot mods f
     boot="$(boot_dir)"
     mods="$(modules_dir)"
     if ! restore_kept_files "$kver"; then
         log "Could not put back every kept file of $kver; what is left is in $(kept_paths)"
-        KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
-        return 1
+        KEEP_BOOT="" KEEP_MODS="" KEEP_KVER="" KEEP_ARMED=0
+        return 2
     fi
-    KEEP_BOOT="" KEEP_MODS="" KEEP_KVER=""
+    KEEP_BOOT="" KEEP_MODS="" KEEP_KVER="" KEEP_ARMED=0
     if [[ -f "$boot/initrd.img-$kver.kept" ]]; then
         mv -f "$boot/initrd.img-$kver.kept" "$boot/initrd.img-$kver" || return 1
     else
@@ -1021,8 +1027,23 @@ restore_kept_files() {
 # since what dpkg left may be unsigned or half installed. Chosen over only
 # naming the kept files: with Secure Boot enforcing, that version may be the
 # running kernel, and an unsigned one in its place would not boot again.
+#
+# Only once dpkg -i has really run (KEEP_ARMED): a stop before that (a
+# package lock that stays taken, a refused repair) changed nothing, and the
+# kept copy, taken before the wait, may be older than the files now there,
+# so it is only dropped. A run ended by a signal never restores: dpkg may
+# still be at work or cut off halfway, so the kept files stay where they are
+# and their paths are logged.
 kept_kernel_on_exit() {
     [[ -n "$KEEP_KVER" ]] || return 0
+    if (( ! KEEP_ARMED )); then
+        drop_kept_kernel
+        return 0
+    fi
+    if [[ -n "$KEEP_SIGNAL" ]]; then
+        log "WARNING: the install was stopped ($KEEP_SIGNAL) while $KEEP_KVER was being installed. The $KEEP_KVER installed before was not put back; its files are kept in $(kept_paths). With Secure Boot enforcing, do not reboot into $KEEP_KVER before installing it again."
+        return 0
+    fi
     log "The install stopped before $KEEP_KVER was ready: putting back the $KEEP_KVER installed before…"
     restore_kept_kernel "$KEEP_KVER" \
         || log "WARNING: the $KEEP_KVER installed before could not be put back completely — it may NOT boot while Secure Boot is enforcing (see above)"
@@ -1036,13 +1057,18 @@ kept_kernel_on_exit() {
 # modules directory and its boot menu entry removed (no postrm hook removes
 # a systemd-boot entry).
 rollback_and_die() {
-    local dir="$1" kver="$2" existed="$3" why="$4" d pkgs=() kept
+    local dir="$1" kver="$2" existed="$3" why="$4" d pkgs=() kept rc=0
     if (( existed )); then
-        kept="$(kept_paths)"
-        if [[ -n "$KEEP_KVER" ]] && restore_kept_kernel "$kver"; then
-            die "$why With Secure Boot enforcing the new build could not boot, so the $kver installed before was put back as it was (kernel, initramfs and modules; the headers are the new build's). Try again, or check the signing setup on the System tab."
+        if [[ -z "$KEEP_KVER" ]]; then
+            die "$why A $kver was installed before, but no copy of it was kept, so it was not removed: it may NOT boot while Secure Boot is enforcing. Boot another kernel and install $kver again."
         fi
-        die "$why The $kver installed before could not be put back completely, so it may NOT boot while Secure Boot is enforcing; what was kept of it is in $kept. Boot another kernel and install $kver again."
+        kept="$(kept_paths)"
+        restore_kept_kernel "$kver" || rc=$?
+        case "$rc" in
+            0) die "$why With Secure Boot enforcing the new build could not boot, so the $kver installed before was put back as it was (kernel, initramfs and modules; the headers are the new build's). Try again, or check the signing setup on the System tab." ;;
+            2) die "$why The $kver installed before could not be put back completely, so it may NOT boot while Secure Boot is enforcing; what was kept of it is in $kept. Boot another kernel and install $kver again." ;;
+            *) die "$why The kernel and modules of the $kver installed before were put back, but its initramfs or its copy on the ESP could not follow (see above), so it may NOT boot while Secure Boot is enforcing. Boot another kernel and install $kver again." ;;
+        esac
     fi
     if [[ "$kver" == "$(uname -r)" ]]; then
         die "$why $kver is the running kernel, so it was not removed — it will NOT boot again while Secure Boot is enforcing. Install a kernel that boots before rebooting."
@@ -1253,7 +1279,11 @@ do_install() {
     # Everything below works on the private, verified copy only.
     STAGE_DIR="$(umask 077 && mktemp -d "${KERNEL_POP_STAGING:-/var/tmp}/kernel-pop-install.XXXXXX")" \
         || die "Could not create a private staging directory"
-    trap 'rm -rf "$STAGE_DIR"; kept_kernel_on_exit' EXIT
+    # fd 3: the trap can fire inside a call whose output goes to the log only.
+    trap 'rm -rf "$STAGE_DIR"; kept_kernel_on_exit >&3' EXIT
+    trap 'KEEP_SIGNAL=SIGTERM; exit 143' TERM
+    trap 'KEEP_SIGNAL=SIGHUP; exit 129' HUP
+    trap 'KEEP_SIGNAL=SIGINT; exit 130' INT
     stage_verified_debs "$src" "$STAGE_DIR"
     local dir="$STAGE_DIR"
 
@@ -1316,6 +1346,10 @@ do_install() {
     # A rollback (Secure Boot enforcing, the new build cannot boot) puts an
     # installed version back instead of purging it.
     if (( existed )) && secure_boot_enforcing; then
+        # Wait for the package lock and finish an interrupted run first: the
+        # copy is taken after that, as close to dpkg as it can be.
+        wait_for_package_lock >>"$LOGFILE" 2>&1
+        finish_interrupted_dpkg >>"$LOGFILE" 2>&1
         keep_installed_kernel "$kver" \
             || { drop_kept_kernel; die "Could not keep a copy of the $kver installed now (is /boot full?), which a failed signing would need to put it back. Nothing was installed."; }
     fi

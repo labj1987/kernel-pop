@@ -238,10 +238,14 @@ systemd-boot entry); a version that was installed before (its
 `/boot/vmlinuz-<kver>` is there; a rebuild, maybe of the running kernel) is
 never purged: its kernel, System.map, config and modules are kept before
 dpkg (`keep_installed_kernel`, hard links), its initramfs copied when
-`/boot` has room (else generated again on restore), and moved back. Any
-other stop after the copy and before the install finished puts it back too
-(`kept_kernel_on_exit`, the EXIT trap); a restore that fails part way leaves
-the rest where it was kept and names the paths. Everything the steps after dpkg need (an initramfs tool,
+`/boot` has room (else generated again on restore), and moved back. The
+copy is taken after the package lock wait and the interrupted-run repair.
+Any other stop once `dpkg -i` has really run (`KEEP_ARMED`, set in
+`dpkg_install`) and before the install finished puts it back too
+(`kept_kernel_on_exit`, the EXIT trap); a stop before that only drops the
+copy, and a stop by a signal (TERM, HUP, INT) never restores: the kept files
+stay and their paths are logged. A restore that fails part way leaves the
+rest where it was kept and names the paths. Everything the steps after dpkg need (an initramfs tool,
 kernel-install or kernelstub) is checked before dpkg. A queued key is fine: the kernel
 boots once MOK Manager enrolls it.
 
