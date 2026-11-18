@@ -1317,7 +1317,13 @@ rm -f "$tmp/dpkg/lock-frontend" "$tmp/dpkg/lock"
     APT_SIM="Remv linux-generic [6.8.0.40.40]"
     out="$( (do_remove "$rk") 2>&1)" && bad "a Remv of a metapackage should be refused too"
     APT_SIM="Purg linux-image-$rk [6.8.0-40.40]"
+    # copies kept by an install stopped by a signal go with the version
+    mkdir -p "$KERNEL_POP_BOOT/.kernel-pop-keep-$rk" "$KERNEL_POP_MODULES/.kernel-pop-keep-$rk/kernel"
+    touch "$KERNEL_POP_BOOT/initrd.img-$rk.kept" "$KERNEL_POP_BOOT/.kernel-pop-keep-6.8.0-41-generic"
     out="$( (do_remove "$rk") 2>&1)" || bad "a removal without metapackages failed: $out"
+    [[ -e "$KERNEL_POP_BOOT/.kernel-pop-keep-$rk" || -e "$KERNEL_POP_MODULES/.kernel-pop-keep-$rk" || -e "$KERNEL_POP_BOOT/initrd.img-$rk.kept" ]] \
+        && bad "the removed version's kept copies were left behind"
+    [[ -e "$KERNEL_POP_BOOT/.kernel-pop-keep-6.8.0-41-generic" ]] || bad "another version's kept copy was removed"
     grep -q "purge -y linux-image-$rk" "$tmp/rm-apt" || bad "the kernel was not purged: [$(cat "$tmp/rm-apt" 2>/dev/null)]"
     # systemd-boot without kernel-install: the entry goes on the ESP and on XBOOTLDR
     (

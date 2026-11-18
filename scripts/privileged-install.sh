@@ -1648,6 +1648,9 @@ do_remove() {
     (( rc != 2 )) || die "update-grub failed"
 
     remove_signed_marker "$kver"
+    # A copy kept by an install that was stopped by a signal (see
+    # keep_installed_kernel) has no use once the version itself is gone.
+    rm -rf "${boot:?}/.kernel-pop-keep-${kver:?}" "${mods:?}/.kernel-pop-keep-${kver:?}" "$boot/initrd.img-$kver.kept"
     log "==== Done. Kernel $kver removed. ===="
 }
 
