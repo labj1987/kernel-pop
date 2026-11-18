@@ -202,7 +202,14 @@ pub fn check_single_top_dir(t: &Tarball) -> Result<()> {
     }
     let prefix = format!("{}/", t.top_dir);
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = line.trim_prefix("./");
+        // "./", "././linux-7.3/..." and the like, as find_makefile reads them.
+        let mut name = line;
+        while let Some(rest) = name.strip_prefix("./") {
+            name = rest;
+        }
+        if name.is_empty() || name == "." {
+            continue;
+        }
         if name != t.top_dir && name != prefix && !name.starts_with(&prefix) {
             bail!("The tarball holds {name}, outside its top-level directory {} — refusing to build it", t.top_dir);
         }
@@ -408,6 +415,33 @@ pub mod tests {
         compress_to("xz", &b.into_inner().unwrap(), &bad);
         let t = inspect(&bad).unwrap();
         assert!(check_single_top_dir(&t).unwrap_err().to_string().contains("outside"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn dot_slash_member_names_are_read_like_the_makefile_search() {
+        let d = scratch("dotslash");
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, data, dir) in [
+            ("./", &b""[..], true),
+            ("././linux-7.2.12/", b"", true),
+            ("./linux-7.2.12/Makefile", MAKEFILE.as_bytes(), false),
+            ("././linux-7.2.12/README", b"x", false),
+        ] {
+            // The name as written, "./" kept: set_path would normalise it away.
+            let mut h = tar::Header::new_gnu();
+            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            h.set_size(data.len() as u64);
+            h.set_mode(if dir { 0o755 } else { 0o644 });
+            h.set_entry_type(if dir { tar::EntryType::Directory } else { tar::EntryType::Regular });
+            h.set_cksum();
+            b.append(&h, data).unwrap();
+        }
+        let xz = d.join("dots.tar.xz");
+        compress_to("xz", &b.into_inner().unwrap(), &xz);
+        let t = inspect(&xz).unwrap();
+        assert_eq!(t.top_dir, "linux-7.2.12");
+        check_single_top_dir(&t).unwrap();
         std::fs::remove_dir_all(&d).unwrap();
     }
 

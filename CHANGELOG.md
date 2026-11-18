@@ -4,6 +4,35 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.6.0 — 2026-11-18
+
+- **A kernel that could not be signed under Secure Boot no longer leaves a broken boot entry.** On
+  systemd-boot, the rollback now removes the boot menu entry too, so the machine does not try the
+  removed kernel by default on the next start.
+- **Reinstalling a kernel version you already have is safe under Secure Boot.** If the new build
+  cannot be signed, the kernel that was installed before (even the running one) is put back
+  instead of being removed.
+- On systemd-boot and Pop!_OS, the kernel's copy on the EFI partition now always gets the final
+  initramfs, with the DKMS modules (such as the NVIDIA driver) built in, also without kernel
+  signing set up. The install checks that every file the boot entry names is there.
+- Kernel Pop no longer lets apt remove packages unasked: when repairing an interrupted update or a
+  failed install would remove packages, it stops and tells you what would go.
+- The install checks for an initramfs tool and the boot loader's tools before it installs
+  anything, instead of failing halfway.
+- Removing a kernel now always notices when that would also remove Ubuntu's kernel metapackages.
+- Set Up Signing repairs an earlier failed copy of a signed kernel to the EFI partition, and keeps
+  the systemd-boot on the EFI partition up to date when it was signed before.
+- Set Up Signing leaves the fallback boot loader alone on an EFI partition shared with Windows or
+  another distribution.
+- Systems with a separate `/boot` boot partition (XBOOTLDR) are supported for systemd-boot
+  entries.
+- DKMS modules are re-signed on systems with DKMS 2, and for modules whose dkms.conf uses single
+  quotes or names no module.
+- Closing the window while the build summary is open closes it at once and deletes the prepared
+  source tree.
+- Tarballs whose members start with `./` can be built.
+- A download that fails on its last write (a full disk) is retried and leaves no partial file.
+
 ## 2.5.2 — 2026-11-16
 
 - **The window takes your desktop's accent colour.** On GNOME, KDE Plasma and COSMIC, primary

@@ -231,8 +231,14 @@ No kernel that shim would refuse is ever left installed. With Secure Boot
 enforcing, `--install` requires the key set, the sbsign tools and a key
 that is enrolled or queued (`secure_boot_preflight`, before dpkg; the app
 checks the same in `install_blocker` and refuses up front). If signing
-then fails, the just-installed packages are purged again
-(`rollback_install`) and the run fails. A queued key is fine: the kernel
+then fails, `rollback_and_die` undoes the install and the run fails: new
+packages are purged and their boot entry removed (`remove_boot_entry`: no
+postrm hook removes a systemd-boot entry); a version that was installed
+before (a rebuild, maybe of the running kernel) is never purged, its
+kernel, System.map, config and modules are kept before dpkg
+(`keep_installed_kernel`, hard links) and moved back, and its initramfs is
+generated again. Everything the steps after dpkg need (an initramfs tool,
+kernel-install or kernelstub) is checked before dpkg. A queued key is fine: the kernel
 boots once MOK Manager enrolls it.
 
 ## Kernel signing
@@ -299,6 +305,12 @@ boots once MOK Manager enrolls it.
   before 2.2.3) gets its package reinstalled, which puts the
   distribution's copy back. A failed reinstall only logs. Never from the
   apt hook, which runs inside dpkg.
+- systemd-boot entries are looked for on the ESP and then on the XBOOTLDR
+  partition (`bootctl --print-boot-path`, `KERNEL_POP_XBOOTLDR` in tests);
+  the paths in an entry are relative to the partition it is on
+  (`sdboot_entry_root`). After an install the ESP copy is refreshed whether
+  or not the kernel was signed (the package hook copied the initramfs from
+  before DKMS) and every file the entry names must exist.
 - `prune_esp_initrds <esp> <kver>`: after every kernel-install add and at the
   end of a systemd-boot install, initramfs files ("initrd", "initrd.img-*")
   in the entry's ESP directory that the entry does not name are removed
@@ -310,8 +322,11 @@ boots once MOK Manager enrolls it.
 - shim in front of systemd-boot (`setup_shim_chain`, from
   `do_setup_signing` when `detect_bootloader` says systemd-boot): the
   layout of Ubuntu's systemd-boot postinst `install_shim` (shim/fb/mm in
-  `EFI/<os-release ID>/`, shim at `EFI/BOOT/BOOTX64.EFI`, UCS-2LE
-  `BOOTX64.CSV` byte-identical to install_shim's, firmware entry
+  `EFI/<os-release ID>/`, shim at `EFI/BOOT/BOOTX64.EFI` only over a
+  fallback loader that is ours (`fallback_is_ours`: none, shim, or
+  systemd-boot; never Windows' or another distribution's, and then no
+  fbx64 either), UCS-2LE `BOOTX64.CSV` (written tmp + mv)
+  byte-identical to install_shim's, firmware entry
   `<Vendor>` = `EFI/<vendor>/shimx64.efi` with load option
   `\EFI\systemd\systemd-bootx64.efi \0`), done by the script itself so it
   also works while GRUB's packages are installed (install_shim returns
@@ -356,7 +371,11 @@ boots once MOK Manager enrolls it.
   run `finish_interrupted_dpkg` first: with files in
   `/var/lib/dpkg/updates` or any `dpkg --audit` output (a run cut off by a
   crash or power cut), `dpkg --configure -a`, `apt-get install -f`, and
-  `--reinstall` of packages whose status has the reinst-required flag.
+  `--reinstall` of packages whose status has the reinst-required flag. Every
+apt repair (`install -f`, that `--reinstall`, the `install -f` after a failed
+`dpkg -i`) is simulated first (`apt_removals`: `Remv` and `Purg` lines) and
+not run when it would remove a package (after a failed `dpkg -i`, only the
+new packages themselves may go, and only when they replaced nothing).
 
 ## Build process
 
