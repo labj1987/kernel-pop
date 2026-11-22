@@ -194,12 +194,14 @@ Fixes applied in every mode with `scripts/config`, then `make olddefconfig`:
     localmodconfig keeps only the present card's driver, so a Tuned 7.3.5
     kernel saw an AMD card added next to an NVIDIA one but bound no driver
     to it. A graphics driver this config rules out (`DRM_I915` on
-    `PREEMPT_RT`, `DRM_XE` without 4 KiB pages) is a note in the summary,
-    not a refused build.
+    `PREEMPT_RT` or a non-x86 kernel, `DRM_XE` without 4 KiB pages) is a
+    note in the summary, not a refused build; any other one left off
+    refuses the build like the rest.
 
 After configuring, the build refuses to start unless `LOCALVERSION`, the
-two key settings and (Match and Tuned) every required option except the graphics drivers came out as set. The summary also warns when an option the
-kernel needs to trust MOK-signed modules is off (below), and when
+two key settings and (Match and Tuned) every required option, except a
+graphics driver the config rules out, came out as set. The summary also
+warns when an option the kernel needs to trust MOK-signed modules is off (below), and when
 `make kernelrelease` differs from `<version>-kernelpop` (a tree with its own
 localversion file).
 
@@ -264,6 +266,15 @@ installed but empty (cold), debug info off:
 | --- | --- | --- | --- | --- | --- |
 | Match this system | 6703 | 26 min 5 s | 6.7 GB | 117 MB | 10.6 MB |
 | Tuned for this machine (196 loaded, 23 more for present devices, 110 extras) | 369 | 8 min 2 s | 3.5 GB | 34 MB | 10.3 MB |
+
+Since the graphics drivers are always kept (amdgpu, radeon, i915, xe and
+nouveau, above), Tuned builds them all on every machine. A Tuned Linux 7.3.5
+build measured the same way on 2026-11-22, on a faster 32-thread machine:
+419 modules, 5 min 30 s, 3.9 GB build tree at its largest, image deb 41 MB,
+headers deb 10.4 MB. The five graphics drivers were 2465 of its 7888
+compiled files, so where none of them was loaded before (an NVIDIA card on
+the proprietary driver), a Tuned build compiles about 45% more files than
+it did; it still takes under half as long as Match this system.
 
 Version 2.1.0 also had "Trim to this machine" (only the modules loaded
 right now): 226 modules, 6 min 41 s, 3.2 GB. It was removed in 2.1.2: Tuned

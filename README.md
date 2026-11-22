@@ -52,7 +52,7 @@ VFS-panics on boot. This app is built around not letting that happen:
   the hardware in this computer plus the kinds people plug in, such as USB
   storage, USB and Bluetooth controllers, keyboards and mice, headsets,
   webcams, docks and VPN/container
-  networking; about a third of the build time; both keep what game
+  networking; under half the build time; both keep what game
   controllers, firewalls, Docker, VMs and VPNs need, and the AMD, Intel
   and NVIDIA (nouveau) graphics drivers, so a graphics card added later
   works without a rebuild) and **Use my own .config**. The fixes every
