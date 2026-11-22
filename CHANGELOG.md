@@ -10,8 +10,9 @@ headings.
   modules that are not loaded while you configure, and firewall rules, Docker, VM networks and
   VPNs load theirs only when they run. A Tuned kernel could therefore not start libvirt's default
   network (no REJECT target), and Docker or a VPN could fail on a rule nothing had loaded before.
-  Every mode now keeps the networking options Docker, libvirt, ufw/firewalld, WireGuard, OpenVPN,
-  Tailscale and IPsec need, and Kernel Pop refuses to build a kernel without them.
+  Match this system and Tuned now keep the networking options Docker, libvirt, ufw/firewalld,
+  WireGuard, OpenVPN, Tailscale and IPsec need, and refuse to build a kernel without them; with your
+  own .config, the summary warns when one is off.
 
 ## 2.6.0 — 2026-11-18
 
