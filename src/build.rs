@@ -481,17 +481,196 @@ pub fn config_value(config: &str, name: &str) -> Option<String> {
 pub const REQUIRED_INPUT_SYMBOLS: &[&str] = &["USB_HID", "HID_GENERIC", "UHID", "INPUT_UINPUT", "INPUT_JOYDEV"];
 /// The same for kernels with classic Bluetooth (BT_BREDR): Bluetooth HID.
 pub const REQUIRED_BLUETOOTH_SYMBOLS: &[&str] = &["BT_HIDP"];
+/// Options every kernel with netfilter must have as modules (or built in): firewalls (nftables,
+/// iptables, ufw, firewalld), NAT, Docker and Podman networking (Docker's check-config list),
+/// libvirt's NAT network, VPNs (WireGuard, OpenVPN, Tailscale, IPsec) and VM networking. They
+/// are only loaded when used, so Tuned's localmodconfig used to drop them: libvirt's default
+/// network could not start without the REJECT targets.
+pub const REQUIRED_NETWORK_SYMBOLS: &[&str] = &[
+    // nftables
+    "NF_TABLES",
+    "NFT_CT",
+    "NFT_NAT",
+    "NFT_MASQ",
+    "NFT_REDIR",
+    "NFT_REJECT",
+    "NFT_REJECT_INET",
+    "NFT_COMPAT",
+    "NFT_LIMIT",
+    "NFT_LOG",
+    "NFT_NUMGEN",
+    "NFT_QUOTA",
+    "NFT_FIB_INET",
+    "NFT_FIB_IPV4",
+    "NFT_FIB_IPV6",
+    "NFT_FWD_NETDEV",
+    // connection tracking, NAT and REJECT
+    "NF_CONNTRACK",
+    "NF_NAT",
+    "NF_REJECT_IPV4",
+    "NF_REJECT_IPV6",
+    "NF_CONNTRACK_FTP",
+    "NF_NAT_FTP",
+    "NF_CONNTRACK_TFTP",
+    "NF_NAT_TFTP",
+    // x_tables matches and targets (iptables, iptables-nft, ufw, Docker)
+    "NETFILTER_XTABLES",
+    "NETFILTER_XT_MATCH_ADDRTYPE",
+    "NETFILTER_XT_MATCH_CONNTRACK",
+    "NETFILTER_XT_MATCH_IPVS",
+    "NETFILTER_XT_MARK",
+    "NETFILTER_XT_CONNMARK",
+    "NETFILTER_XT_MATCH_COMMENT",
+    "NETFILTER_XT_MATCH_LIMIT",
+    "NETFILTER_XT_MATCH_HL",
+    "NETFILTER_XT_MATCH_MULTIPORT",
+    "NETFILTER_XT_MATCH_RECENT",
+    "NETFILTER_XT_MATCH_OWNER",
+    "NETFILTER_XT_MATCH_STATE",
+    "NETFILTER_XT_TARGET_LOG",
+    "NETFILTER_XT_TARGET_TCPMSS",
+    "NETFILTER_XT_TARGET_CHECKSUM",
+    "NETFILTER_XT_TARGET_MASQUERADE",
+    "NETFILTER_XT_TARGET_REDIRECT",
+    // iptables tables (IPv4 and IPv6)
+    "IP_NF_IPTABLES",
+    "IP_NF_IPTABLES_LEGACY",
+    "IP_NF_FILTER",
+    "IP_NF_MANGLE",
+    "IP_NF_RAW",
+    "IP_NF_NAT",
+    "IP_NF_TARGET_REJECT",
+    "IP_NF_TARGET_MASQUERADE",
+    "IP_NF_TARGET_REDIRECT",
+    "IP6_NF_IPTABLES",
+    "IP6_NF_IPTABLES_LEGACY",
+    "IP6_NF_MATCH_RT",
+    "IP6_NF_FILTER",
+    "IP6_NF_MANGLE",
+    "IP6_NF_RAW",
+    "IP6_NF_NAT",
+    "IP6_NF_TARGET_REJECT",
+    "IP6_NF_TARGET_MASQUERADE",
+    // ipset and IPVS (firewalld, Docker swarm, kube-proxy)
+    "IP_SET",
+    "IP_SET_HASH_IP",
+    "IP_SET_HASH_NET",
+    "IP_VS",
+    "IP_VS_RR",
+    // container and VM networking
+    "BRIDGE",
+    "BRIDGE_NETFILTER",
+    "VLAN_8021Q",
+    "VETH",
+    "MACVLAN",
+    "IPVLAN",
+    "VXLAN",
+    "DUMMY",
+    "OVERLAY_FS",
+    "NET_CLS_CGROUP",
+    "VHOST_NET",
+    "MACVTAP",
+    "VSOCKETS",
+    "VHOST_VSOCK",
+    // VPNs
+    "TUN",
+    "WIREGUARD",
+    "INET_ESP",
+    "INET6_ESP",
+    "XFRM_USER",
+];
+/// The yes/no options the network modules above need (they cannot be modules).
+pub const REQUIRED_NETWORK_FLAGS: &[&str] = &[
+    "NETFILTER_ADVANCED",
+    "NETFILTER_XTABLES_LEGACY",
+    "NF_TABLES_INET",
+    "NF_TABLES_IPV4",
+    "NF_TABLES_IPV6",
+    "NF_TABLES_NETDEV",
+    "BRIDGE_VLAN_FILTERING",
+    "IP_VS_PROTO_TCP",
+    "IP_VS_PROTO_UDP",
+    "IP_VS_NFCT",
+    "IP_VS_IPV6",
+    "POSIX_MQUEUE",
+];
 
 /// The required options `config` leaves off (neither y nor m). For Match
-/// and Tuned these are turned on as modules before configuring, since
-/// localmodconfig only ever removes modules.
+/// and Tuned these are turned on before configuring, and for Tuned again
+/// after localmodconfig, which removes every module that is not loaded.
 pub fn missing_required(config: &str) -> Vec<&'static str> {
     let on = |s: &str| matches!(config_value(config, s).as_deref(), Some("y" | "m"));
     let mut need: Vec<&'static str> = REQUIRED_INPUT_SYMBOLS.to_vec();
     if on("BT") && on("BT_BREDR") {
         need.extend_from_slice(REQUIRED_BLUETOOTH_SYMBOLS);
     }
+    if on("NETFILTER") {
+        need.extend_from_slice(REQUIRED_NETWORK_FLAGS);
+        need.extend_from_slice(REQUIRED_NETWORK_SYMBOLS);
+    }
     need.into_iter().filter(|s| !on(s)).collect()
+}
+
+/// scripts/config arguments that turn `symbols` on: yes/no options with
+/// --enable, everything else as a module (a missing option is never =y, so
+/// nothing built in is demoted).
+pub fn enable_args<'a>(symbols: &[&'a str]) -> Vec<&'a str> {
+    symbols.iter().flat_map(|s| [if REQUIRED_NETWORK_FLAGS.contains(s) { "--enable" } else { "--module" }, *s]).collect()
+}
+
+/// `CONFIG_A, CONFIG_B` for a short list, a count for a long one (the names are in the log).
+fn option_list(symbols: &[&str]) -> String {
+    if symbols.len() > 8 {
+        format!("{} options", symbols.len())
+    } else {
+        format!("CONFIG_{}", symbols.join(", CONFIG_"))
+    }
+}
+
+/// Every option the tree's Kconfig files define (`config X` / `menuconfig X`).
+pub fn kconfig_symbols(tree: &Path) -> Result<std::collections::HashSet<String>> {
+    let mut out = std::collections::HashSet::new();
+    let mut stack = vec![tree.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).with_context(|| format!("Could not read {}", dir.display()))? {
+            let e = e?;
+            let path = e.path();
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() && e.file_name().to_string_lossy().starts_with("Kconfig") {
+                out.extend(kconfig_text_symbols(&std::fs::read_to_string(&path).unwrap_or_default()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn kconfig_text_symbols(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines().filter_map(|l| {
+        let mut w = l.split_whitespace();
+        match w.next() {
+            Some("config" | "menuconfig") => w.next().map(str::to_string),
+            _ => None,
+        }
+    })
+}
+
+/// `missing_required`, without options this kernel version does not have (an older longterm
+/// tree, or an option renamed upstream): those cannot be turned on and must not block a build.
+pub fn missing_required_in(config: &str, defined: &std::collections::HashSet<String>) -> Vec<&'static str> {
+    missing_required(config).into_iter().filter(|s| defined.contains(*s)).collect()
+}
+
+/// What needs `symbols`, for the configuration summary.
+fn enable_users(symbols: &[&str]) -> &'static str {
+    let net = symbols.iter().any(|s| REQUIRED_NETWORK_SYMBOLS.contains(s) || REQUIRED_NETWORK_FLAGS.contains(s));
+    let input = symbols.iter().any(|s| REQUIRED_INPUT_SYMBOLS.contains(s) || REQUIRED_BLUETOOTH_SYMBOLS.contains(s));
+    match (input, net) {
+        (true, true) => "game controllers, Bluetooth input devices, firewalls, Docker, VMs or VPNs",
+        (false, true) => "firewalls, Docker and other containers, VM networks or VPNs",
+        _ => "game controllers or Bluetooth input devices",
+    }
 }
 
 /// The number of =m symbols: how many modules the configuration builds.
@@ -771,31 +950,30 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
 
     let (debug_args, debug_text) = debug_info_args();
     let own_config = matches!(req.mode, ConfigMode::OwnConfig(_));
-    let enable: Vec<&str> = if own_config { vec![] } else { missing_required(&base) };
+    let defined = kconfig_symbols(tree)?;
+    let enable: Vec<&str> = if own_config { vec![] } else { missing_required_in(&base, &defined) };
     let mut fixes = vec![
         format!("LOCALVERSION set to \"{LOCALVERSION}\""),
         "SYSTEM_TRUSTED_KEYS set to \"\" (Ubuntu's points at Canonical certificate files that are not in a kernel.org tree)".to_string(),
         "SYSTEM_REVOCATION_KEYS set to \"\" (same reason)".to_string(),
         format!("Debug info {debug_text}"),
     ];
-    let apply_fixes = || -> Result<()> {
+    let apply_fixes = |enable: &[&str]| -> Result<()> {
         let mut c = scripts_config(tree);
         c.args(["--set-str", "LOCALVERSION", LOCALVERSION])
             .args(["--set-str", "SYSTEM_TRUSTED_KEYS", ""])
             .args(["--set-str", "SYSTEM_REVOCATION_KEYS", ""])
-            .args(&debug_args);
-        for sym in &enable {
-            c.args(["--module", sym]);
+            .args(&debug_args)
+            .args(enable_args(enable));
+        if !enable.is_empty() {
+            r.note(format!("Turning on CONFIG_{}", enable.join(", CONFIG_")));
         }
         r.run(c, "scripts/config").map(|_| ())
     };
     if !enable.is_empty() {
-        fixes.push(format!(
-            "CONFIG_{} turned on as modules (game controllers and Bluetooth controllers, keyboards and mice need them)",
-            enable.join(", CONFIG_")
-        ));
+        fixes.push(format!("Turned on for {}: {}", enable_users(&enable), option_list(&enable)));
     }
-    apply_fixes()?;
+    apply_fixes(&enable)?;
 
     let mut notes = vec![];
     if base_rust {
@@ -848,8 +1026,13 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         let mut c = make(tree);
         c.arg(format!("LSMOD={}", list.display())).arg("localmodconfig");
         r.run(c, "make localmodconfig")?;
-        apply_fixes()?;
+        // localmodconfig drops every module that is not loaded, required ones included: put them back.
+        let restore = missing_required_in(&std::fs::read_to_string(tree.join(".config"))?, &defined);
+        apply_fixes(&restore)?;
         olddefconfig()?;
+        if !restore.is_empty() {
+            fixes.push(format!("Kept after localmodconfig for {}: {} options", enable_users(&restore), restore.len()));
+        }
         fixes.push(format!("localmodconfig: only drivers for {what}"));
         notes.push(
             "Tuned: hardware that is not present now and not a common plug-in kind (an unusual USB gadget, a different Wi-Fi card) may have no driver in this kernel; Match this system includes everything.".into(),
@@ -864,9 +1047,10 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         }
     };
     expect("LOCALVERSION", &format!("\"{LOCALVERSION}\""))?;
-    let missing = missing_required(&config);
+    let missing = missing_required_in(&config, &defined);
     if !missing.is_empty() {
-        let what = format!("CONFIG_{} is off: game controllers or Bluetooth input devices would not work with this kernel", missing.join(", CONFIG_"));
+        let why = if own_config { "" } else { " (it could not be turned on: an option it depends on is off in the base config)" };
+        let what = format!("CONFIG_{} is off{why}: {} would not work with this kernel", missing.join(", CONFIG_"), enable_users(&missing));
         if own_config {
             notes.push(format!("{what}."));
         } else {
@@ -1421,6 +1605,46 @@ mod tests {
     }
 
     #[test]
+    fn firewall_container_and_vpn_options_always_kept() {
+        let mut full =
+            String::from("CONFIG_USB_HID=y\nCONFIG_HID_GENERIC=y\nCONFIG_UHID=m\nCONFIG_INPUT_UINPUT=m\nCONFIG_INPUT_JOYDEV=m\nCONFIG_NETFILTER=y\n");
+        for s in REQUIRED_NETWORK_FLAGS {
+            full.push_str(&format!("CONFIG_{s}=y\n"));
+        }
+        for s in REQUIRED_NETWORK_SYMBOLS {
+            full.push_str(&format!("CONFIG_{s}=m\n"));
+        }
+        assert!(missing_required(&full).is_empty());
+        // LordNikon's 7.3.5 Tuned kernel: no REJECT, so libvirt's NAT network could not start.
+        let no_reject = full
+            .replace("CONFIG_NFT_REJECT=m\n", "# CONFIG_NFT_REJECT is not set\n")
+            .replace("CONFIG_IP_NF_TARGET_REJECT=m\n", "")
+            .replace("CONFIG_BRIDGE_VLAN_FILTERING=y\n", "");
+        assert_eq!(missing_required(&no_reject), ["BRIDGE_VLAN_FILTERING", "NFT_REJECT", "IP_NF_TARGET_REJECT"]);
+        // Yes/no options are switched on, the rest become modules.
+        assert_eq!(enable_args(&["BRIDGE_VLAN_FILTERING", "NFT_REJECT"]), ["--enable", "BRIDGE_VLAN_FILTERING", "--module", "NFT_REJECT"]);
+        // Without netfilter at all, none of them is asked for.
+        let no_netfilter = no_reject.replace("CONFIG_NETFILTER=y\n", "");
+        assert!(missing_required(&no_netfilter).is_empty());
+        // ufw's IPv6 rules need the hl and rt matches; 6.17+ iptables tables need the legacy switch.
+        let ufw = full.replace("CONFIG_NETFILTER_XT_MATCH_HL=m\n", "").replace("CONFIG_IP6_NF_MATCH_RT=m\n", "");
+        assert_eq!(missing_required(&ufw), ["NETFILTER_XT_MATCH_HL", "IP6_NF_MATCH_RT"]);
+        let pre_617 = full.replace("CONFIG_NETFILTER_XTABLES_LEGACY=y\n", "");
+        assert_eq!(missing_required(&pre_617), ["NETFILTER_XTABLES_LEGACY"]);
+        // An option the tree does not define (an older longterm kernel) is never required.
+        let mut defined: std::collections::HashSet<String> = REQUIRED_NETWORK_SYMBOLS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(missing_required_in(&pre_617, &defined), Vec::<&str>::new());
+        defined.insert("NETFILTER_XTABLES_LEGACY".into());
+        assert_eq!(missing_required_in(&pre_617, &defined), ["NETFILTER_XTABLES_LEGACY"]);
+        let k = "config NETFILTER_XTABLES_LEGACY\n\tbool \"x\"\nmenuconfig NF_TABLES\n  depends on config_FOO\n# config NOT_ME\n";
+        assert_eq!(kconfig_text_symbols(k).collect::<Vec<_>>(), ["NETFILTER_XTABLES_LEGACY", "NF_TABLES"]);
+        assert_eq!(option_list(&["A", "B"]), "CONFIG_A, CONFIG_B");
+        assert_eq!(option_list(&["A"; 9]), "9 options");
+        assert_eq!(enable_users(&["UHID"]), "game controllers or Bluetooth input devices");
+        assert_eq!(enable_users(&["NFT_REJECT"]), "firewalls, Docker and other containers, VM networks or VPNs");
+    }
+
+    #[test]
     fn config_values() {
         let c = "CONFIG_RUST=y\nCONFIG_LOCALVERSION=\"-kernelpop\"\n# CONFIG_DEBUG_INFO_NONE is not set\nCONFIG_E1000=m\nCONFIG_EXT4_FS=y\nCONFIG_SND=m\n";
         assert_eq!(config_value(c, "RUST").as_deref(), Some("y"));
@@ -1657,6 +1881,38 @@ mod tests {
         let tree = p.tree.clone();
         p.discard();
         assert!(!tree.exists());
+    }
+
+    /// Extract and configure only, in Tuned mode on this machine: every required option (input,
+    /// Bluetooth HID, firewall/container/VPN networking) must still be on after localmodconfig.
+    /// KERNEL_POP_LIVE_TARBALL=<tarball>.
+    #[test]
+    #[ignore]
+    fn live_prepare_tuned_keeps_required_options() {
+        let path = PathBuf::from(std::env::var("KERNEL_POP_LIVE_TARBALL").expect("set KERNEL_POP_LIVE_TARBALL"));
+        let tarball = crate::source::inspect(&path).unwrap();
+        let running = String::from_utf8(Command::new("uname").arg("-r").output().unwrap().stdout).unwrap().trim().to_string();
+        let trust = SourceTrust::Unverified { reason: "test: configure only".into() };
+        let req = BuildRequest { tarball, trust, mode: ConfigMode::TunedForMachine, running_kernel: running };
+        let events: EventSink = Arc::new(|_| {});
+        let p = prepare(req, events, BuildControl::new(), 300 << 20).unwrap();
+        println!("{}", p.summary.text());
+        let config = std::fs::read_to_string(p.tree.join(".config")).unwrap();
+        assert!(missing_required(&config).is_empty(), "{:?}", missing_required(&config));
+        for s in [
+            "NFT_REJECT",
+            "IP_NF_TARGET_REJECT",
+            "IP_NF_TARGET_MASQUERADE",
+            "NFT_MASQ",
+            "BRIDGE_NETFILTER",
+            "WIREGUARD",
+            "UHID",
+            "NETFILTER_XT_MATCH_HL",
+            "IP6_NF_MATCH_RT",
+        ] {
+            assert!(matches!(config_value(&config, s).as_deref(), Some("y" | "m")), "CONFIG_{s} is off");
+        }
+        p.discard();
     }
 
     /// A real build of a real kernel.org tarball, like the Build page does

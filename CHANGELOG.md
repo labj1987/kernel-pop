@@ -4,6 +4,16 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.6.1 — 2026-11-22
+
+- **Tuned kernels keep firewall, container, VM and VPN support.** Tuned for this machine drops
+  modules that are not loaded while you configure, and firewall rules, Docker, VM networks and
+  VPNs load theirs only when they run. A Tuned kernel could therefore not start libvirt's default
+  network (no REJECT target), and Docker or a VPN could fail on a rule nothing had loaded before.
+  Match this system and Tuned now keep the networking options Docker, libvirt, ufw/firewalld,
+  WireGuard, OpenVPN, Tailscale and IPsec need, and refuse to build a kernel without them; with your
+  own .config, the summary warns when one is off.
+
 ## 2.6.0 — 2026-11-18
 
 - **A kernel that could not be signed under Secure Boot no longer leaves a broken boot entry.** On
