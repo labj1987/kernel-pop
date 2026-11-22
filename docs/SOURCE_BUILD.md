@@ -139,8 +139,9 @@ Base config:
   used now and then (`build::TUNED_EXTRA_MODULES`: USB storage, card
   readers, common file systems, input devices and game controllers, USB
   audio and webcams, Bluetooth, USB network adapters and phone tethering,
-  docks and Thunderbolt, printers and serial adapters, VPN, container and
-  VM networking, dm-crypt, loop, zram, ntsync). Hardware that is neither
+  docks and Thunderbolt, printers and serial adapters, the AMD, Intel and
+  nouveau graphics drivers, VPN, container and VM networking, dm-crypt,
+  loop, zram, ntsync). Hardware that is neither
   present nor one of those kinds (an unusual USB gadget, a different Wi-Fi
   card) may have no driver. Kernel messages in the journal were also
   tried as a history of earlier boots; on the test machine they named no
@@ -182,9 +183,22 @@ Fixes applied in every mode with `scripts/config`, then `make olddefconfig`:
     load only when a firewall rule, container or VPN uses them, so the 7.3.5
     Tuned kernel had lost them all: libvirt's default network could not start
     (no `REJECT`), and Docker ran only on what happened to be loaded.
+  - graphics, whenever `DRM` and `PCI` are on: `DRM_AMDGPU` with
+    `DRM_AMD_DC` (the only display path for Vega and newer) and
+    `DRM_AMDGPU_SI`/`DRM_AMDGPU_CIK` (amdgpu drives GCN 1/2 cards by default
+    when built with them; otherwise radeon takes them, without Vulkan),
+    `DRM_RADEON` (pre-GCN AMD/ATI cards), `DRM_I915` and `DRM_XE` (Intel
+    integrated and Arc), `DRM_NOUVEAU` (NVIDIA without the proprietary
+    driver) (`build::REQUIRED_GPU_SYMBOLS` and `REQUIRED_GPU_FLAGS`; the
+    firmware loader and DRM helpers come with them through Kconfig selects).
+    localmodconfig keeps only the present card's driver, so a Tuned 7.3.5
+    kernel saw an AMD card added next to an NVIDIA one but bound no driver
+    to it. A graphics driver this config rules out (`DRM_I915` on
+    `PREEMPT_RT`, `DRM_XE` without 4 KiB pages) is a note in the summary,
+    not a refused build.
 
 After configuring, the build refuses to start unless `LOCALVERSION`, the
-two key settings and (Match and Tuned) every required option came out as set. The summary also warns when an option the
+two key settings and (Match and Tuned) every required option except the graphics drivers came out as set. The summary also warns when an option the
 kernel needs to trust MOK-signed modules is off (below), and when
 `make kernelrelease` differs from `<version>-kernelpop` (a tree with its own
 localversion file).

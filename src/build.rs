@@ -71,9 +71,9 @@ pub const TUNED_BUILD_NEED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// plugged in later or used only now and then: USB storage and card
 /// readers, the common file systems, input devices and game controllers,
 /// USB audio and webcams, Bluetooth, USB network adapters and phone
-/// tethering, docks, printers and serial adapters, and the networking that
-/// VPNs, containers and virtual machines load on demand. Names that do not
-/// exist in a tree are ignored by localmodconfig.
+/// tethering, docks, printers and serial adapters, graphics cards, and the
+/// networking that VPNs, containers and virtual machines load on demand.
+/// Names that do not exist in a tree are ignored by localmodconfig.
 pub const TUNED_EXTRA_MODULES: &[&str] = &[
     // storage and card readers
     "usb_storage",
@@ -197,6 +197,13 @@ pub const TUNED_EXTRA_MODULES: &[&str] = &[
     "kvm_amd",
     "vhost_net",
     "vhost_vsock",
+    // graphics cards added or swapped later (REQUIRED_GPU_SYMBOLS); listed here too so
+    // localmodconfig keeps what they depend on
+    "amdgpu",
+    "radeon",
+    "i915",
+    "xe",
+    "nouveau",
     // encrypted and image-backed disks, compressed swap, Wine/Proton sync
     "dm_crypt",
     "dm_mod",
@@ -595,6 +602,19 @@ pub const REQUIRED_NETWORK_FLAGS: &[&str] = &[
     "POSIX_MQUEUE",
 ];
 
+/// Graphics drivers every kernel with DRM and PCI must have as modules (or built in), so a
+/// graphics card added or swapped later has a driver: Tuned's localmodconfig keeps only the
+/// driver of the card present while it runs, and a second card then got none. AMD since GCN
+/// (amdgpu), older AMD/ATI cards (radeon), Intel integrated and Arc graphics (i915, and xe
+/// for Xe2 and newer), NVIDIA without the proprietary driver (nouveau). Their firmware
+/// loading and helpers come with them through Kconfig selects. A driver whose dependencies a
+/// config rules out (i915 on PREEMPT_RT, xe without 4 KiB pages) is noted, not refused.
+pub const REQUIRED_GPU_SYMBOLS: &[&str] = &["DRM_AMDGPU", "DRM_RADEON", "DRM_I915", "DRM_XE", "DRM_NOUVEAU"];
+/// The yes/no options amdgpu needs to drive every card it supports: Display Core (the only
+/// display path for Vega and newer) and the 2012-2013 GCN 1/2 cards (SI, CIK), which amdgpu
+/// drives by default when built with them (radeon takes them otherwise, without Vulkan).
+pub const REQUIRED_GPU_FLAGS: &[&str] = &["DRM_AMD_DC", "DRM_AMDGPU_SI", "DRM_AMDGPU_CIK"];
+
 /// The required options `config` leaves off (neither y nor m). For Match
 /// and Tuned these are turned on before configuring, and for Tuned again
 /// after localmodconfig, which removes every module that is not loaded.
@@ -608,6 +628,10 @@ pub fn missing_required(config: &str) -> Vec<&'static str> {
         need.extend_from_slice(REQUIRED_NETWORK_FLAGS);
         need.extend_from_slice(REQUIRED_NETWORK_SYMBOLS);
     }
+    if on("DRM") && on("PCI") {
+        need.extend_from_slice(REQUIRED_GPU_SYMBOLS);
+        need.extend_from_slice(REQUIRED_GPU_FLAGS);
+    }
     need.into_iter().filter(|s| !on(s)).collect()
 }
 
@@ -615,7 +639,7 @@ pub fn missing_required(config: &str) -> Vec<&'static str> {
 /// --enable, everything else as a module (a missing option is never =y, so
 /// nothing built in is demoted).
 pub fn enable_args<'a>(symbols: &[&'a str]) -> Vec<&'a str> {
-    symbols.iter().flat_map(|s| [if REQUIRED_NETWORK_FLAGS.contains(s) { "--enable" } else { "--module" }, *s]).collect()
+    symbols.iter().flat_map(|s| [if REQUIRED_NETWORK_FLAGS.contains(s) || REQUIRED_GPU_FLAGS.contains(s) { "--enable" } else { "--module" }, *s]).collect()
 }
 
 /// `CONFIG_A, CONFIG_B` for a short list, a count for a long one (the names are in the log).
@@ -662,15 +686,27 @@ pub fn missing_required_in(config: &str, defined: &std::collections::HashSet<Str
     missing_required(config).into_iter().filter(|s| defined.contains(*s)).collect()
 }
 
+/// Whether `s` is one of the graphics driver options.
+fn is_gpu_symbol(s: &str) -> bool {
+    REQUIRED_GPU_SYMBOLS.contains(&s) || REQUIRED_GPU_FLAGS.contains(&s)
+}
+
 /// What needs `symbols`, for the configuration summary.
-fn enable_users(symbols: &[&str]) -> &'static str {
+fn enable_users(symbols: &[&str]) -> String {
     let net = symbols.iter().any(|s| REQUIRED_NETWORK_SYMBOLS.contains(s) || REQUIRED_NETWORK_FLAGS.contains(s));
     let input = symbols.iter().any(|s| REQUIRED_INPUT_SYMBOLS.contains(s) || REQUIRED_BLUETOOTH_SYMBOLS.contains(s));
-    match (input, net) {
-        (true, true) => "game controllers, Bluetooth input devices, firewalls, Docker, VMs or VPNs",
-        (false, true) => "firewalls, Docker and other containers, VM networks or VPNs",
-        _ => "game controllers or Bluetooth input devices",
+    let gpu = symbols.iter().any(|s| is_gpu_symbol(s));
+    let mut users = vec![];
+    if input || !(net || gpu) {
+        users.push("game controllers or Bluetooth input devices");
     }
+    if net {
+        users.push("firewalls, Docker and other containers, VM networks or VPNs");
+    }
+    if gpu {
+        users.push("graphics cards added later (AMD, Intel, NVIDIA without its own driver)");
+    }
+    users.join("; ")
 }
 
 /// The number of =m symbols: how many modules the configuration builds.
@@ -1011,7 +1047,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         let present = present_device_modules();
         let new_present = present.iter().filter(|m| !loaded.contains(m)).count();
         let what = format!(
-            "the {} modules loaded right now, {} more for devices present but not in use, and {} common plug-in, VPN, container and VM drivers",
+            "the {} modules loaded right now, {} more for devices present but not in use, and {} common plug-in, graphics, VPN, container and VM drivers",
             loaded.len(),
             new_present,
             TUNED_EXTRA_MODULES.len()
@@ -1047,7 +1083,13 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         }
     };
     expect("LOCALVERSION", &format!("\"{LOCALVERSION}\""))?;
-    let missing = missing_required_in(&config, &defined);
+    // A graphics driver whose dependencies this config rules out (i915 on a PREEMPT_RT kernel)
+    // only costs a card this machine does not have: say so instead of refusing to build.
+    let (gpu_off, missing): (Vec<&str>, Vec<&str>) = missing_required_in(&config, &defined).into_iter().partition(|s| is_gpu_symbol(s));
+    if !gpu_off.is_empty() {
+        let why = if own_config { "" } else { " (it could not be turned on: this configuration rules out what it depends on)" };
+        notes.push(format!("CONFIG_{} is off{why}: {} would have no driver in this kernel.", gpu_off.join(", CONFIG_"), enable_users(&gpu_off)));
+    }
     if !missing.is_empty() {
         let why = if own_config { "" } else { " (it could not be turned on: an option it depends on is off in the base config)" };
         let what = format!("CONFIG_{} is off{why}: {} would not work with this kernel", missing.join(", CONFIG_"), enable_users(&missing));
@@ -1642,6 +1684,50 @@ mod tests {
         assert_eq!(option_list(&["A"; 9]), "9 options");
         assert_eq!(enable_users(&["UHID"]), "game controllers or Bluetooth input devices");
         assert_eq!(enable_users(&["NFT_REJECT"]), "firewalls, Docker and other containers, VM networks or VPNs");
+        assert_eq!(
+            enable_users(&["UHID", "NFT_REJECT"]),
+            "game controllers or Bluetooth input devices; firewalls, Docker and other containers, VM networks or VPNs"
+        );
+    }
+
+    #[test]
+    fn graphics_drivers_always_kept() {
+        for m in ["amdgpu", "radeon", "i915", "xe", "nouveau"] {
+            assert!(TUNED_EXTRA_MODULES.contains(&m), "{m} missing from TUNED_EXTRA_MODULES");
+        }
+        let mut full =
+            String::from("CONFIG_USB_HID=y\nCONFIG_HID_GENERIC=y\nCONFIG_UHID=m\nCONFIG_INPUT_UINPUT=m\nCONFIG_INPUT_JOYDEV=m\nCONFIG_PCI=y\nCONFIG_DRM=y\n");
+        for s in REQUIRED_GPU_SYMBOLS {
+            full.push_str(&format!("CONFIG_{s}=m\n"));
+        }
+        for s in REQUIRED_GPU_FLAGS {
+            full.push_str(&format!("CONFIG_{s}=y\n"));
+        }
+        assert!(missing_required(&full).is_empty());
+        // The 7.3.0 Tuned kernel on a machine with only an NVIDIA card: amdgpu (and with it SI, CIK
+        // and Display Core, which Kconfig hides) and radeon were gone, so an AMD card added later
+        // had no driver.
+        let no_amd = full
+            .replace("CONFIG_DRM_AMDGPU=m\n", "# CONFIG_DRM_AMDGPU is not set\n")
+            .replace("CONFIG_DRM_RADEON=m\n", "# CONFIG_DRM_RADEON is not set\n")
+            .replace("CONFIG_DRM_AMD_DC=y\n", "")
+            .replace("CONFIG_DRM_AMDGPU_SI=y\n", "")
+            .replace("CONFIG_DRM_AMDGPU_CIK=y\n", "");
+        let need = missing_required(&no_amd);
+        assert_eq!(need, ["DRM_AMDGPU", "DRM_RADEON", "DRM_AMD_DC", "DRM_AMDGPU_SI", "DRM_AMDGPU_CIK"]);
+        // Drivers become modules, amdgpu's yes/no options are switched on.
+        assert_eq!(
+            enable_args(&need),
+            ["--module", "DRM_AMDGPU", "--module", "DRM_RADEON", "--enable", "DRM_AMD_DC", "--enable", "DRM_AMDGPU_SI", "--enable", "DRM_AMDGPU_CIK"]
+        );
+        // A built-in driver counts as on and is never touched.
+        let builtin = full.replace("CONFIG_DRM_I915=m", "CONFIG_DRM_I915=y").replace("CONFIG_DRM_XE=m\n", "");
+        assert_eq!(missing_required(&builtin), ["DRM_XE"]);
+        // Without DRM or PCI (a headless or embedded config) none of them is asked for.
+        assert!(missing_required(&no_amd.replace("CONFIG_DRM=y\n", "")).is_empty());
+        assert!(missing_required(&no_amd.replace("CONFIG_PCI=y\n", "")).is_empty());
+        assert_eq!(enable_users(&["DRM_XE"]), "graphics cards added later (AMD, Intel, NVIDIA without its own driver)");
+        assert!(is_gpu_symbol("DRM_AMDGPU_SI") && is_gpu_symbol("DRM_NOUVEAU") && !is_gpu_symbol("UHID"));
     }
 
     #[test]
@@ -1884,7 +1970,8 @@ mod tests {
     }
 
     /// Extract and configure only, in Tuned mode on this machine: every required option (input,
-    /// Bluetooth HID, firewall/container/VPN networking) must still be on after localmodconfig.
+    /// Bluetooth HID, firewall/container/VPN networking, graphics drivers) must still be on after
+    /// localmodconfig.
     /// KERNEL_POP_LIVE_TARBALL=<tarball>.
     #[test]
     #[ignore]
@@ -1909,6 +1996,11 @@ mod tests {
             "UHID",
             "NETFILTER_XT_MATCH_HL",
             "IP6_NF_MATCH_RT",
+            "DRM_AMDGPU",
+            "DRM_RADEON",
+            "DRM_I915",
+            "DRM_XE",
+            "DRM_NOUVEAU",
         ] {
             assert!(matches!(config_value(&config, s).as_deref(), Some("y" | "m")), "CONFIG_{s} is off");
         }

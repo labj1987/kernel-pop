@@ -2822,7 +2822,7 @@ impl MainView {
                 ModeChoice::Tuned,
                 "mode-tuned",
                 "Tuned for this machine",
-                "Drivers for the hardware in this computer plus the kinds people plug in (USB storage, controllers, headsets, webcams, docks, VPN and container networking). Builds in a fraction of the time.".into(),
+                "Drivers for the hardware in this computer plus the kinds people plug in or add later (USB storage, controllers, headsets, webcams, docks, graphics cards, VPN and container networking). Builds in a fraction of the time.".into(),
                 cx,
             ),
         ];
