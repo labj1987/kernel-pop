@@ -160,9 +160,26 @@ Fixes applied in every mode with `scripts/config`, then `make olddefconfig`:
   the log and the summary say why. `olddefconfig` would drop it silently
   otherwise.
 - Debug info: see the measurement below.
+- Required options (`build::missing_required`), turned on as modules (yes/no
+  options switched on) when the base config has them off, and in Tuned again
+  after localmodconfig, which drops every module that is not loaded:
+  - input: `USB_HID`, `HID_GENERIC`, `UHID`, `INPUT_UINPUT`, `INPUT_JOYDEV`,
+    and `BT_HIDP` with classic Bluetooth. Without `UHID` (the 7.3.4 Tuned
+    kernel) Bluetooth controllers, keyboards and mice connect but never become
+    input devices.
+  - networking, whenever `NETFILTER` is on: nftables and iptables with NAT,
+    masquerade, mangle, raw and the REJECT targets, conntrack helpers, the
+    common x_tables matches, ipset and IPVS, bridge netfilter and VLAN
+    filtering, veth/macvlan/ipvlan/vxlan, overlayfs, vhost-net and vsock, TUN,
+    WireGuard and IPsec (`build::REQUIRED_NETWORK_SYMBOLS` and
+    `REQUIRED_NETWORK_FLAGS`; the list follows Docker's `check-config.sh`,
+    libvirt's NAT network, ufw/firewalld and the common VPNs). These modules
+    load only when a firewall rule, container or VPN uses them, so the 7.3.5
+    Tuned kernel had lost them all: libvirt's default network could not start
+    (no `REJECT`), and Docker ran only on what happened to be loaded.
 
-After configuring, the build refuses to start unless `LOCALVERSION` and the
-two key settings came out as set. The summary also warns when an option the
+After configuring, the build refuses to start unless `LOCALVERSION`, the
+two key settings and every required option came out as set. The summary also warns when an option the
 kernel needs to trust MOK-signed modules is off (below), and when
 `make kernelrelease` differs from `<version>-kernelpop` (a tree with its own
 localversion file).

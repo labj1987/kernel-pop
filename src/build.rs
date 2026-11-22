@@ -481,17 +481,151 @@ pub fn config_value(config: &str, name: &str) -> Option<String> {
 pub const REQUIRED_INPUT_SYMBOLS: &[&str] = &["USB_HID", "HID_GENERIC", "UHID", "INPUT_UINPUT", "INPUT_JOYDEV"];
 /// The same for kernels with classic Bluetooth (BT_BREDR): Bluetooth HID.
 pub const REQUIRED_BLUETOOTH_SYMBOLS: &[&str] = &["BT_HIDP"];
+/// Options every kernel with netfilter must have as modules (or built in): firewalls (nftables,
+/// iptables, ufw, firewalld), NAT, Docker and Podman networking (Docker's check-config list),
+/// libvirt's NAT network, VPNs (WireGuard, OpenVPN, Tailscale, IPsec) and VM networking. They
+/// are only loaded when used, so Tuned's localmodconfig used to drop them: libvirt's default
+/// network could not start without the REJECT targets.
+pub const REQUIRED_NETWORK_SYMBOLS: &[&str] = &[
+    // nftables
+    "NF_TABLES",
+    "NFT_CT",
+    "NFT_NAT",
+    "NFT_MASQ",
+    "NFT_REDIR",
+    "NFT_REJECT",
+    "NFT_REJECT_INET",
+    "NFT_COMPAT",
+    "NFT_LIMIT",
+    "NFT_LOG",
+    "NFT_NUMGEN",
+    "NFT_QUOTA",
+    "NFT_FIB_INET",
+    "NFT_FIB_IPV4",
+    "NFT_FIB_IPV6",
+    "NFT_FWD_NETDEV",
+    // connection tracking, NAT and REJECT
+    "NF_CONNTRACK",
+    "NF_NAT",
+    "NF_REJECT_IPV4",
+    "NF_REJECT_IPV6",
+    "NF_CONNTRACK_FTP",
+    "NF_NAT_FTP",
+    "NF_CONNTRACK_TFTP",
+    "NF_NAT_TFTP",
+    // x_tables matches and targets (iptables, iptables-nft, ufw, Docker)
+    "NETFILTER_XTABLES",
+    "NETFILTER_XT_MATCH_ADDRTYPE",
+    "NETFILTER_XT_MATCH_CONNTRACK",
+    "NETFILTER_XT_MATCH_IPVS",
+    "NETFILTER_XT_MARK",
+    "NETFILTER_XT_CONNMARK",
+    "NETFILTER_XT_MATCH_COMMENT",
+    "NETFILTER_XT_MATCH_LIMIT",
+    "NETFILTER_XT_MATCH_MULTIPORT",
+    "NETFILTER_XT_MATCH_RECENT",
+    "NETFILTER_XT_MATCH_OWNER",
+    "NETFILTER_XT_MATCH_STATE",
+    "NETFILTER_XT_TARGET_LOG",
+    "NETFILTER_XT_TARGET_TCPMSS",
+    "NETFILTER_XT_TARGET_CHECKSUM",
+    "NETFILTER_XT_TARGET_MASQUERADE",
+    "NETFILTER_XT_TARGET_REDIRECT",
+    // iptables tables (IPv4 and IPv6)
+    "IP_NF_IPTABLES",
+    "IP_NF_FILTER",
+    "IP_NF_MANGLE",
+    "IP_NF_RAW",
+    "IP_NF_NAT",
+    "IP_NF_TARGET_REJECT",
+    "IP_NF_TARGET_MASQUERADE",
+    "IP_NF_TARGET_REDIRECT",
+    "IP6_NF_IPTABLES",
+    "IP6_NF_FILTER",
+    "IP6_NF_MANGLE",
+    "IP6_NF_RAW",
+    "IP6_NF_NAT",
+    "IP6_NF_TARGET_REJECT",
+    "IP6_NF_TARGET_MASQUERADE",
+    // ipset and IPVS (firewalld, Docker swarm, kube-proxy)
+    "IP_SET",
+    "IP_SET_HASH_IP",
+    "IP_SET_HASH_NET",
+    "IP_VS",
+    "IP_VS_RR",
+    // container and VM networking
+    "BRIDGE",
+    "BRIDGE_NETFILTER",
+    "VLAN_8021Q",
+    "VETH",
+    "MACVLAN",
+    "IPVLAN",
+    "VXLAN",
+    "DUMMY",
+    "OVERLAY_FS",
+    "NET_CLS_CGROUP",
+    "VHOST_NET",
+    "MACVTAP",
+    "VSOCKETS",
+    "VHOST_VSOCK",
+    // VPNs
+    "TUN",
+    "WIREGUARD",
+    "INET_ESP",
+    "INET6_ESP",
+    "XFRM_USER",
+];
+/// The yes/no options the network modules above need (they cannot be modules).
+pub const REQUIRED_NETWORK_FLAGS: &[&str] = &[
+    "NETFILTER_ADVANCED",
+    "NF_TABLES_INET",
+    "NF_TABLES_IPV4",
+    "NF_TABLES_IPV6",
+    "NF_TABLES_NETDEV",
+    "BRIDGE_VLAN_FILTERING",
+    "IP_VS_PROTO_TCP",
+    "IP_VS_PROTO_UDP",
+    "IP_VS_NFCT",
+    "IP_VS_IPV6",
+    "POSIX_MQUEUE",
+];
 
 /// The required options `config` leaves off (neither y nor m). For Match
-/// and Tuned these are turned on as modules before configuring, since
-/// localmodconfig only ever removes modules.
+/// and Tuned these are turned on before configuring, and for Tuned again
+/// after localmodconfig, which removes every module that is not loaded.
 pub fn missing_required(config: &str) -> Vec<&'static str> {
     let on = |s: &str| matches!(config_value(config, s).as_deref(), Some("y" | "m"));
     let mut need: Vec<&'static str> = REQUIRED_INPUT_SYMBOLS.to_vec();
     if on("BT") && on("BT_BREDR") {
         need.extend_from_slice(REQUIRED_BLUETOOTH_SYMBOLS);
     }
+    if on("NETFILTER") {
+        need.extend_from_slice(REQUIRED_NETWORK_FLAGS);
+        need.extend_from_slice(REQUIRED_NETWORK_SYMBOLS);
+    }
     need.into_iter().filter(|s| !on(s)).collect()
+}
+
+/// scripts/config arguments that turn `symbols` on: yes/no options with
+/// --enable, everything else as a module (a missing option is never =y, so
+/// nothing built in is demoted).
+pub fn enable_args<'a>(symbols: &[&'a str]) -> Vec<&'a str> {
+    symbols.iter().flat_map(|s| [if REQUIRED_NETWORK_FLAGS.contains(s) { "--enable" } else { "--module" }, *s]).collect()
+}
+
+/// What needs `symbols`, for the configuration summary.
+fn enable_users(symbols: &[&str]) -> &'static str {
+    let net = symbols.iter().any(|s| REQUIRED_NETWORK_SYMBOLS.contains(s) || REQUIRED_NETWORK_FLAGS.contains(s));
+    let input = symbols.iter().any(|s| REQUIRED_INPUT_SYMBOLS.contains(s) || REQUIRED_BLUETOOTH_SYMBOLS.contains(s));
+    match (input, net) {
+        (true, true) => "game controllers, Bluetooth input devices, firewalls, Docker, VMs or VPNs",
+        (false, true) => "firewalls, Docker and other containers, VM networks or VPNs",
+        _ => "game controllers or Bluetooth input devices",
+    }
+}
+
+fn enable_what(symbols: &[&str]) -> String {
+    format!("for {}", enable_users(symbols))
 }
 
 /// The number of =m symbols: how many modules the configuration builds.
@@ -778,24 +912,19 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         "SYSTEM_REVOCATION_KEYS set to \"\" (same reason)".to_string(),
         format!("Debug info {debug_text}"),
     ];
-    let apply_fixes = || -> Result<()> {
+    let apply_fixes = |enable: &[&str]| -> Result<()> {
         let mut c = scripts_config(tree);
         c.args(["--set-str", "LOCALVERSION", LOCALVERSION])
             .args(["--set-str", "SYSTEM_TRUSTED_KEYS", ""])
             .args(["--set-str", "SYSTEM_REVOCATION_KEYS", ""])
-            .args(&debug_args);
-        for sym in &enable {
-            c.args(["--module", sym]);
-        }
+            .args(&debug_args)
+            .args(enable_args(enable));
         r.run(c, "scripts/config").map(|_| ())
     };
     if !enable.is_empty() {
-        fixes.push(format!(
-            "CONFIG_{} turned on as modules (game controllers and Bluetooth controllers, keyboards and mice need them)",
-            enable.join(", CONFIG_")
-        ));
+        fixes.push(format!("Turned on {}: CONFIG_{}", enable_what(&enable), enable.join(", CONFIG_")));
     }
-    apply_fixes()?;
+    apply_fixes(&enable)?;
 
     let mut notes = vec![];
     if base_rust {
@@ -848,8 +977,13 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
         let mut c = make(tree);
         c.arg(format!("LSMOD={}", list.display())).arg("localmodconfig");
         r.run(c, "make localmodconfig")?;
-        apply_fixes()?;
+        // localmodconfig drops every module that is not loaded, required ones included: put them back.
+        let restore = missing_required(&std::fs::read_to_string(tree.join(".config"))?);
+        apply_fixes(&restore)?;
         olddefconfig()?;
+        if !restore.is_empty() {
+            fixes.push(format!("Kept after localmodconfig {}: {} options", enable_what(&restore), restore.len()));
+        }
         fixes.push(format!("localmodconfig: only drivers for {what}"));
         notes.push(
             "Tuned: hardware that is not present now and not a common plug-in kind (an unusual USB gadget, a different Wi-Fi card) may have no driver in this kernel; Match this system includes everything.".into(),
@@ -866,7 +1000,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     expect("LOCALVERSION", &format!("\"{LOCALVERSION}\""))?;
     let missing = missing_required(&config);
     if !missing.is_empty() {
-        let what = format!("CONFIG_{} is off: game controllers or Bluetooth input devices would not work with this kernel", missing.join(", CONFIG_"));
+        let what = format!("CONFIG_{} is off: {} would not work with this kernel", missing.join(", CONFIG_"), enable_users(&missing));
         if own_config {
             notes.push(format!("{what}."));
         } else {
@@ -1421,6 +1555,38 @@ mod tests {
     }
 
     #[test]
+    fn firewall_container_and_vpn_options_always_kept() {
+        let mut full =
+            String::from("CONFIG_USB_HID=y\nCONFIG_HID_GENERIC=y\nCONFIG_UHID=m\nCONFIG_INPUT_UINPUT=m\nCONFIG_INPUT_JOYDEV=m\nCONFIG_NETFILTER=y\n");
+        for s in REQUIRED_NETWORK_FLAGS {
+            full.push_str(&format!("CONFIG_{s}=y\n"));
+        }
+        for s in REQUIRED_NETWORK_SYMBOLS {
+            full.push_str(&format!("CONFIG_{s}=m\n"));
+        }
+        assert!(missing_required(&full).is_empty());
+        // LordNikon's 7.3.5 Tuned kernel: no REJECT, so libvirt's NAT network could not start.
+        let no_reject = full
+            .replace("CONFIG_NFT_REJECT=m\n", "# CONFIG_NFT_REJECT is not set\n")
+            .replace("CONFIG_IP_NF_TARGET_REJECT=m\n", "")
+            .replace("CONFIG_BRIDGE_VLAN_FILTERING=y\n", "");
+        assert_eq!(missing_required(&no_reject), ["BRIDGE_VLAN_FILTERING", "NFT_REJECT", "IP_NF_TARGET_REJECT"]);
+        // Yes/no options are switched on, the rest become modules.
+        assert_eq!(enable_args(&["BRIDGE_VLAN_FILTERING", "NFT_REJECT"]), ["--enable", "BRIDGE_VLAN_FILTERING", "--module", "NFT_REJECT"]);
+        // Without netfilter at all, none of them is asked for.
+        let no_netfilter = no_reject.replace("CONFIG_NETFILTER=y\n", "");
+        assert!(missing_required(&no_netfilter).is_empty());
+        // Every option is listed once, in one list, as a plain Kconfig name.
+        let mut seen = std::collections::HashSet::new();
+        for s in REQUIRED_INPUT_SYMBOLS.iter().chain(REQUIRED_BLUETOOTH_SYMBOLS).chain(REQUIRED_NETWORK_FLAGS).chain(REQUIRED_NETWORK_SYMBOLS) {
+            assert!(s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'), "{s}");
+            assert!(seen.insert(*s), "{s} listed twice");
+        }
+        assert_eq!(enable_users(&["UHID"]), "game controllers or Bluetooth input devices");
+        assert_eq!(enable_users(&["NFT_REJECT"]), "firewalls, Docker and other containers, VM networks or VPNs");
+    }
+
+    #[test]
     fn config_values() {
         let c = "CONFIG_RUST=y\nCONFIG_LOCALVERSION=\"-kernelpop\"\n# CONFIG_DEBUG_INFO_NONE is not set\nCONFIG_E1000=m\nCONFIG_EXT4_FS=y\nCONFIG_SND=m\n";
         assert_eq!(config_value(c, "RUST").as_deref(), Some("y"));
@@ -1657,6 +1823,28 @@ mod tests {
         let tree = p.tree.clone();
         p.discard();
         assert!(!tree.exists());
+    }
+
+    /// Extract and configure only, in Tuned mode on this machine: every required option (input,
+    /// Bluetooth HID, firewall/container/VPN networking) must still be on after localmodconfig.
+    /// KERNEL_POP_LIVE_TARBALL=<tarball>.
+    #[test]
+    #[ignore]
+    fn live_prepare_tuned_keeps_required_options() {
+        let path = PathBuf::from(std::env::var("KERNEL_POP_LIVE_TARBALL").expect("set KERNEL_POP_LIVE_TARBALL"));
+        let tarball = crate::source::inspect(&path).unwrap();
+        let running = String::from_utf8(Command::new("uname").arg("-r").output().unwrap().stdout).unwrap().trim().to_string();
+        let trust = SourceTrust::Unverified { reason: "test: configure only".into() };
+        let req = BuildRequest { tarball, trust, mode: ConfigMode::TunedForMachine, running_kernel: running };
+        let events: EventSink = Arc::new(|_| {});
+        let p = prepare(req, events, BuildControl::new(), 300 << 20).unwrap();
+        println!("{}", p.summary.text());
+        let config = std::fs::read_to_string(p.tree.join(".config")).unwrap();
+        assert!(missing_required(&config).is_empty(), "{:?}", missing_required(&config));
+        for s in ["NFT_REJECT", "IP_NF_TARGET_REJECT", "IP_NF_TARGET_MASQUERADE", "NFT_MASQ", "BRIDGE_NETFILTER", "WIREGUARD", "UHID"] {
+            assert!(matches!(config_value(&config, s).as_deref(), Some("y" | "m")), "CONFIG_{s} is off");
+        }
+        p.discard();
     }
 
     /// A real build of a real kernel.org tarball, like the Build page does
