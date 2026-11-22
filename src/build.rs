@@ -720,8 +720,8 @@ fn enable_users(symbols: &[&str]) -> String {
 fn gpu_cards(s: &str) -> &'static str {
     match s {
         "DRM_RADEON" => "older AMD/ATI",
-        "DRM_I915" => "Intel",
-        "DRM_XE" => "Intel Arc and newer",
+        "DRM_I915" => "Intel (up to Arc A-series)",
+        "DRM_XE" => "Intel (Xe2: Arc B-series, Lunar Lake and newer)",
         "DRM_NOUVEAU" => "NVIDIA (nouveau)",
         _ => "AMD",
     }
@@ -729,12 +729,14 @@ fn gpu_cards(s: &str) -> &'static str {
 
 /// Why this configuration cannot have the graphics driver `s` at all, for the cases its
 /// Kconfig rules out (i915 needs x86 and no PREEMPT_RT, xe needs 4 KiB pages); None otherwise.
-fn gpu_ruled_out(config: &str, s: &str) -> Option<&'static str> {
+/// `defined` holds the tree's Kconfig symbols: a tree without a PAGE_SIZE_4KB option says
+/// nothing about xe's page size, so xe off there is refused like any other option.
+fn gpu_ruled_out(config: &str, defined: &std::collections::HashSet<String>, s: &str) -> Option<&'static str> {
     let y = |n: &str| config_value(config, n).as_deref() == Some("y");
     match s {
         "DRM_I915" if y("PREEMPT_RT") => Some("this is a PREEMPT_RT kernel, which i915 cannot be built for"),
         "DRM_I915" if !y("X86") => Some("i915 is for x86 kernels only"),
-        "DRM_XE" if !y("PAGE_SIZE_4KB") => Some("xe needs 4 KiB pages"),
+        "DRM_XE" if defined.contains("PAGE_SIZE_4KB") && !y("PAGE_SIZE_4KB") => Some("xe needs 4 KiB pages"),
         _ => None,
     }
 }
@@ -748,11 +750,11 @@ fn still_on<'a>(config: &str, symbols: &[&'a str]) -> Vec<&'a str> {
 /// Splits the required options a finished configuration still has off into summary notes,
 /// for graphics drivers `config` rules out (only a card this kind of kernel cannot drive
 /// goes without), and the rest, which refuse the build.
-fn split_missing(config: &str, missing: Vec<&'static str>) -> (Vec<(&'static str, String)>, Vec<&'static str>) {
+fn split_missing(config: &str, defined: &std::collections::HashSet<String>, missing: Vec<&'static str>) -> (Vec<(&'static str, String)>, Vec<&'static str>) {
     let mut noted = vec![];
     let mut refuse = vec![];
     for s in missing {
-        match gpu_ruled_out(config, s) {
+        match gpu_ruled_out(config, defined, s) {
             Some(why) => noted.push((s, format!("CONFIG_{s} is off ({why}): {} graphics cards would have no driver in this kernel.", gpu_cards(s)))),
             None => refuse.push(s),
         }
@@ -1135,7 +1137,7 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
     expect("LOCALVERSION", &format!("\"{LOCALVERSION}\""))?;
     // A graphics driver this kind of kernel cannot have (i915 on PREEMPT_RT) is a note; anything
     // else that is off refuses the build.
-    let (noted, missing) = split_missing(&config, missing_required_in(&config, &defined));
+    let (noted, missing) = split_missing(&config, &defined, missing_required_in(&config, &defined));
     notes.extend(noted.into_iter().map(|(_, n)| n));
     let restored = still_on(&config, &restore);
     if let Some(i) = restore_fix.filter(|_| !restored.is_empty()) {
@@ -1781,7 +1783,7 @@ mod tests {
         // Without DRM or PCI (a headless or embedded config) none of them is asked for.
         assert!(missing_required(&no_amd.replace("CONFIG_DRM=y\n", "")).is_empty());
         assert!(missing_required(&no_amd.replace("CONFIG_PCI=y\n", "")).is_empty());
-        assert_eq!(enable_users(&["DRM_XE"]), "graphics cards added later (Intel Arc and newer)");
+        assert_eq!(enable_users(&["DRM_XE"]), "graphics cards added later (Intel (Xe2: Arc B-series, Lunar Lake and newer))");
         assert_eq!(
             enable_users(&["DRM_AMDGPU", "DRM_RADEON", "DRM_AMD_DC", "DRM_NOUVEAU"]),
             "graphics cards added later (AMD, older AMD/ATI, NVIDIA (nouveau))"
@@ -1796,23 +1798,28 @@ mod tests {
 
     #[test]
     fn only_ruled_out_graphics_drivers_are_notes() {
+        let defined: std::collections::HashSet<String> = ["X86", "PREEMPT_RT", "PAGE_SIZE_4KB", "PAGE_SIZE_16KB"].iter().map(|s| s.to_string()).collect();
+        let split = |config: &str, missing: Vec<&'static str>| split_missing(config, &defined, missing);
         let x86 = "CONFIG_X86=y\nCONFIG_PAGE_SIZE_4KB=y\n";
         // i915 on a PREEMPT_RT kernel cannot be built: a note, the build goes on.
         let rt = format!("{x86}CONFIG_PREEMPT_RT=y\n");
-        let (noted, refuse) = split_missing(&rt, vec!["DRM_I915"]);
+        let (noted, refuse) = split(&rt, vec!["DRM_I915"]);
         assert!(refuse.is_empty());
         assert_eq!(noted.len(), 1);
         assert_eq!(noted[0].0, "DRM_I915");
-        assert!(noted[0].1.contains("PREEMPT_RT") && noted[0].1.contains("Intel graphics cards"), "{}", noted[0].1);
+        assert!(noted[0].1.contains("PREEMPT_RT") && noted[0].1.contains("Intel (up to Arc A-series) graphics cards"), "{}", noted[0].1);
         // xe without 4 KiB pages: a note.
-        let (noted, refuse) = split_missing("CONFIG_X86=y\nCONFIG_PAGE_SIZE_16KB=y\n", vec!["DRM_XE"]);
-        assert!(refuse.is_empty() && noted[0].1.contains("4 KiB"));
+        let (noted, refuse) = split("CONFIG_X86=y\nCONFIG_PAGE_SIZE_16KB=y\n", vec!["DRM_XE"]);
+        assert!(refuse.is_empty() && noted[0].1.contains("4 KiB") && noted[0].1.contains("Xe2"), "{}", noted[0].1);
+        // A tree with no PAGE_SIZE_4KB option at all: nothing rules xe out, so it is refused.
+        let no_page_option: std::collections::HashSet<String> = ["X86".to_string()].into_iter().collect();
+        assert_eq!(split_missing("CONFIG_X86=y\n", &no_page_option, vec!["DRM_XE"]), (vec![], vec!["DRM_XE"]));
         // i915 on a non-x86 kernel: a note.
-        assert!(split_missing("CONFIG_ARM64=y\n", vec!["DRM_I915"]).1.is_empty());
+        assert!(split("CONFIG_ARM64=y\n", vec!["DRM_I915"]).1.is_empty());
         // amdgpu off on a plain x86 config is the case this exists for: refused, as is i915 there.
-        assert_eq!(split_missing(x86, vec!["DRM_AMDGPU", "DRM_I915", "DRM_XE"]), (vec![], vec!["DRM_AMDGPU", "DRM_I915", "DRM_XE"]));
+        assert_eq!(split(x86, vec!["DRM_AMDGPU", "DRM_I915", "DRM_XE"]), (vec![], vec!["DRM_AMDGPU", "DRM_I915", "DRM_XE"]));
         // Other required options are refused even on RT.
-        assert_eq!(split_missing(&rt, vec!["UHID", "DRM_AMD_DC"]), (vec![], vec!["UHID", "DRM_AMD_DC"]));
+        assert_eq!(split(&rt, vec!["UHID", "DRM_AMD_DC"]), (vec![], vec!["UHID", "DRM_AMD_DC"]));
     }
 
     #[test]

@@ -274,7 +274,9 @@ build measured the same way on 2026-11-22, on a faster 32-thread machine:
 headers deb 10.4 MB. The five graphics drivers were 2465 of its 7888
 compiled files, so where none of them was loaded before (an NVIDIA card on
 the proprietary driver), a Tuned build compiles about 45% more files than
-it did; it still takes under half as long as Match this system.
+it did. Match this system was not measured on 7.3.5: that machine runs a
+Tuned kernel (431 modules), so Match there starts from a config of about
+the same size and says nothing about an Ubuntu config's 6703 modules.
 
 Version 2.1.0 also had "Trim to this machine" (only the modules loaded
 right now): 226 modules, 6 min 41 s, 3.2 GB. It was removed in 2.1.2: Tuned

@@ -12,9 +12,9 @@ headings.
   a new kernel. Match this system and Tuned now always keep the AMD (amdgpu, and radeon for older
   cards), Intel (i915, xe) and NVIDIA (nouveau) graphics drivers as modules. If your kernel had
   amdgpu's support for GCN 1 and 2 cards (Radeon HD 7000, R7/R9 200) off, such a card now uses
-  amdgpu instead of radeon, as upstream Linux does by default (`radeon.si_support=1
-  amdgpu.si_support=0`, or the same with `cik_support`, switches it back). Tuned builds take longer for it: the graphics drivers are about a third of
-  what a Tuned kernel compiles.
+  amdgpu instead of radeon, as current upstream Linux does by default (`radeon.si_support=1
+  amdgpu.si_support=0`, or the same with `cik_support`, switches it back). Tuned builds take
+  longer for it: the graphics drivers are about a third of what a Tuned kernel compiles.
 
 ## 2.6.1 — 2026-11-22
 
