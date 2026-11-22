@@ -52,8 +52,10 @@ VFS-panics on boot. This app is built around not letting that happen:
   the hardware in this computer plus the kinds people plug in, such as USB
   storage, USB and Bluetooth controllers, keyboards and mice, headsets,
   webcams, docks and VPN/container
-  networking; about a third of the build time; both keep what game
-  controllers, firewalls, Docker, VMs and VPNs need) and **Use my own .config**. The fixes every
+  networking; about 420 modules instead of the 6700 of an Ubuntu config; both keep what game
+  controllers, firewalls, Docker, VMs and VPNs need, and the AMD, Intel
+  and NVIDIA (nouveau) graphics drivers, so a graphics card added later
+  works without a rebuild) and **Use my own .config**. The fixes every
   Ubuntu config needs for a kernel.org tree are applied automatically, and
   a summary is shown before the build starts
 - Builds never run as root. Missing build tools are listed and installed
