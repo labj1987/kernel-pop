@@ -965,6 +965,9 @@ fn configure(req: &BuildRequest, tree: &Path, base_config: &Path, r: &Runner) ->
             .args(["--set-str", "SYSTEM_REVOCATION_KEYS", ""])
             .args(&debug_args)
             .args(enable_args(enable));
+        if !enable.is_empty() {
+            r.note(format!("Turning on CONFIG_{}", enable.join(", CONFIG_")));
+        }
         r.run(c, "scripts/config").map(|_| ())
     };
     if !enable.is_empty() {
