@@ -4,7 +4,7 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
-## Unreleased
+## 2.6.2 — 2026-11-22
 
 - **A graphics card added later works with a Tuned kernel.** Tuned for this machine kept only the
   driver of the graphics card in the computer while you configured, so a second or replacement
