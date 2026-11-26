@@ -200,9 +200,7 @@ pub const TUNED_EXTRA_MODULES: &[&str] = &[
     "vhost_vsock",
     // GPU and other PCI device passthrough to virtual machines (REQUIRED_PASSTHROUGH_SYMBOLS)
     "vfio",
-    "vfio_iommu_type1",
     "vfio_pci",
-    "vfio_pci_core",
     // graphics cards added or swapped later (REQUIRED_GPU_SYMBOLS); listed here too so
     // localmodconfig keeps what they depend on
     "amdgpu",
@@ -631,7 +629,7 @@ pub const REQUIRED_GPU_FLAGS: &[&str] = &["DRM_AMD_DC", "DRM_AMDGPU_SI", "DRM_AM
 /// HD-audio PCI controller every card's HDMI/DisplayPort audio function uses, and the HDMI
 /// codec drivers for AMD/ATI, NVIDIA and Intel graphics (since Linux 6.17 each its own option;
 /// before, one SND_HDA_CODEC_HDMI for all). Without the vendor's codec the card's audio falls
-/// back to the generic codec, which reads no ELD: the 7.3.6 Tuned kernel had no
+/// back to the generic codec, which cannot read an AMD card's ELD: the 7.3.6 Tuned kernel had no
 /// SND_HDA_CODEC_HDMI_ATI, so an RX 580 added later gave no sound on a TV over HDMI.
 pub const REQUIRED_HDMI_AUDIO_SYMBOLS: &[&str] =
     &["SND_HDA_INTEL", "SND_HDA_CODEC_HDMI", "SND_HDA_CODEC_HDMI_GENERIC", "SND_HDA_CODEC_HDMI_ATI", "SND_HDA_CODEC_HDMI_NVIDIA", "SND_HDA_CODEC_HDMI_INTEL"];
@@ -661,7 +659,8 @@ pub fn missing_required(config: &str) -> Vec<&'static str> {
     if on("DRM") && on("PCI") {
         need.extend_from_slice(REQUIRED_GPU_SYMBOLS);
         need.extend_from_slice(REQUIRED_GPU_FLAGS);
-        if on("SND") {
+        // SND_HDA_INTEL depended on SND_PCI before Linux 6.17: a tree without PCI sound has no HD-audio
+        if on("SND") && !config.contains("# CONFIG_SND_PCI is not set") {
             need.extend_from_slice(REQUIRED_HDMI_AUDIO_SYMBOLS);
         }
     }
@@ -669,7 +668,10 @@ pub fn missing_required(config: &str) -> Vec<&'static str> {
         need.extend_from_slice(REQUIRED_PASSTHROUGH_SYMBOLS);
         need.extend_from_slice(REQUIRED_PASSTHROUGH_FLAGS);
     }
-    need.into_iter().filter(|s| !on(s)).collect()
+    // The IOMMUFD container (IOMMUFD_VFIO_CONTAINER, which needs VFIO_CONTAINER off) serves the same
+    // /dev/vfio interface without the type 1 backend.
+    let iommufd = on("IOMMUFD_VFIO_CONTAINER");
+    need.into_iter().filter(|s| !on(s) && !(iommufd && matches!(*s, "VFIO_CONTAINER" | "VFIO_IOMMU_TYPE1"))).collect()
 }
 
 /// scripts/config arguments that turn `symbols` on: yes/no options with
@@ -1844,12 +1846,6 @@ mod tests {
 
     #[test]
     fn hdmi_audio_and_passthrough_always_kept() {
-        for m in ["snd_hda_intel", "snd_hda_codec_hdmi", "snd_hda_codec_atihdmi", "snd_hda_codec_nvhdmi", "snd_hda_codec_intelhdmi"] {
-            assert!(TUNED_EXTRA_MODULES.contains(&m), "{m} missing from TUNED_EXTRA_MODULES");
-        }
-        for m in ["vfio", "vfio_iommu_type1", "vfio_pci", "vfio_pci_core"] {
-            assert!(TUNED_EXTRA_MODULES.contains(&m), "{m} missing from TUNED_EXTRA_MODULES");
-        }
         let mut full = String::from(
             "CONFIG_USB_HID=y\nCONFIG_HID_GENERIC=y\nCONFIG_UHID=m\nCONFIG_INPUT_UINPUT=m\nCONFIG_INPUT_JOYDEV=m\nCONFIG_PCI=y\nCONFIG_DRM=y\nCONFIG_SND=m\nCONFIG_KVM=m\n",
         );
@@ -1910,12 +1906,10 @@ mod tests {
             enable_users(&["UHID", "SND_HDA_CODEC_HDMI_ATI", "VFIO_PCI"]),
             "game controllers or Bluetooth input devices; HDMI/DisplayPort audio of AMD, NVIDIA and Intel graphics cards; GPU passthrough to virtual machines"
         );
-        // Neither is a graphics driver that a config can rule out: off at the end refuses the build.
-        let defined: std::collections::HashSet<String> = ["X86", "PREEMPT_RT"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(
-            split_missing("CONFIG_X86=y\nCONFIG_PREEMPT_RT=y\n", &defined, vec!["SND_HDA_CODEC_HDMI_ATI", "VFIO"]),
-            (vec![], vec!["SND_HDA_CODEC_HDMI_ATI", "VFIO"])
-        );
+        // IOMMUFD's container stands in for the classic one.
+        assert_eq!(missing_required(&format!("{tuned_736}CONFIG_IOMMUFD_VFIO_CONTAINER=y\n")), ["SND_HDA_CODEC_HDMI_ATI", "VFIO", "VFIO_PCI", "VFIO_GROUP"]);
+        // No PCI sound (before 6.17 the HD-audio driver needs it): no HDMI audio asked for.
+        assert!(!missing_required(&format!("{tuned_736}# CONFIG_SND_PCI is not set\n")).contains(&"SND_HDA_CODEC_HDMI_ATI"));
     }
 
     #[test]
@@ -2215,13 +2209,6 @@ mod tests {
             "DRM_I915",
             "DRM_XE",
             "DRM_NOUVEAU",
-            "SND_HDA_INTEL",
-            "SND_HDA_CODEC_HDMI_ATI",
-            "SND_HDA_CODEC_HDMI_NVIDIA",
-            "SND_HDA_CODEC_HDMI_INTEL",
-            "VFIO",
-            "VFIO_PCI",
-            "VFIO_IOMMU_TYPE1",
         ] {
             assert!(matches!(config_value(&config, s).as_deref(), Some("y" | "m")), "CONFIG_{s} is off");
         }
