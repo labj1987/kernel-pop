@@ -71,8 +71,9 @@ pub const TUNED_BUILD_NEED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// plugged in later or used only now and then: USB storage and card
 /// readers, the common file systems, input devices and game controllers,
 /// USB audio and webcams, Bluetooth, USB network adapters and phone
-/// tethering, docks, printers and serial adapters, graphics cards, and the
-/// networking that VPNs, containers and virtual machines load on demand.
+/// tethering, docks, printers and serial adapters, graphics cards and their
+/// HDMI/DisplayPort audio, the networking that VPNs, containers and virtual
+/// machines load on demand, and GPU passthrough to virtual machines.
 /// Names that do not exist in a tree are ignored by localmodconfig.
 pub const TUNED_EXTRA_MODULES: &[&str] = &[
     // storage and card readers
@@ -197,6 +198,9 @@ pub const TUNED_EXTRA_MODULES: &[&str] = &[
     "kvm_amd",
     "vhost_net",
     "vhost_vsock",
+    // GPU and other PCI device passthrough to virtual machines (REQUIRED_PASSTHROUGH_SYMBOLS)
+    "vfio",
+    "vfio_pci",
     // graphics cards added or swapped later (REQUIRED_GPU_SYMBOLS); listed here too so
     // localmodconfig keeps what they depend on
     "amdgpu",
@@ -204,6 +208,13 @@ pub const TUNED_EXTRA_MODULES: &[&str] = &[
     "i915",
     "xe",
     "nouveau",
+    // their HDMI/DisplayPort audio (REQUIRED_HDMI_AUDIO_SYMBOLS): the HD-audio controller and
+    // the AMD, NVIDIA and Intel HDMI codecs (one module for all of them before Linux 6.17)
+    "snd_hda_intel",
+    "snd_hda_codec_hdmi",
+    "snd_hda_codec_atihdmi",
+    "snd_hda_codec_nvhdmi",
+    "snd_hda_codec_intelhdmi",
     // encrypted and image-backed disks, compressed swap, Wine/Proton sync
     "dm_crypt",
     "dm_mod",
@@ -614,6 +625,23 @@ pub const REQUIRED_GPU_SYMBOLS: &[&str] = &["DRM_AMDGPU", "DRM_RADEON", "DRM_I91
 /// display path for Vega and newer) and the 2012-2013 GCN 1/2 cards (SI, CIK), which amdgpu
 /// drives by default when built with them (radeon takes them otherwise, without Vulkan).
 pub const REQUIRED_GPU_FLAGS: &[&str] = &["DRM_AMD_DC", "DRM_AMDGPU_SI", "DRM_AMDGPU_CIK"];
+/// The sound side of those graphics cards, for every kernel with sound, DRM and PCI: the
+/// HD-audio PCI controller every card's HDMI/DisplayPort audio function uses, and the HDMI
+/// codec drivers for AMD/ATI, NVIDIA and Intel graphics (since Linux 6.17 each its own option;
+/// before, one SND_HDA_CODEC_HDMI for all). Without the vendor's codec the card's audio falls
+/// back to the generic codec, which cannot read an AMD card's ELD: the 7.3.6 Tuned kernel had no
+/// SND_HDA_CODEC_HDMI_ATI, so an RX 580 added later gave no sound on a TV over HDMI.
+pub const REQUIRED_HDMI_AUDIO_SYMBOLS: &[&str] =
+    &["SND_HDA_INTEL", "SND_HDA_CODEC_HDMI", "SND_HDA_CODEC_HDMI_GENERIC", "SND_HDA_CODEC_HDMI_ATI", "SND_HDA_CODEC_HDMI_NVIDIA", "SND_HDA_CODEC_HDMI_INTEL"];
+/// GPU (and any PCI device) passthrough to virtual machines, for every kernel with KVM and
+/// PCI: the VFIO framework, its PCI driver and the type 1 IOMMU backend libvirt and QEMU use.
+/// Nothing loads them until a device is handed to a VM, so Tuned's localmodconfig dropped them
+/// (the 7.3.5 and 7.3.6 Tuned kernels could not pass a graphics card to a VM).
+/// VFIO_IOMMU_TYPE1 has no prompt: it comes with VFIO_CONTAINER, below.
+pub const REQUIRED_PASSTHROUGH_SYMBOLS: &[&str] = &["VFIO", "VFIO_PCI", "VFIO_IOMMU_TYPE1"];
+/// The yes/no options VFIO_IOMMU_TYPE1 needs: the classic /dev/vfio group and container
+/// interface (the container selects the type 1 backend on x86).
+pub const REQUIRED_PASSTHROUGH_FLAGS: &[&str] = &["VFIO_GROUP", "VFIO_CONTAINER"];
 
 /// The required options `config` leaves off (neither y nor m). For Match
 /// and Tuned these are turned on before configuring, and for Tuned again
@@ -631,15 +659,26 @@ pub fn missing_required(config: &str) -> Vec<&'static str> {
     if on("DRM") && on("PCI") {
         need.extend_from_slice(REQUIRED_GPU_SYMBOLS);
         need.extend_from_slice(REQUIRED_GPU_FLAGS);
+        if on("SND") {
+            need.extend_from_slice(REQUIRED_HDMI_AUDIO_SYMBOLS);
+        }
     }
-    need.into_iter().filter(|s| !on(s)).collect()
+    if on("KVM") && on("PCI") {
+        need.extend_from_slice(REQUIRED_PASSTHROUGH_SYMBOLS);
+        need.extend_from_slice(REQUIRED_PASSTHROUGH_FLAGS);
+    }
+    // The IOMMUFD container (IOMMUFD_VFIO_CONTAINER, which needs VFIO_CONTAINER off) serves the same
+    // /dev/vfio interface without the type 1 backend.
+    let iommufd = on("IOMMUFD_VFIO_CONTAINER");
+    need.into_iter().filter(|s| !on(s) && !(iommufd && matches!(*s, "VFIO_CONTAINER" | "VFIO_IOMMU_TYPE1"))).collect()
 }
 
 /// scripts/config arguments that turn `symbols` on: yes/no options with
 /// --enable, everything else as a module (a missing option is never =y, so
 /// nothing built in is demoted).
 pub fn enable_args<'a>(symbols: &[&'a str]) -> Vec<&'a str> {
-    symbols.iter().flat_map(|s| [if REQUIRED_NETWORK_FLAGS.contains(s) || REQUIRED_GPU_FLAGS.contains(s) { "--enable" } else { "--module" }, *s]).collect()
+    let flag = |s: &str| REQUIRED_NETWORK_FLAGS.contains(&s) || REQUIRED_GPU_FLAGS.contains(&s) || REQUIRED_PASSTHROUGH_FLAGS.contains(&s);
+    symbols.iter().flat_map(|s| [if flag(s) { "--enable" } else { "--module" }, *s]).collect()
 }
 
 /// `CONFIG_A, CONFIG_B` for a short list, a count for a long one (the names are in the log).
@@ -696,12 +735,20 @@ fn enable_users(symbols: &[&str]) -> String {
     let net = symbols.iter().any(|s| REQUIRED_NETWORK_SYMBOLS.contains(s) || REQUIRED_NETWORK_FLAGS.contains(s));
     let input = symbols.iter().any(|s| REQUIRED_INPUT_SYMBOLS.contains(s) || REQUIRED_BLUETOOTH_SYMBOLS.contains(s));
     let gpu = symbols.iter().any(|s| is_gpu_symbol(s));
+    let audio = symbols.iter().any(|s| REQUIRED_HDMI_AUDIO_SYMBOLS.contains(s));
+    let passthrough = symbols.iter().any(|s| REQUIRED_PASSTHROUGH_SYMBOLS.contains(s) || REQUIRED_PASSTHROUGH_FLAGS.contains(s));
     let mut users = vec![];
-    if input || !(net || gpu) {
+    if input || !(net || gpu || audio || passthrough) {
         users.push("game controllers or Bluetooth input devices");
     }
     if net {
         users.push("firewalls, Docker and other containers, VM networks or VPNs");
+    }
+    if audio {
+        users.push("HDMI/DisplayPort audio of AMD, NVIDIA and Intel graphics cards");
+    }
+    if passthrough {
+        users.push("GPU passthrough to virtual machines");
     }
     let mut cards: Vec<&str> = vec![];
     for c in symbols.iter().filter(|s| is_gpu_symbol(s)).map(|s| gpu_cards(s)) {
@@ -1797,6 +1844,72 @@ mod tests {
     }
 
     #[test]
+    fn hdmi_audio_and_passthrough_always_kept() {
+        let mut full = String::from(
+            "CONFIG_USB_HID=y\nCONFIG_HID_GENERIC=y\nCONFIG_UHID=m\nCONFIG_INPUT_UINPUT=m\nCONFIG_INPUT_JOYDEV=m\nCONFIG_PCI=y\nCONFIG_DRM=y\nCONFIG_SND=m\nCONFIG_KVM=m\n",
+        );
+        for s in REQUIRED_GPU_SYMBOLS.iter().chain(REQUIRED_HDMI_AUDIO_SYMBOLS).chain(REQUIRED_PASSTHROUGH_SYMBOLS) {
+            full.push_str(&format!("CONFIG_{s}=m\n"));
+        }
+        for s in REQUIRED_GPU_FLAGS.iter().chain(REQUIRED_PASSTHROUGH_FLAGS) {
+            full.push_str(&format!("CONFIG_{s}=y\n"));
+        }
+        assert!(missing_required(&full).is_empty(), "{:?}", missing_required(&full));
+        // LordNikon's 7.3.6 Tuned kernel: no AMD HDMI codec (an RX 580 added later fell back to the
+        // generic codec, no ELD, no sound on the TV) and no VFIO (localmodconfig dropped it all,
+        // the type 1 backend and the group/container switches with it).
+        let tuned_736 = full
+            .replace("CONFIG_SND_HDA_CODEC_HDMI_ATI=m\n", "# CONFIG_SND_HDA_CODEC_HDMI_ATI is not set\n")
+            .replace("CONFIG_VFIO=m\n", "# CONFIG_VFIO is not set\n")
+            .replace("CONFIG_VFIO_PCI=m\n", "")
+            .replace("CONFIG_VFIO_IOMMU_TYPE1=m\n", "")
+            .replace("CONFIG_VFIO_GROUP=y\n", "")
+            .replace("CONFIG_VFIO_CONTAINER=y\n", "");
+        let need = missing_required(&tuned_736);
+        assert_eq!(need, ["SND_HDA_CODEC_HDMI_ATI", "VFIO", "VFIO_PCI", "VFIO_IOMMU_TYPE1", "VFIO_GROUP", "VFIO_CONTAINER"]);
+        // Codecs and VFIO become modules, the group/container interface is switched on.
+        assert_eq!(
+            enable_args(&need),
+            [
+                "--module",
+                "SND_HDA_CODEC_HDMI_ATI",
+                "--module",
+                "VFIO",
+                "--module",
+                "VFIO_PCI",
+                "--module",
+                "VFIO_IOMMU_TYPE1",
+                "--enable",
+                "VFIO_GROUP",
+                "--enable",
+                "VFIO_CONTAINER"
+            ]
+        );
+        // A machine whose only sound was USB: the HD-audio controller and every HDMI codec.
+        let mut usb_only = full.clone();
+        for s in REQUIRED_HDMI_AUDIO_SYMBOLS {
+            usb_only = usb_only.replace(&format!("CONFIG_{s}=m\n"), "");
+        }
+        assert_eq!(missing_required(&usb_only), REQUIRED_HDMI_AUDIO_SYMBOLS);
+        // Built in counts as on.
+        assert!(missing_required(&full.replace("CONFIG_SND_HDA_INTEL=m", "CONFIG_SND_HDA_INTEL=y").replace("CONFIG_VFIO=m", "CONFIG_VFIO=y")).is_empty());
+        // No sound, or no graphics: no HDMI audio asked for. No KVM or no PCI: no passthrough.
+        assert_eq!(missing_required(&tuned_736.replace("CONFIG_SND=m\n", "")), ["VFIO", "VFIO_PCI", "VFIO_IOMMU_TYPE1", "VFIO_GROUP", "VFIO_CONTAINER"]);
+        assert!(!missing_required(&tuned_736.replace("CONFIG_DRM=y\n", "")).contains(&"SND_HDA_CODEC_HDMI_ATI"));
+        assert_eq!(missing_required(&tuned_736.replace("CONFIG_KVM=m\n", "")), ["SND_HDA_CODEC_HDMI_ATI"]);
+        assert!(missing_required(&tuned_736.replace("CONFIG_PCI=y\n", "")).is_empty());
+        // The summary names what needs them.
+        assert_eq!(enable_users(&["SND_HDA_CODEC_HDMI_ATI"]), "HDMI/DisplayPort audio of AMD, NVIDIA and Intel graphics cards");
+        assert_eq!(enable_users(&["VFIO", "VFIO_CONTAINER"]), "GPU passthrough to virtual machines");
+        assert_eq!(
+            enable_users(&["UHID", "SND_HDA_CODEC_HDMI_ATI", "VFIO_PCI"]),
+            "game controllers or Bluetooth input devices; HDMI/DisplayPort audio of AMD, NVIDIA and Intel graphics cards; GPU passthrough to virtual machines"
+        );
+        // IOMMUFD's container stands in for the classic one.
+        assert_eq!(missing_required(&format!("{tuned_736}CONFIG_IOMMUFD_VFIO_CONTAINER=y\n")), ["SND_HDA_CODEC_HDMI_ATI", "VFIO", "VFIO_PCI", "VFIO_GROUP"]);
+    }
+
+    #[test]
     fn only_ruled_out_graphics_drivers_are_notes() {
         let defined: std::collections::HashSet<String> = ["X86", "PREEMPT_RT", "PAGE_SIZE_4KB", "PAGE_SIZE_16KB"].iter().map(|s| s.to_string()).collect();
         let split = |config: &str, missing: Vec<&'static str>| split_missing(config, &defined, missing);
@@ -2062,8 +2175,8 @@ mod tests {
     }
 
     /// Extract and configure only, in Tuned mode on this machine: every required option (input,
-    /// Bluetooth HID, firewall/container/VPN networking, graphics drivers) must still be on after
-    /// localmodconfig.
+    /// Bluetooth HID, firewall/container/VPN networking, graphics drivers and their HDMI audio,
+    /// GPU passthrough) must still be on after localmodconfig.
     /// KERNEL_POP_LIVE_TARBALL=<tarball>.
     #[test]
     #[ignore]

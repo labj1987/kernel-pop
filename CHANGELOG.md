@@ -4,6 +4,18 @@ One `## <version> — <date>` heading per released version, newest first. A rele
 carries its section as written, and the AppStream `<releases>` list is generated from these
 headings.
 
+## 2.6.3 — 2026-11-25
+
+- **HDMI and DisplayPort sound from an added graphics card works with a Tuned kernel.** Tuned for
+  this machine kept only the HDMI audio driver of the graphics card in the computer while you
+  configured, so an AMD card added next to an NVIDIA one played no sound on a TV or monitor over
+  HDMI. Match this system and Tuned now always keep the HD-audio controller and the AMD, NVIDIA
+  and Intel HDMI/DisplayPort audio drivers.
+- **Tuned kernels can pass a graphics card to a virtual machine.** VFIO, which libvirt and QEMU
+  use for GPU passthrough, loads only when a device is handed to a VM, so Tuned dropped it. Match
+  this system and Tuned now always keep it, and refuse to build a kernel without it or the HDMI
+  audio drivers above.
+
 ## 2.6.2 — 2026-11-22
 
 - **A graphics card added later works with a Tuned kernel.** Tuned for this machine kept only the
