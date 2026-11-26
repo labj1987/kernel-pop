@@ -659,8 +659,7 @@ pub fn missing_required(config: &str) -> Vec<&'static str> {
     if on("DRM") && on("PCI") {
         need.extend_from_slice(REQUIRED_GPU_SYMBOLS);
         need.extend_from_slice(REQUIRED_GPU_FLAGS);
-        // SND_HDA_INTEL depended on SND_PCI before Linux 6.17: a tree without PCI sound has no HD-audio
-        if on("SND") && !config.contains("# CONFIG_SND_PCI is not set") {
+        if on("SND") {
             need.extend_from_slice(REQUIRED_HDMI_AUDIO_SYMBOLS);
         }
     }
@@ -1908,8 +1907,6 @@ mod tests {
         );
         // IOMMUFD's container stands in for the classic one.
         assert_eq!(missing_required(&format!("{tuned_736}CONFIG_IOMMUFD_VFIO_CONTAINER=y\n")), ["SND_HDA_CODEC_HDMI_ATI", "VFIO", "VFIO_PCI", "VFIO_GROUP"]);
-        // No PCI sound (before 6.17 the HD-audio driver needs it): no HDMI audio asked for.
-        assert!(!missing_required(&format!("{tuned_736}# CONFIG_SND_PCI is not set\n")).contains(&"SND_HDA_CODEC_HDMI_ATI"));
     }
 
     #[test]

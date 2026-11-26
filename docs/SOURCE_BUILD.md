@@ -209,7 +209,8 @@ Fixes applied in every mode with `scripts/config`, then `make olddefconfig`:
     fell back to the generic codec: no ELD, no sound on the TV over HDMI.
   - GPU passthrough, whenever `KVM` and `PCI` are on: `VFIO`, `VFIO_PCI` and
     `VFIO_IOMMU_TYPE1`, with `VFIO_GROUP` and `VFIO_CONTAINER` switched on
-    (the type 1 backend has no prompt; the container selects it)
+    (the type 1 backend has no prompt; the container selects it; a config that
+    already uses `IOMMUFD_VFIO_CONTAINER` is left on that container)
     (`build::REQUIRED_PASSTHROUGH_SYMBOLS` and `REQUIRED_PASSTHROUGH_FLAGS`).
     Nothing loads them until a device is handed to a VM, so the 7.3.5 and
     7.3.6 Tuned kernels had none and could not pass a graphics card to a VM.
