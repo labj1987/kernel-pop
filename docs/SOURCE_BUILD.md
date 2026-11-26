@@ -140,7 +140,8 @@ Base config:
   readers, common file systems, input devices and game controllers, USB
   audio and webcams, Bluetooth, USB network adapters and phone tethering,
   docks and Thunderbolt, printers and serial adapters, the AMD, Intel and
-  nouveau graphics drivers, VPN, container and VM networking, dm-crypt,
+  nouveau graphics drivers and the HD-audio HDMI codecs, VPN, container
+  and VM networking, VFIO, dm-crypt,
   loop, zram, ntsync). Hardware that is neither
   present nor one of those kinds (an unusual USB gadget, a different Wi-Fi
   card) may have no driver. Kernel messages in the journal were also
@@ -197,6 +198,21 @@ Fixes applied in every mode with `scripts/config`, then `make olddefconfig`:
     `PREEMPT_RT` or a non-x86 kernel, `DRM_XE` without 4 KiB pages) is a
     note in the summary, not a refused build; any other one left off
     refuses the build like the rest.
+  - HDMI/DisplayPort audio, whenever `SND`, `DRM` and `PCI` are on:
+    `SND_HDA_INTEL` (the HD-audio PCI controller a graphics card's audio
+    function uses) and the HDMI codecs `SND_HDA_CODEC_HDMI` with
+    `SND_HDA_CODEC_HDMI_GENERIC`, `SND_HDA_CODEC_HDMI_ATI`,
+    `SND_HDA_CODEC_HDMI_NVIDIA` and `SND_HDA_CODEC_HDMI_INTEL` (separate
+    options since Linux 6.17; one `SND_HDA_CODEC_HDMI` before)
+    (`build::REQUIRED_HDMI_AUDIO_SYMBOLS`). The 7.3.6 Tuned kernel on a
+    machine with an NVIDIA card had no ATI codec, so an RX 580 added later
+    fell back to the generic codec: no ELD, no sound on the TV over HDMI.
+  - GPU passthrough, whenever `KVM` and `PCI` are on: `VFIO`, `VFIO_PCI` and
+    `VFIO_IOMMU_TYPE1`, with `VFIO_GROUP` and `VFIO_CONTAINER` switched on
+    (the type 1 backend has no prompt; the container selects it)
+    (`build::REQUIRED_PASSTHROUGH_SYMBOLS` and `REQUIRED_PASSTHROUGH_FLAGS`).
+    Nothing loads them until a device is handed to a VM, so the 7.3.5 and
+    7.3.6 Tuned kernels had none and could not pass a graphics card to a VM.
 
 After configuring, the build refuses to start unless `LOCALVERSION`, the
 two key settings and (Match and Tuned) every required option, except a
